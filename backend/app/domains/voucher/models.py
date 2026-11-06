@@ -226,6 +226,12 @@ class VoucherBatch(BaseModel):
     # How long a voucher grants access *after* first redemption -- distinct
     # from batch_expires_at below. See models.py's module docstring.
     validity_minutes: Mapped[int] = mapped_column(Integer, nullable=False)
+    # How long each login lasts, when shorter than the voucher's validity (a
+    # voucher good for 7 days, 2 hours per login). NULL means "the validity",
+    # as before. Applied at NAS-only (Aruba Instant On) routers only; see
+    # ``GuestService.login_via_voucher``. Each login still spends one of
+    # ``max_uses_per_voucher``.
+    session_timeout_minutes: Mapped[int | None] = mapped_column(Integer, nullable=True)
     # The batch's own shelf-life: codes not redeemed by this timestamp
     # become permanently invalid, independent of validity_minutes.
     batch_expires_at: Mapped[datetime | None] = mapped_column(

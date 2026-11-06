@@ -23,7 +23,11 @@ from fastapi import status
 
 from app.common.exceptions import CloudGuestError
 
+from .constants import GUEST_NAME_INVALID_CODE, GUEST_NAME_REQUIRED_CODE
+
 __all__ = [
+    "GuestNameInvalidError",
+    "GuestNameRequiredError",
     "GuestError",
     "GuestNotFoundError",
     "CrossOrganizationGuestAccessError",
@@ -32,6 +36,7 @@ __all__ = [
     "GuestSessionNotFoundError",
     "GuestAuthMethodNotEnabledError",
     "VenueClosedError",
+    "AccessTierOutsideLoginHoursError",
     "GuestTeamSharedQuotaExceededError",
     "RouterNotEligibleForGuestSessionError",
     "InvalidSessionStatusTransitionError",
@@ -63,6 +68,7 @@ __all__ = [
     "GuestPinLockedError",
     "GuestProfileFieldNotCollectedError",
     "GuestReviewLinkOpenedNotAuthorizedError",
+    "GuestReviewPromptNotAuthorizedError",
 ]
 
 
@@ -196,6 +202,21 @@ class VenueClosedError(GuestError):
             closed_message or "This WiFi network is closed right now.",
             status_code=status.HTTP_403_FORBIDDEN,
             data={"code": "venue_closed"},
+        )
+
+
+class AccessTierOutsideLoginHoursError(GuestError):
+    """The guest's Access Tier only allows sign-in during its login hours,
+    and now is outside them. Enforced at Aruba Instant On venues only (see
+    ``app.domains.policy.access_tier``). Same machine-readable
+    ``data["code"]`` contract as ``VenueClosedError`` so the portal can tell
+    it apart from a generic 403."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "Your WiFi access isn't available at this time of day.",
+            status_code=status.HTTP_403_FORBIDDEN,
+            data={"code": "access_tier_outside_login_hours"},
         )
 
 
@@ -717,6 +738,44 @@ class GuestProfileFieldNotCollectedError(GuestError):
         )
 
 
+class GuestNameRequiredError(GuestError):
+    """The venue requires a name at sign-in
+    (``captive_portal_configs.require_guest_name``), this is an OTP session,
+    and the guest has no name on file -- so the step that opens the network
+    is refused.
+
+    Raised by ``POST /network-integrations/portal/authorize`` and
+    ``/portal/radius-authorize`` (via
+    ``GuestService.require_session_name``). RADIUS Authorize and the router
+    agent's ``/agent/authorized-macs`` list apply the same predicate but
+    answer in their own vocabulary (Access-Reject / MAC left out), since
+    neither has an HTTP error to give.
+
+    A 403 with the stable ``data.code == "guest_name_required"``: the
+    caller's proof of session is fine; what is missing is a precondition
+    the guest can satisfy with ``POST /guest/sign-in-name``."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "Please enter your name to connect to the WiFi.",
+            status_code=status.HTTP_403_FORBIDDEN,
+            data={"code": GUEST_NAME_REQUIRED_CODE},
+        )
+
+
+class GuestNameInvalidError(GuestError):
+    """``POST /guest/sign-in-name`` was sent a name that is empty after
+    trimming, too long, or contains control characters. 400 with the
+    stable ``data.code == "guest_name_invalid"``."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(
+            reason,
+            status_code=status.HTTP_400_BAD_REQUEST,
+            data={"code": GUEST_NAME_INVALID_CODE},
+        )
+
+
 class GuestReviewLinkOpenedNotAuthorizedError(GuestError):
     """``POST /guest/review-link-opened`` was called without a live
     session belonging to the named guest.
@@ -737,6 +796,20 @@ class GuestReviewLinkOpenedNotAuthorizedError(GuestError):
     and a guest who taps the card late in a long session, neither of whom
     is doing anything wrong.
     """
+
+    def __init__(self) -> None:
+        super().__init__(
+            "A live session for this guest is required",
+            status_code=status.HTTP_403_FORBIDDEN,
+        )
+
+
+class GuestReviewPromptNotAuthorizedError(GuestError):
+    """``POST /guest/review-prompt-shown`` was called without a live
+    session belonging to the named guest. The same deliberately light
+    check as ``GuestReviewLinkOpenedNotAuthorizedError``, for the same
+    reasons: it guards a timestamp that stores nothing about the guest and
+    grants nothing."""
 
     def __init__(self) -> None:
         super().__init__(

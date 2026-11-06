@@ -1129,12 +1129,19 @@ class TestIdentifierCanonicalization:
         assert canonical == stored
         validate_identifier_shape(canonical)  # does not raise
 
-    def test_email_identifiers_are_left_alone(self) -> None:
-        # Case-folding emails would be an unrelated behaviour change to a
-        # column ``Guest.identifier`` compares case-sensitively.
+    def test_email_identifiers_are_stripped_and_lowercased(self) -> None:
+        # The same spelling every guest login path now stores (see
+        # ``guest.validators.normalize_identifier``), so a rule written as
+        # "Guest@Example.com" matches the guest who types it in any case.
         assert canonicalize_rule_identifier("  Guest@Example.com ") == (
-            "Guest@Example.com"
+            "guest@example.com"
         )
+
+    def test_a_mixed_case_email_rule_still_matches(self) -> None:
+        # Rules written before emails were case-folded keep their case; the
+        # match compares lower() on both sides.
+        assert identifiers_match("Guest@Example.com", "guest@example.com") is True
+        assert identifiers_match("guest@example.com", "GUEST@example.com") is True
 
     async def test_create_guest_rule_stores_e164(self) -> None:
         fx = make_fixture()
@@ -1317,6 +1324,40 @@ class TestMatchTermsAndSqlAgree:
         for pattern in terms.prefix_patterns:
             assert f"'{pattern}'" in compiled
         assert "LIKE" in compiled.upper()
+
+    async def test_email_rule_statement_compares_lowercased_column(self) -> None:
+        """A blocklist rule stored as "Guest@X.com" (before emails were
+        case-folded) must still catch the guest whose login identifier is
+        now "guest@x.com"."""
+        captured: list[object] = []
+
+        class _Result:
+            def scalars(self) -> _Result:
+                return self
+
+            def all(self) -> list[GuestAccessRule]:
+                return []
+
+        class _Session:
+            async def execute(self, statement: object) -> _Result:
+                captured.append(statement)
+                return _Result()
+
+        repository = GuestAccessRepository(_Session())  # type: ignore[arg-type]
+        await repository.list_matching_guest_rules(
+            organization_id=uuid.uuid4(),
+            location_id=uuid.uuid4(),
+            identifier="Guest@X.com",
+            now=_now(),
+        )
+        compiled = str(
+            captured[0].compile(  # type: ignore[attr-defined]
+                compile_kwargs={"literal_binds": True}
+            )
+        )
+        assert "lower(guest_access_rules.identifier)" in compiled
+        assert "'guest@x.com'" in compiled
+        assert "Guest@X.com" not in compiled
 
 
 # ============================================================================

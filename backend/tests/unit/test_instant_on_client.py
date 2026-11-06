@@ -27,6 +27,7 @@ from app.domains.network_integration.providers.aruba_instant_on import (
     map_alert,
     map_client,
     map_client_usage,
+    map_event,
     map_health,
     map_network,
 )
@@ -835,6 +836,42 @@ class TestMapping:
         h = map_health(fx.SYSTEM_HEALTH)
         assert (h.score, h.status) == (100, "good")
 
+    def test_an_event_carries_no_client_identity(self) -> None:
+        event = map_event(
+            {
+                "kind": "event",
+                "id": "e1",
+                "event": "clientConnected",
+                "state": "info",
+                "category": "client",
+                "occurrenceTime": "2026-11-02T01:30:00Z",
+                "source": "aa:bb:cc:dd:ee:ff",
+                "account": "person@example.com",
+                "attributes": {
+                    "device": "AP21",
+                    "network": "WYFY_ARUBA",
+                    "client": "aa:bb:cc:dd:ee:ff",
+                },
+            }
+        )
+        assert (event.event, event.device_name, event.network_name) == (
+            "clientConnected",
+            None,
+            "WYFY_ARUBA",
+        )
+        assert event.occurred_at == "2026-11-02T01:30:00+00:00"
+        assert "aa:bb" not in repr(event) and "person@" not in repr(event)
+
+    def test_an_event_without_its_name_is_drift(self) -> None:
+        with pytest.raises(InstantOnApiDriftError):
+            map_event({"id": "e1"})
+
+    def test_event_attributes_of_another_shape_are_dropped(self) -> None:
+        event = map_event(
+            {"event": "x", "attributes": {"device": {"mac": "aa"}, "network": 3}}
+        )
+        assert event.device_name is None
+
     def test_unparseable_alert_time_is_none_not_drift(self) -> None:
         assert map_alert({"type": "x", "raisedTime": "yesterday"}).raised_at is None
 
@@ -920,3 +957,22 @@ class TestRedisRefreshLock:
             owner = redis.values["k"]
         assert "k" not in redis.values
         assert redis.evals == [("k", owner)]
+
+
+def test_an_events_device_attribute_never_leaves_the_mapper() -> None:
+    """The measured feed puts a guest's phone name and MAC here. Not sent to
+    customers until a raw row shows what this attribute really holds."""
+    event = map_event(
+        {
+            "id": "e1",
+            "event": "clientConnected",
+            "attributes": {
+                "network": "Guest",
+                "device": "Asha 12:34:56:78:9a:bc",
+            },
+        }
+    )
+    assert event.device_name is None
+    assert event.network_name == "Guest"
+    assert "Asha" not in repr(event)
+    assert "12:34" not in repr(event)

@@ -68,12 +68,12 @@ from typing import Any, Protocol
 
 from wyfy_device_gateway.snmp_poller import (
     SnmpConnectionError,
+    SnmpCredentialError,
     SnmpCredentials,
     SnmpDeviceError,
     SnmpPoller,
 )
 
-from app.core.config import get_settings
 from app.domains.policy.constants import PolicyType
 from app.domains.policy.service import ResolvedPolicy
 from app.domains.rbac.enums import AuditAction
@@ -176,6 +176,12 @@ class RouterLookupProtocol(Protocol):
     def get_decrypted_api_secret(self, router: Router) -> str | None: ...
 
     def get_decrypted_snmp_community(self, router: Router) -> str | None: ...
+
+    def get_snmp_credentials(self, router: Router) -> SnmpCredentials | None: ...
+
+    async def record_snmp_poll_outcome(
+        self, router: Router, *, status: str, detail: str | None = None
+    ) -> None: ...
 
 
 class RouterProvisioningLookupProtocol(Protocol):
@@ -1641,38 +1647,43 @@ async def run_router_snmp_metrics_poll_sweep(
     ``snmp_version``/``snmp_port`` resolve the identical way against
     ``Settings.snmp_default_version``/``snmp_default_port``.
 
-    ## Per-router failure isolation
+    ## Per-router failure isolation, and where a failure is written
 
-    Mirrors ``run_router_health_poll_sweep``'s identical per-router
-    isolation contract exactly: one router's own SNMP timeout/connection
-    failure (:class:`~wyfy_device_gateway.snmp_poller.SnmpConnectionError`)
-    or device-level SNMP error
-    (:class:`~wyfy_device_gateway.snmp_poller.SnmpDeviceError`) is
-    recorded honestly via ``record_failed_health_check`` and never aborts
-    the sweep for the rest of the fleet. A successful poll records a full
-    ``RouterHealthSnapshot`` via ``record_health_snapshot`` -- tagged
-    ``metrics_source="snmp"`` and carrying real, current per-interface
-    traffic counters (``interface_traffic_counters``) the RouterOS-API
-    path's own ``record_health_snapshot`` calls never populate -- composing
-    onto the exact same table ``run_router_health_poll_sweep`` already
-    writes to, never a second, disconnected metrics table (see
-    ``router_provisioning.models.RouterHealthSnapshot``'s own updated
-    docstring).
+    One router's timeout/error never aborts the sweep. A successful poll
+    records a ``RouterHealthSnapshot`` tagged ``metrics_source="snmp"``
+    into the same table the RouterOS-API sweep writes.
+
+    **A failed or skipped poll is written on the router row, not as a
+    health snapshot** (changed 2026-10-06). It used to call
+    ``record_failed_health_check``, which writes an ``UNHEALTHY`` row into
+    the device-health history the venue owner sees -- so a router whose
+    only problem was a closed UDP 161 would have read as an unhealthy
+    *device* every five minutes beside healthy RouterOS-API readings. A
+    silent SNMP agent is a fact about the monitoring channel, not about the
+    router. It now goes to ``Router.snmp_last_poll_*``
+    (``RouterService.record_snmp_poll_outcome``), which the Master console
+    shows, and a skip is recorded too (``not_configured``) instead of
+    vanishing.
+
+    Vendors whose devices the platform cannot poll over SNMP
+    (``app.domains.router.snmp.snmp_support_for``) are skipped and
+    recorded as such, even if a legacy row has ``snmp_enabled`` set.
 
     Unlike the RouterOS-API sweep, a successful SNMP poll never calls
     ``RouterService.heartbeat`` -- SNMP reachability is a genuinely
-    different liveness signal from "the RouterOS management API answered",
-    and conflating the two would let a router with a working SNMP agent
-    but a genuinely down RouterOS API (or vice versa) report a false
-    liveness/health status via the wrong channel.
+    different liveness signal from "the RouterOS management API answered".
 
     ``routers``, when passed explicitly, is polled instead of
     ``repository.list_routers_for_snmp_poll()``'s own full, platform-wide
-    result -- purely a test-injection seam, mirroring
-    ``run_router_health_poll_sweep``'s identical parameter."""
+    result -- purely a test-injection seam."""
+    from app.domains.router.snmp import (
+        SnmpPollStatus,
+        SnmpSupport,
+        snmp_support_for,
+    )
+
     if routers is None:
         routers = await repository.list_routers_for_snmp_poll()
-    settings = get_settings()
     poller = snmp_poller or SnmpPoller()
     checked = 0
     unreachable = 0
@@ -1680,34 +1691,45 @@ async def run_router_snmp_metrics_poll_sweep(
     errors = 0
     for router in routers:
         try:
-            host = router.management_ip_address or router.public_ip_address
-            community = (
-                router_lookup.get_decrypted_snmp_community(router)
-                or settings.snmp_default_community
-                or None
-            )
-            if not host or not community:
+            support = snmp_support_for(router)
+            if support.support is not SnmpSupport.SUPPORTED:
                 skipped += 1
+                await router_lookup.record_snmp_poll_outcome(
+                    router,
+                    status=SnmpPollStatus.NOT_CONFIGURED.value,
+                    detail=support.reason,
+                )
                 continue
-            credentials = SnmpCredentials(
-                host=host,
-                community=community,
-                port=router.snmp_port or settings.snmp_default_port,
-                version=router.snmp_version or settings.snmp_default_version,
-                timeout_seconds=settings.snmp_poll_timeout_seconds,
-            )
+            credentials = router_lookup.get_snmp_credentials(router)
+            if credentials is None:
+                skipped += 1
+                await router_lookup.record_snmp_poll_outcome(
+                    router,
+                    status=SnmpPollStatus.NOT_CONFIGURED.value,
+                    detail="No management address or no community / user name.",
+                )
+                continue
             try:
                 metrics = await poller.get_device_metrics(credentials)
-            except (SnmpConnectionError, SnmpDeviceError) as exc:
-                await router_provisioning.record_failed_health_check(
-                    router_id=router.id,
-                    requesting_organization_id=router.organization_id,
-                    detail=str(exc),
-                    metrics_source=MetricsSource.SNMP.value,
-                )
+            except SnmpConnectionError as exc:
                 unreachable += 1
+                await router_lookup.record_snmp_poll_outcome(
+                    router,
+                    status=SnmpPollStatus.NO_RESPONSE.value,
+                    detail=str(exc),
+                )
                 logger.warning(
                     "router_snmp_metrics_poll_sweep_router_unreachable",
+                    extra={"router_id": str(router.id), "detail": str(exc)},
+                )
+                continue
+            except (SnmpDeviceError, SnmpCredentialError) as exc:
+                unreachable += 1
+                await router_lookup.record_snmp_poll_outcome(
+                    router, status=SnmpPollStatus.ERROR.value, detail=str(exc)
+                )
+                logger.warning(
+                    "router_snmp_metrics_poll_sweep_router_error",
                     extra={"router_id": str(router.id), "detail": str(exc)},
                 )
                 continue
@@ -1722,6 +1744,9 @@ async def run_router_snmp_metrics_poll_sweep(
                 interface_traffic_counters=interface_counters,
                 metrics_source=MetricsSource.SNMP.value,
                 call_heartbeat=False,
+            )
+            await router_lookup.record_snmp_poll_outcome(
+                router, status=SnmpPollStatus.OK.value
             )
             checked += 1
         except Exception as exc:  # noqa: BLE001 -- per-router isolation, see docstring

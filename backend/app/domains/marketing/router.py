@@ -52,6 +52,7 @@ from .dependencies import (
 from .exceptions import PublicRateLimitedError
 from .provider_service import ProviderService
 from .schemas import (
+    AudienceCandidatesRequest,
     AudienceFilter,
     CampaignCreate,
     CampaignUpdate,
@@ -235,6 +236,30 @@ async def audience_preview(
     service: MarketingService = Depends(get_marketing_service),
 ):
     return _ok(request, "Audience preview", await service.audience_preview(scope, body))
+
+
+@router.post(
+    "/audience/candidates",
+    response_model=ApiResponse[dict],
+    dependencies=_guards("marketing.read"),
+)
+async def audience_candidates(
+    request: Request,
+    body: AudienceCandidatesRequest,
+    scope: CallerScope = Depends(get_caller_scope),
+    service: MarketingService = Depends(get_marketing_service),
+):
+    return _ok(
+        request,
+        "Audience candidates",
+        await service.audience_candidates(
+            scope,
+            body.audience,
+            search=body.search,
+            page=body.page,
+            page_size=body.page_size,
+        ),
+    )
 
 
 # ============================================================================

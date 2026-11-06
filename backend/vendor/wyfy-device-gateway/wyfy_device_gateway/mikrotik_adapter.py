@@ -69,6 +69,7 @@ on top if/when it migrates this call site (e.g. via ``creds.extra``).
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import ipaddress
 import logging
@@ -77,6 +78,7 @@ import shlex
 import time
 import uuid
 from collections.abc import Callable, Mapping, Sequence
+from datetime import UTC, datetime, timedelta
 
 import asyncssh
 import librouteros
@@ -84,6 +86,9 @@ from librouteros.exceptions import LibRouterosError
 
 from . import mikrotik_firewall as _fw
 from . import mikrotik_guest_isolation as _iso
+from . import mikrotik_local_users as _users
+from . import mikrotik_snmp as _snmp
+from . import mikrotik_traffic_flow as _tflow
 from .contract import (
     ConnectedDevice,
     ContentFilterRuleConfig,
@@ -95,6 +100,7 @@ from .contract import (
     DeviceVendor,
     DhcpLease,
     DhcpLeaseKeepResult,
+    DhcpPoolState,
     DhcpOptionBinding,
     DhcpOptionConfig,
     DhcpOptionInfo,
@@ -111,6 +117,10 @@ from .contract import (
     FirewallFilterRuleConfig,
     FirewallSyncResult,
     HotspotActiveSession,
+    HotspotBypassBindingResult,
+    HotspotBypassBindingRow,
+    HotspotBypassBindingSnapshot,
+    HotspotBypassRemovalResult,
     HotspotCertificatePush,
     HotspotCertificatePushResult,
     HotspotDeviceBlockResult,
@@ -122,6 +132,9 @@ from .contract import (
     NatRuleConfig,
     NetworkSnapshot,
     ArpPingResult,
+    LanBridgeHost,
+    LanPort,
+    LanSnapshot,
     PingResult,
     PortForwardConfig,
     ProvisionResult,
@@ -134,6 +147,7 @@ from .contract import (
     SpeedTestResult,
     TracerouteHop,
     TracerouteResult,
+    VenueQueueSyncResult,
     VlanConfig,
     VlanHotspotConfig,
     WanHealth,
@@ -151,6 +165,8 @@ _DHCP_OPTION_PATH = ("ip", "dhcp-server", "option")
 _DHCP_OPTION_SET_PATH = ("ip", "dhcp-server", "option", "sets")
 _DHCP_NETWORK_PATH = ("ip", "dhcp-server", "network")
 _DHCP_LEASE_PATH = ("ip", "dhcp-server", "lease")
+_DHCP_SERVER_PATH = ("ip", "dhcp-server")
+_IP_POOL_PATH = ("ip", "pool")
 # Every menu whose rows can hand a DHCP option to clients, paired with the
 # field that identifies a row to a human. ``/ip dhcp-server`` itself is
 # deliberately absent: it carries no ``dhcp-option``/``dhcp-option-set``
@@ -1278,6 +1294,11 @@ def _smallest_enclosing_network(
 #: docs/mikrotik/TRUSTED_DEVICES_AND_ACCESS_RULES.md §1.4). The one binding a
 #: device block removes that it did not write itself.
 _AUTHMAC_BINDING_COMMENT = "cloudguest-authmac"
+#: The ``/system scheduler`` entry that runs that loop. It is the only thing
+#: that ever removes a ``cloudguest-authmac`` binding, so
+#: :meth:`MikroTikAdapter.ensure_hotspot_bypass_binding` writes one only on a
+#: router where this entry exists and is enabled.
+_AUTHMAC_SCHEDULER_NAME = "cloudguest-authmac-sched"
 #: ``cloudguest-devblock:<device rule uuid>`` -- the only shape
 #: :meth:`MikroTikAdapter.block_hotspot_device` writes or removes.
 DEVICE_BLOCK_MARKER_PREFIX = "cloudguest-devblock:"
@@ -2022,6 +2043,143 @@ class MikroTikAdapter:
             api.close()
         return [lease for row in rows if (lease := _lease_from_row(row)) is not None]
 
+    async def read_dhcp_pools(self, creds: DeviceCredentials) -> list[DhcpPoolState]:
+        """Every ``/ip pool`` on the router, each joined to the DHCP server
+        that uses it and the network row that covers it. Read-only.
+
+        Three menus on one connection. A failed read of any of them raises
+        :class:`MikroTikDeviceError` rather than answering ``[]`` -- "this
+        router has no pool" and "we could not ask" are different answers,
+        for the same reason as :meth:`read_dhcp_leases`.
+        """
+        return await asyncio.to_thread(self._read_dhcp_pools_sync, creds)
+
+    def _read_dhcp_pools_sync(self, creds: DeviceCredentials) -> list[DhcpPoolState]:
+        api = self._connect_api(creds)
+        try:
+            try:
+                pools = list(api.path(*_IP_POOL_PATH))
+                servers = list(api.path(*_DHCP_SERVER_PATH))
+                networks = list(api.path(*_DHCP_NETWORK_PATH))
+            except LibRouterosError as exc:
+                raise MikroTikDeviceError(
+                    creds.host, f"read_dhcp_pools: {exc}"
+                ) from exc
+        finally:
+            api.close()
+        return _join_dhcp_pools(pools, servers, networks)
+
+    async def update_dhcp_pool_in_place(
+        self,
+        creds: DeviceCredentials,
+        *,
+        pool_name: str,
+        ranges: str,
+        lease_time: str | None = None,
+        dns_servers: tuple[str, ...] | None = None,
+    ) -> DhcpPoolState:
+        """Edit an address pool that already lives on the router -- by its
+        own name, in place -- and read it back.
+
+        :meth:`configure_dhcp_pool` cannot do this: it names everything
+        after the interface (``bridge-pool``/``bridge-dhcp``) and refuses an
+        interface that already serves DHCP, which is every router the setup
+        script made. This changes the setup script's own rows instead:
+
+        * ``/ip pool`` ``ranges`` of ``pool_name``;
+        * ``lease-time`` of the ``/ip dhcp-server`` that hands that pool
+          out, when ``lease_time`` is given and there is one;
+        * ``dns-server`` of the ``/ip dhcp-server network`` row that covers
+          the pool, when ``dns_servers`` is given and there is one.
+
+        Never the gateway or the network's address: those are the
+        router's own address on the interface, and the hotspot behind it.
+        Each field is written only when it differs, and the pool is read
+        again afterwards; a range the router did not keep raises rather
+        than reporting success. No pool of that name raises without
+        writing anything.
+        """
+        return await asyncio.to_thread(
+            self._update_dhcp_pool_in_place_sync,
+            creds,
+            pool_name,
+            ranges,
+            lease_time,
+            dns_servers,
+        )
+
+    def _update_dhcp_pool_in_place_sync(
+        self,
+        creds: DeviceCredentials,
+        pool_name: str,
+        ranges: str,
+        lease_time: str | None,
+        dns_servers: tuple[str, ...] | None,
+    ) -> DhcpPoolState:
+        api = self._connect_api(creds)
+        try:
+            try:
+                pool_row = next(
+                    (r for r in api.path(*_IP_POOL_PATH) if r.get("name") == pool_name),
+                    None,
+                )
+                if pool_row is None:
+                    raise MikroTikDeviceError(
+                        creds.host,
+                        f"update_dhcp_pool_in_place: no pool named {pool_name!r}",
+                    )
+                if str(pool_row.get("ranges") or "") != ranges:
+                    api.path(*_IP_POOL_PATH).update(
+                        **{".id": pool_row[".id"], "ranges": ranges}
+                    )
+                if lease_time is not None:
+                    for srv in api.path(*_DHCP_SERVER_PATH):
+                        if srv.get("address-pool") == pool_name:
+                            if not _same_routeros_duration(
+                                srv.get("lease-time"), lease_time
+                            ):
+                                api.path(*_DHCP_SERVER_PATH).update(
+                                    **{".id": srv[".id"], "lease-time": lease_time}
+                                )
+                            break
+                if dns_servers is not None:
+                    first = _pool_first_address(
+                        tuple(r.strip() for r in ranges.split(",") if r.strip())
+                    )
+                    wanted = ",".join(dns_servers)
+                    for row in api.path(*_DHCP_NETWORK_PATH):
+                        try:
+                            net = ipaddress.ip_network(
+                                str(row.get("address") or ""), strict=False
+                            )
+                        except ValueError:
+                            continue
+                        if first is not None and first in net:
+                            if str(row.get("dns-server") or "") != wanted:
+                                api.path(*_DHCP_NETWORK_PATH).update(
+                                    **{".id": row[".id"], "dns-server": wanted}
+                                )
+                            break
+                after = _join_dhcp_pools(
+                    list(api.path(*_IP_POOL_PATH)),
+                    list(api.path(*_DHCP_SERVER_PATH)),
+                    list(api.path(*_DHCP_NETWORK_PATH)),
+                )
+            except LibRouterosError as exc:
+                raise MikroTikDeviceError(
+                    creds.host, f"update_dhcp_pool_in_place: {exc}"
+                ) from exc
+        finally:
+            api.close()
+        state = next((p for p in after if p.pool_name == pool_name), None)
+        if state is None or ",".join(state.ranges) != ranges:
+            raise MikroTikDeviceError(
+                creds.host,
+                f"update_dhcp_pool_in_place: {pool_name!r} did not keep ranges "
+                f"{ranges!r} (read back {state.ranges if state else None!r})",
+            )
+        return state
+
     async def keep_dhcp_lease_address(
         self, creds: DeviceCredentials, *, mac_address: str, address: str
     ) -> DhcpLeaseKeepResult:
@@ -2378,6 +2536,383 @@ class MikroTikAdapter:
         return HotspotDeviceUnblockResult(removed_ids=tuple(removed), remaining=remaining)
 
     # ------------------------------------------------------------------
+    # session bypass at sign-in (the authorized-MAC loop's own write, early)
+    # ------------------------------------------------------------------
+
+    async def ensure_hotspot_bypass_binding(
+        self, creds: DeviceCredentials, *, mac_address: str
+    ) -> HotspotBypassBindingResult:
+        """Add the session bypass for one MAC -- the row the router's own
+        ``cloudguest-authmac-sched`` adds on its next one-minute poll --
+        unless the router's script would not add it either.
+
+        The script (``buildAuthorizedMacStatements`` in the console's setup
+        generator) is the reconciler and stays the only thing that removes
+        these rows. This method is its ADD pass for a single MAC, performed
+        early, under the same two guards and with the same three fields, so
+        that the next poll finds the row and has nothing to do:
+
+        * **No binding of any kind for the MAC** -- not "none of ours". The
+          script asks ``find where mac-address=<mac>`` with no comment
+          filter. An operator's own binding for the device, a trusted-device
+          bypass, a ``type=blocked`` device rule and a disabled row all
+          count, and all are left exactly as found.
+        * **No live** ``/ip hotspot active`` **session for the MAC.** A
+          device that authenticated through the hotspot is already online;
+          RouterOS answers a binding appearing under it by removing the host
+          (``logged out: host removed: ip binding changed``).
+
+        The row written is ``mac-address=<mac> type=bypassed
+        comment=cloudguest-authmac`` and nothing else, which is the
+        script's own ``add``. The comment is not a parameter: a row tagged
+        anything else would never be removed by the script.
+
+        * **And only on a router whose** ``cloudguest-authmac-sched`` **exists
+          and is enabled** (``"no_reconciler"`` otherwise). That scheduler is
+          the only thing that removes these rows. A venue that has switched
+          it off, or a router that never had it, would keep every binding
+          written here for good -- one sign-in would be internet with no
+          login and no expiry. Where the router's own loop does not run,
+          this method does nothing, which is what that router does today.
+          Read on the same connection, immediately before the write, so it
+          is the router's answer and not a record of what was once pushed.
+
+        Nothing is ever removed or edited, with one exception: a row this
+        very call added a moment ago, when the read-back shows the router's
+        own poll added one for the same MAC in between (``"raced"``).
+
+        ``/ip hotspot host`` is read after a successful add and reported;
+        it is not written. See :class:`HotspotBypassBindingResult`.
+        """
+        return await asyncio.to_thread(
+            self._ensure_hotspot_bypass_binding_sync, creds, mac_address
+        )
+
+    def _ensure_hotspot_bypass_binding_sync(
+        self, creds: DeviceCredentials, mac_address: str
+    ) -> HotspotBypassBindingResult:
+        mac = normalize_mac_address(mac_address)
+        if mac is None:
+            raise ValueError(f"not a MAC address: {mac_address!r}")
+
+        def _for_mac(rows: object) -> list[dict]:
+            return [
+                dict(r)
+                for r in rows  # type: ignore[attr-defined]
+                if normalize_mac_address(r.get("mac-address")) == mac
+            ]
+
+        def _describe(rows: list[dict]) -> tuple[str, ...]:
+            return tuple(
+                f"{_safe_str(r.get('type')) or 'regular'}:"
+                f"{_safe_str(r.get('comment')) or ''}"
+                for r in rows
+            )
+
+        def _result(
+            outcome: str,
+            servers: int,
+            *,
+            binding_id: str | None = None,
+            existing: tuple[str, ...] = (),
+            host_state: str | None = None,
+        ) -> HotspotBypassBindingResult:
+            return HotspotBypassBindingResult(
+                outcome=outcome,
+                hotspot_servers=servers,
+                binding_id=binding_id,
+                existing_bindings=existing,
+                host_state=host_state,
+            )
+
+        api = self._connect_api(creds)
+        try:
+            try:
+                servers = len(list(api.path("ip", "hotspot")))
+                if not servers:
+                    return _result("no_hotspot", 0)
+                reconcilers = [
+                    r
+                    for r in api.path("system", "scheduler")
+                    if _safe_str(r.get("name")) == _AUTHMAC_SCHEDULER_NAME
+                    and not _is_truthy(r.get("disabled"))
+                ]
+                if not reconcilers:
+                    return _result("no_reconciler", servers)
+                bindings = api.path("ip", "hotspot", "ip-binding")
+                existing = _for_mac(bindings)
+                if existing:
+                    return _result(
+                        "already_bound", servers, existing=_describe(existing)
+                    )
+                if _for_mac(api.path("ip", "hotspot", "active")):
+                    return _result("active_session", servers)
+
+                binding_id = str(
+                    bindings.add(
+                        **{
+                            "mac-address": mac,
+                            "type": "bypassed",
+                            "comment": _AUTHMAC_BINDING_COMMENT,
+                        }
+                    )
+                )
+                after = _for_mac(api.path("ip", "hotspot", "ip-binding"))
+                mine = [r for r in after if str(r.get(".id")) == binding_id]
+                if (
+                    len(mine) != 1
+                    or _safe_str(mine[0].get("type")) != "bypassed"
+                    or _safe_str(mine[0].get("comment")) != _AUTHMAC_BINDING_COMMENT
+                ):
+                    raise MikroTikDeviceError(
+                        creds.host,
+                        "ensure_hotspot_bypass_binding: the bypassed ip-binding "
+                        "was not found on the router after writing it",
+                    )
+                others = [r for r in after if str(r.get(".id")) != binding_id]
+                if others:
+                    # The router's own poll added the same binding between
+                    # our read and our add. Take back the one row we know is
+                    # ours -- by the .id the add returned -- rather than
+                    # leave the MAC bound twice.
+                    bindings.remove(binding_id)
+                    return _result("raced", servers, existing=_describe(others))
+            except LibRouterosError as exc:
+                raise MikroTikDeviceError(
+                    creds.host, f"ensure_hotspot_bypass_binding: {exc}"
+                ) from exc
+
+            host_state: str | None = None
+            try:
+                hosts = _for_mac(api.path("ip", "hotspot", "host"))
+                if not hosts:
+                    host_state = "absent"
+                elif all(_is_truthy(r.get("bypassed")) for r in hosts):
+                    host_state = "bypassed"
+                else:
+                    host_state = "pending"
+            except LibRouterosError as exc:
+                # A diagnostic read. The binding above is written and read
+                # back; not being able to look at the host table changes
+                # nothing about it.
+                logger.info(
+                    "mikrotik_hotspot_host_read_failed",
+                    extra={"host": creds.host, "detail": str(exc)},
+                )
+            return _result(
+                "created", servers, binding_id=binding_id, host_state=host_state
+            )
+        finally:
+            self._safe_close(api)
+
+    # ------------------------------------------------------------------
+    # session bypass removal (the authorized-MAC loop's REMOVE pass)
+    # ------------------------------------------------------------------
+
+    async def read_hotspot_bypass_bindings(
+        self, creds: DeviceCredentials
+    ) -> HotspotBypassBindingSnapshot:
+        """List the ``cloudguest-authmac`` bindings this router holds.
+        Read-only. See :class:`HotspotBypassBindingSnapshot`."""
+        return await asyncio.to_thread(self._read_hotspot_bypass_bindings_sync, creds)
+
+    def _read_hotspot_bypass_bindings_sync(
+        self, creds: DeviceCredentials
+    ) -> HotspotBypassBindingSnapshot:
+        api = self._connect_api(creds)
+        try:
+            try:
+                servers = len(list(api.path("ip", "hotspot")))
+                reconciler_enabled = any(
+                    _safe_str(r.get("name")) == _AUTHMAC_SCHEDULER_NAME
+                    and not _is_truthy(r.get("disabled"))
+                    for r in api.path("system", "scheduler")
+                )
+                rows: list[HotspotBypassBindingRow] = []
+                unreadable = 0
+                for r in api.path("ip", "hotspot", "ip-binding"):
+                    # Exactly the tag. Not a prefix, not a substring: a
+                    # trusted-device or device-block row, or an operator's
+                    # own note that happens to mention it, is not ours.
+                    if _safe_str(r.get("comment")) != _AUTHMAC_BINDING_COMMENT:
+                        continue
+                    mac = normalize_mac_address(r.get("mac-address"))
+                    if mac is None or not r.get(".id"):
+                        unreadable += 1
+                        continue
+                    rows.append(
+                        HotspotBypassBindingRow(
+                            binding_id=str(r[".id"]),
+                            mac_address=mac,
+                            disabled=_is_truthy(r.get("disabled")),
+                        )
+                    )
+            except LibRouterosError as exc:
+                raise MikroTikDeviceError(
+                    creds.host, f"read_hotspot_bypass_bindings: {exc}"
+                ) from exc
+            return HotspotBypassBindingSnapshot(
+                hotspot_servers=servers,
+                reconciler_enabled=reconciler_enabled,
+                bindings=tuple(rows),
+                unreadable=unreadable,
+            )
+        finally:
+            self._safe_close(api)
+
+    async def remove_hotspot_bypass_binding(
+        self,
+        creds: DeviceCredentials,
+        *,
+        binding_id: str,
+        mac_address: str,
+        drop_bypassed_host: bool = True,
+    ) -> HotspotBypassRemovalResult:
+        """Remove one session bypass, by the ``.id`` a
+        :meth:`read_hotspot_bypass_bindings` listed it under.
+
+        The router's own ``cloudguest-authmac-sched`` is meant to do this
+        and, on every router provisioned before its removal pass was
+        repaired, never has: a MAC once bypassed stayed bypassed. This is
+        that pass for one row, performed by the platform.
+
+        The row is read again on this connection and removed only if it is
+        still the row that was listed -- same ``.id``, comment exactly
+        ``cloudguest-authmac``, same MAC. Anything else is reported and
+        left alone. No other binding is ever touched, and nothing is added.
+
+        **The host row.** A binding is configuration; what forwards the
+        device's traffic is its ``/ip hotspot host`` entry, which was
+        created ``bypassed`` because of the binding. Whether RouterOS drops
+        that entry itself when the binding goes has not been established on
+        hardware, so both states are read and reported
+        (``host_before``/``host_after``). With ``drop_bypassed_host`` a
+        host that *still* reads ``bypassed`` after the removal is removed
+        too, so the hotspot re-creates it from the device's next packet
+        with no binding to bypass it -- behind the login page. That is
+        never done while another binding still names the MAC (the device
+        is then bypassed by a row that is not ours), nor while the MAC is a
+        live ``/ip hotspot active`` session, nor to a host that is not
+        bypassed. Its failure is logged and does not undo the removal.
+
+        Connections already established through the router are not
+        touched: no connection-tracking entry is removed here.
+        """
+        return await asyncio.to_thread(
+            self._remove_hotspot_bypass_binding_sync,
+            creds,
+            binding_id,
+            mac_address,
+            drop_bypassed_host,
+        )
+
+    def _remove_hotspot_bypass_binding_sync(
+        self,
+        creds: DeviceCredentials,
+        binding_id: str,
+        mac_address: str,
+        drop_bypassed_host: bool,
+    ) -> HotspotBypassRemovalResult:
+        mac = normalize_mac_address(mac_address)
+        if mac is None:
+            raise ValueError(f"not a MAC address: {mac_address!r}")
+        if not binding_id:
+            raise ValueError("binding_id is required")
+
+        def _for_mac(rows: object) -> list[dict]:
+            return [
+                dict(r)
+                for r in rows  # type: ignore[attr-defined]
+                if normalize_mac_address(r.get("mac-address")) == mac
+            ]
+
+        def _host_state(api) -> tuple[str | None, list[dict]]:  # noqa: ANN001
+            try:
+                hosts = _for_mac(api.path("ip", "hotspot", "host"))
+            except LibRouterosError as exc:
+                logger.info(
+                    "mikrotik_hotspot_host_read_failed",
+                    extra={"host": creds.host, "detail": str(exc)},
+                )
+                return None, []
+            if not hosts:
+                return "absent", hosts
+            if any(_is_truthy(r.get("bypassed")) for r in hosts):
+                return "bypassed", hosts
+            return "unbypassed", hosts
+
+        api = self._connect_api(creds)
+        try:
+            try:
+                bindings = api.path("ip", "hotspot", "ip-binding")
+                row = next(
+                    (dict(r) for r in bindings if str(r.get(".id")) == binding_id),
+                    None,
+                )
+                if row is None:
+                    return HotspotBypassRemovalResult(outcome="gone")
+                if (
+                    _safe_str(row.get("comment")) != _AUTHMAC_BINDING_COMMENT
+                    or normalize_mac_address(row.get("mac-address")) != mac
+                ):
+                    return HotspotBypassRemovalResult(outcome="changed")
+
+                host_before, _ = _host_state(api)
+                bindings.remove(binding_id)
+
+                after = [dict(r) for r in api.path("ip", "hotspot", "ip-binding")]
+                if any(str(r.get(".id")) == binding_id for r in after):
+                    raise MikroTikDeviceError(
+                        creds.host,
+                        "remove_hotspot_bypass_binding: the binding was still on "
+                        "the router after removing it",
+                    )
+                others = tuple(
+                    f"{_safe_str(r.get('type')) or 'regular'}:"
+                    f"{_safe_str(r.get('comment')) or ''}"
+                    for r in _for_mac(after)
+                )
+                active_session = bool(_for_mac(api.path("ip", "hotspot", "active")))
+            except LibRouterosError as exc:
+                raise MikroTikDeviceError(
+                    creds.host, f"remove_hotspot_bypass_binding: {exc}"
+                ) from exc
+
+            host_after, hosts = _host_state(api)
+            hosts_removed = 0
+            if (
+                drop_bypassed_host
+                and host_after == "bypassed"
+                and not others
+                and not active_session
+            ):
+                try:
+                    table = api.path("ip", "hotspot", "host")
+                    for r in hosts:
+                        if (
+                            _is_truthy(r.get("bypassed"))
+                            and not _is_truthy(r.get("authorized"))
+                            and r.get(".id")
+                        ):
+                            table.remove(str(r[".id"]))
+                            hosts_removed += 1
+                except LibRouterosError as exc:
+                    logger.warning(
+                        "mikrotik_hotspot_host_remove_failed",
+                        extra={"host": creds.host, "detail": str(exc)},
+                    )
+            return HotspotBypassRemovalResult(
+                outcome="removed",
+                other_bindings=others,
+                active_session=active_session,
+                host_before=host_before,
+                host_after=host_after,
+                hosts_removed=hosts_removed,
+            )
+        finally:
+            self._safe_close(api)
+
+    # ------------------------------------------------------------------
     # diagnostics (shared by network_diagnostics + isp call sites)
     # ------------------------------------------------------------------
 
@@ -2476,13 +3011,73 @@ class MikroTikAdapter:
                 ) from exc
         finally:
             api.close()
-        sent, received, _loss, _rtt = _parse_ping_rows(rows, requested_count=count)
+        sent, received, _loss, rtt = _parse_ping_rows(rows, requested_count=count)
         # A timed-out row carries the target IP in ``host``, not a MAC;
         # normalize_mac_address drops it.
         replied_macs = frozenset(
             mac for row in rows if (mac := normalize_mac_address(row.get("host")))
         )
-        return ArpPingResult(sent=sent, received=received, replied_macs=replied_macs)
+        return ArpPingResult(
+            sent=sent,
+            received=received,
+            replied_macs=replied_macs,
+            avg_rtt_ms=rtt if received else None,
+        )
+
+    async def read_lan_snapshot(self, creds: DeviceCredentials) -> LanSnapshot:
+        """Port link state, MAC-to-port table and the router clock, in ONE
+        API connection -- the monitored-hardware health sweep reads this
+        once per router per sweep, never per device.
+
+        Four reads, all small and all read-only:
+
+        * ``/interface`` (``.proplist`` trimmed): ``running``, ``link-downs``,
+          ``last-link-down-time``/``last-link-up-time``, byte counters. Tells
+          "cable pulled / device powered off" apart from "device ignores
+          ping", which ICMP and ARP cannot.
+        * ``/interface/bridge/host`` (``.proplist`` trimmed): the port each
+          MAC was learned on, and how many other MACs share that port.
+        * ``/interface/bridge/port``: port -> bridge, so an ARP ping can be
+          sent on the bridge even when the stored interface is a port.
+        * ``/system/clock``: RouterOS reports link times in local time; the
+          offset converts them to UTC. Unreadable clock -> times ``None``.
+
+        Measured on a hEX lite (RouterOS 7.21.4) 2026-10-19: 0.06 s, 0.04 s
+        and well under 0.1 s for the rest.
+        """
+        return await asyncio.to_thread(self._read_lan_snapshot_sync, creds)
+
+    def _read_lan_snapshot_sync(self, creds: DeviceCredentials) -> LanSnapshot:
+        api = self._connect_api(creds)
+        try:
+            try:
+                interfaces = list(
+                    api("/interface/print", **{".proplist": _LAN_PORT_PROPLIST})
+                )
+                hosts = list(
+                    api(
+                        "/interface/bridge/host/print",
+                        **{".proplist": _LAN_HOST_PROPLIST},
+                    )
+                )
+                members = list(
+                    api(
+                        "/interface/bridge/port/print",
+                        **{".proplist": "interface,bridge"},
+                    )
+                )
+            except (LibRouterosError, OSError) as exc:
+                raise MikroTikDeviceError(
+                    creds.host, f"lan snapshot failed: {_describe_exception(exc)}"
+                ) from exc
+            try:
+                clock_rows = list(api("/system/clock/print"))
+            except (LibRouterosError, OSError):
+                clock_rows = []
+        finally:
+            self._safe_close(api)
+        offset = _router_clock_offset_seconds(clock_rows, time.time())
+        return _build_lan_snapshot(interfaces, hosts, members, offset)
 
     async def traceroute(
         self,
@@ -5742,6 +6337,44 @@ class MikroTikAdapter:
         finally:
             api.close()
 
+    async def ensure_host_route(
+        self, creds: DeviceCredentials, *, dst_address: str, gateway: str, comment: str
+    ) -> None:
+        """See the contract. Tested against RouterOS 7.16.2 (CHR)."""
+        await asyncio.to_thread(
+            self._ensure_host_route_sync, creds, dst_address, gateway, comment
+        )
+
+    def _ensure_host_route_sync(
+        self, creds: DeviceCredentials, dst_address: str, gateway: str, comment: str
+    ) -> None:
+        api = self._connect_api(creds)
+        try:
+            menu = api.path("ip", "route")
+            try:
+                existing = [row for row in menu if row.get("comment") == comment]
+                if not existing:
+                    menu.add(
+                        **{
+                            "dst-address": f"{dst_address}/32",
+                            "gateway": gateway,
+                            "comment": comment,
+                        }
+                    )
+                # RouterOS v7 may qualify the address as "10.1.0.2%ether2".
+                elif str(existing[0].get("gateway") or "").split("%")[0] != gateway:
+                    menu.update(**{".id": existing[0][".id"], "gateway": gateway})
+            except LibRouterosError as exc:
+                raise MikroTikDeviceError(
+                    creds.host, f"ensure_host_route: {exc}"
+                ) from exc
+            except (OSError, EOFError) as exc:
+                raise MikroTikConnectionError(
+                    creds.host, f"ensure_host_route: {_describe_exception(exc)}"
+                ) from exc
+        finally:
+            self._safe_close(api)
+
     async def ensure_wan_egress(
         self, creds: DeviceCredentials, *, interface: str
     ) -> None:
@@ -6782,6 +7415,50 @@ class MikroTikAdapter:
             self._safe_close(api)
 
     # ------------------------------------------------------------------
+    # traffic flow (NetFlow v9 / IPFIX export) -- see mikrotik_traffic_flow
+    # ------------------------------------------------------------------
+
+    async def read_traffic_flow(
+        self, creds: DeviceCredentials, *, identity: Mapping[str, str] | None
+    ) -> _tflow.TrafficFlowState:
+        """Read-only: ``/ip traffic-flow``, its ``ipfix`` field toggles and
+        the export target(s) whose ``dst-address`` + ``port`` equal
+        ``identity``. Never writes."""
+        return await asyncio.to_thread(
+            self._traffic_flow_sync, creds, None, identity
+        )
+
+    async def apply_traffic_flow(
+        self, creds: DeviceCredentials, config: _tflow.TrafficFlowConfig
+    ) -> _tflow.TrafficFlowApplyResult:
+        """Write ``config`` (only the fields that differ), then read back.
+        Refused (nothing written) -> :class:`_tflow.TrafficFlowRefusal`
+        re-raised as-is so the caller sees its ``code``."""
+        return await asyncio.to_thread(
+            self._traffic_flow_sync, creds, config, config.identity
+        )
+
+    def _traffic_flow_sync(
+        self,
+        creds: DeviceCredentials,
+        config: _tflow.TrafficFlowConfig | None,
+        identity: Mapping[str, str] | None,
+    ) -> _tflow.TrafficFlowState | _tflow.TrafficFlowApplyResult:
+        api = self._connect_api(creds)
+        try:
+            try:
+                if config is None:
+                    return _tflow.read_traffic_flow(api, identity=identity)
+                return _tflow.apply_traffic_flow(api, config)
+            except LibRouterosError as exc:
+                op = "read" if config is None else "apply"
+                raise MikroTikDeviceError(
+                    creds.host, f"{op}_traffic_flow: {exc}"
+                ) from exc
+        finally:
+            self._safe_close(api)
+
+    # ------------------------------------------------------------------
     # guest isolation (bridge horizon, own radios, routed guard rows)
     # ------------------------------------------------------------------
 
@@ -6830,6 +7507,42 @@ class MikroTikAdapter:
                 raise MikroTikDeviceError(
                     creds.host, f"{op}_guest_isolation: {exc}"
                 ) from exc
+        finally:
+            self._safe_close(api)
+
+    # ------------------------------------------------------------------
+    # SNMP agent (for the platform's own read-only poller)
+    # ------------------------------------------------------------------
+
+    async def read_snmp_state(self, creds: DeviceCredentials) -> _snmp.SnmpDeviceState:
+        """Read-only: see :func:`wyfy_device_gateway.mikrotik_snmp.read_snmp_state`."""
+        return await asyncio.to_thread(self._snmp_sync, creds, "read", None)
+
+    async def apply_snmp_config(
+        self, creds: DeviceCredentials, config: _snmp.SnmpDeviceConfig
+    ) -> _snmp.SnmpApplyResult:
+        """Enable the agent with the platform's read-only community, fence
+        the factory ``public`` one, and read back."""
+        return await asyncio.to_thread(self._snmp_sync, creds, "apply", config)
+
+    async def remove_snmp_config(
+        self, creds: DeviceCredentials
+    ) -> _snmp.SnmpApplyResult:
+        """Remove the platform's community (see the module for when the
+        agent itself is turned off)."""
+        return await asyncio.to_thread(self._snmp_sync, creds, "remove", None)
+
+    def _snmp_sync(self, creds: DeviceCredentials, op: str, config):  # noqa: ANN001, ANN202
+        api = self._connect_api(creds)
+        try:
+            try:
+                if op == "read":
+                    return _snmp.read_snmp_state(api)
+                if op == "apply":
+                    return _snmp.apply_snmp_config(api, config)
+                return _snmp.remove_snmp_config(api)
+            except LibRouterosError as exc:
+                raise MikroTikDeviceError(creds.host, f"{op}_snmp: {exc}") from exc
         finally:
             self._safe_close(api)
 
@@ -6999,13 +7712,38 @@ class MikroTikAdapter:
         path_segments: tuple[str, ...],
         fields: dict[str, str],
         operation: str,
+        supersede_name_prefix: str | None = None,
+        keep_queue_ids: tuple[str, ...] = (),
     ) -> str:
         api = self._connect_api(creds)
         try:
             try:
-                return api.path(*path_segments).add(**fields)
+                device_queue_id = api.path(*path_segments).add(**fields)
             except LibRouterosError as exc:
                 raise MikroTikDeviceError(creds.host, f"{operation}: {exc}") from exc
+            if path_segments == _SIMPLE_QUEUE_PATH:
+                _raise_simple_queue_to_top(api, creds.host, str(device_queue_id))
+                if supersede_name_prefix:
+                    try:
+                        _remove_superseded_simple_queues(
+                            api,
+                            creds.host,
+                            str(device_queue_id),
+                            supersede_name_prefix,
+                            keep_queue_ids,
+                        )
+                    except LibRouterosError as exc:
+                        # A row for this address that could not be taken
+                        # away may be the one that governs. The caller is
+                        # told the write failed, and the row just added is
+                        # taken back so the device is as it was found --
+                        # the caller will not record an id for it.
+                        with contextlib.suppress(LibRouterosError):
+                            api.path(*path_segments).remove(str(device_queue_id))
+                        raise MikroTikDeviceError(
+                            creds.host, f"{operation}: superseded row: {exc}"
+                        ) from exc
+            return device_queue_id
         finally:
             api.close()
 
@@ -7022,6 +7760,8 @@ class MikroTikAdapter:
                 api.path(*path_segments).update(**fields)
             except LibRouterosError as exc:
                 raise MikroTikDeviceError(creds.host, f"{operation}: {exc}") from exc
+            if path_segments == _SIMPLE_QUEUE_PATH and fields.get(".id"):
+                _raise_simple_queue_to_top(api, creds.host, str(fields[".id"]))
         finally:
             api.close()
 
@@ -7054,7 +7794,20 @@ class MikroTikAdapter:
         burst_threshold_kbps: int | None = None,
         burst_time_seconds: int | None = None,
         priority: int = 8,
+        parent: str | None = None,
+        supersede_name_prefix: str | None = None,
+        keep_queue_ids: Sequence[str] = (),
     ) -> str:
+        """Adds a ``/queue simple`` row and moves it to the top of the list
+        (see ``_raise_simple_queue_to_top``).
+
+        ``supersede_name_prefix`` makes the new row the *only* row of its
+        kind for its address: once it is on the device, every other static
+        row named ``<prefix><uuid>`` whose target is exactly the same
+        single host is removed, in the same connection. See
+        ``_remove_superseded_simple_queues`` for why the order of the list
+        is not enough. ``keep_queue_ids`` are rows to leave alone whatever
+        they target."""
         fields = {
             "name": name,
             "target": target,
@@ -7067,13 +7820,294 @@ class MikroTikAdapter:
             ),
             "priority": str(priority),
         }
+        if parent:
+            fields["parent"] = parent
         return await asyncio.to_thread(
             self._queue_add_sync,
             creds,
             ("queue", "simple"),
             fields,
             "create_simple_queue",
+            supersede_name_prefix,
+            tuple(str(i) for i in keep_queue_ids if i),
         )
+
+    async def sync_venue_simple_queue(
+        self,
+        creds: DeviceCredentials,
+        *,
+        name: str,
+        download_rate_kbps: int | None,
+        upload_rate_kbps: int | None,
+        child_queue_ids: Sequence[str] = (),
+        targets: Sequence[str] | None = None,
+        comment: str | None = None,
+    ) -> VenueQueueSyncResult:
+        """One parent ``/queue simple`` holding a venue's total speed, with
+        each listed guest row under it.
+
+        ## Why a parent row
+
+        Every guest already has a row of their own, limiting that guest. A
+        venue's total -- "everyone together gets no more than this" -- is a
+        limit on their sum, and in ``/queue simple`` that is a row whose
+        ``target`` is the guest subnet with the guests' rows as its
+        children (``parent=<name>``). A packet is matched against the
+        top-level rows in list order; it enters the first one whose target
+        it matches, and inside that row it goes to the first matching
+        child. A packet that matches the parent and no child -- a bypassed
+        or trusted device, a guest whose own row has not been written yet
+        -- is still held by the parent's own limit.
+
+        ## Why it has to be first
+
+        Because the first matching top-level row takes the packet. A
+        top-level row for one guest's address that sits *above* the parent
+        (a dynamic hotspot queue made from a RADIUS rate-limit reply is
+        the real case; the hotspot inserts those at the top) takes that
+        guest's traffic out of the total. So the parent is moved to the top
+        whenever it is not there, and the read-back names any top-level row
+        still above it.
+
+        ## What is not established on hardware
+
+        That RouterOS accepts ``parent`` over the API on ``add`` and
+        ``set`` as written here; that it lets a static row be moved above a
+        dynamic one; where it lists a child relative to its parent after
+        ``set parent=``; and that a child whose target is outside the
+        parent's target behaves as a plain mismatch rather than an error.
+        Nothing here assumes any of them: every write is followed by a
+        read of the whole list, and ``in_sync``/``problems`` describe what
+        the device then holds.
+
+        Idempotent. A device that already matches costs one read and no
+        write."""
+        return await asyncio.to_thread(
+            self._sync_venue_simple_queue_sync,
+            creds,
+            name,
+            download_rate_kbps,
+            upload_rate_kbps,
+            tuple(str(i) for i in child_queue_ids if i),
+            None if targets is None else tuple(targets),
+            comment,
+        )
+
+    def _sync_venue_simple_queue_sync(
+        self,
+        creds: DeviceCredentials,
+        name: str,
+        download_rate_kbps: int | None,
+        upload_rate_kbps: int | None,
+        child_queue_ids: tuple[str, ...],
+        targets: tuple[str, ...] | None,
+        comment: str | None,
+    ) -> VenueQueueSyncResult:
+        api = self._connect_api(creds)
+        try:
+            try:
+                if targets is None:
+                    targets = _hotspot_guest_networks(api)
+                wanted_targets = tuple(sorted({t.strip() for t in targets if t.strip()}))
+                if not wanted_targets:
+                    # Nothing is written against a guess. The guests' own
+                    # rows stay exactly as they are.
+                    return VenueQueueSyncResult(
+                        name=name,
+                        in_sync=False,
+                        problems=("guest_subnet_unresolved",),
+                    )
+                max_limit = _max_limit_field(
+                    upload_rate_kbps or 0, download_rate_kbps or 0
+                )["max-limit"]
+                path = api.path(*_SIMPLE_QUEUE_PATH)
+                rows = [dict(row) for row in path]
+                parent = _static_row_named(rows, name)
+
+                created = updated = moved = False
+                reparented = 0
+                if parent is None:
+                    fields = {
+                        "name": name,
+                        "target": ",".join(wanted_targets),
+                        "max-limit": max_limit,
+                    }
+                    if comment:
+                        fields["comment"] = comment
+                    parent_id = str(path.add(**fields))
+                    created = True
+                else:
+                    parent_id = str(parent.get(".id"))
+                    changes: dict[str, str] = {}
+                    if _queue_target_set(parent) != set(wanted_targets):
+                        changes["target"] = ",".join(wanted_targets)
+                    if _rate_pair_bps(parent.get("max-limit")) != _rate_pair_bps(
+                        max_limit
+                    ):
+                        changes["max-limit"] = max_limit
+                    if changes:
+                        path.update(**{".id": parent_id, **changes})
+                        updated = True
+
+                known = {str(row.get(".id")): row for row in rows}
+                for child_id in child_queue_ids:
+                    child = known.get(child_id)
+                    if child is None or child_id == parent_id:
+                        continue
+                    if _safe_str(child.get("parent")) != name:
+                        path.update(**{".id": child_id, "parent": name})
+                        reparented += 1
+
+                if created or updated or reparented:
+                    rows = [dict(row) for row in path]
+                first_id = str(rows[0].get(".id")) if rows else parent_id
+                move_refused = False
+                if first_id != parent_id:
+                    # Its own ``try``: the row and its children are already
+                    # written, and a router that will not reorder them (a
+                    # static row above a dynamic one is the case nobody has
+                    # tried on hardware) must not turn that into "the venue
+                    # cap failed". The read-back below reports where the
+                    # parent actually is.
+                    try:
+                        tuple(
+                            api(
+                                "/queue/simple/move",
+                                numbers=parent_id,
+                                destination=first_id,
+                            )
+                        )
+                        moved = True
+                    except LibRouterosError as exc:
+                        move_refused = True
+                        logger.warning(
+                            "venue_simple_queue_move_refused",
+                            extra={
+                                "host": creds.host,
+                                "queue_name": name,
+                                "error": str(exc),
+                            },
+                        )
+
+                wrote = created or updated or moved or bool(reparented)
+                if wrote:
+                    rows = [dict(row) for row in path]
+            except LibRouterosError as exc:
+                raise MikroTikDeviceError(
+                    creds.host, f"sync_venue_simple_queue: {exc}"
+                ) from exc
+
+            problems = _venue_queue_problems(
+                rows,
+                name=name,
+                parent_id=parent_id,
+                targets=wanted_targets,
+                max_limit=max_limit,
+                child_queue_ids=child_queue_ids,
+            )
+            if move_refused and "top_level_row_above_parent" not in problems:
+                problems = (*problems, "parent_move_refused")
+            if problems:
+                logger.warning(
+                    "venue_simple_queue_not_in_sync",
+                    extra={
+                        "host": creds.host,
+                        "queue_name": name,
+                        "problems": list(problems),
+                    },
+                )
+            return VenueQueueSyncResult(
+                name=name,
+                device_queue_id=parent_id,
+                targets=wanted_targets,
+                created=created,
+                updated=updated,
+                reparented=reparented,
+                moved_to_top=moved,
+                wrote=wrote,
+                in_sync=not problems,
+                problems=problems,
+            )
+        finally:
+            api.close()
+
+    async def clear_venue_simple_queue(
+        self, creds: DeviceCredentials, *, name: str
+    ) -> VenueQueueSyncResult:
+        """Takes a venue's total cap off the device: the rows under the
+        parent named ``name`` go back to the top level first, the parent is
+        removed second, and the list is read back third.
+
+        The order is the point. Removing a parent that still has rows under
+        it is not something this asks RouterOS to decide: if any row still
+        names it after the first step, the parent is left where it is and
+        the result says so. Absent already is success with nothing written.
+        A row with this name that the device made itself (dynamic) is not
+        touched."""
+        return await asyncio.to_thread(self._clear_venue_simple_queue_sync, creds, name)
+
+    def _clear_venue_simple_queue_sync(
+        self, creds: DeviceCredentials, name: str
+    ) -> VenueQueueSyncResult:
+        api = self._connect_api(creds)
+        try:
+            try:
+                path = api.path(*_SIMPLE_QUEUE_PATH)
+                rows = [dict(row) for row in path]
+                parent = _static_row_named(rows, name)
+                children = [
+                    row
+                    for row in rows
+                    if _safe_str(row.get("parent")) == name
+                    and not _is_truthy(row.get("dynamic"))
+                ]
+                if parent is None and not children:
+                    return VenueQueueSyncResult(name=name)
+
+                for child in children:
+                    path.update(**{".id": str(child.get(".id")), "parent": "none"})
+                unparented = len(children)
+                if children:
+                    rows = [dict(row) for row in path]
+
+                removed = False
+                still_under = [
+                    row for row in rows if _safe_str(row.get("parent")) == name
+                ]
+                if parent is not None and not still_under:
+                    path.remove(str(parent.get(".id")))
+                    removed = True
+                rows = [dict(row) for row in path]
+            except LibRouterosError as exc:
+                raise MikroTikDeviceError(
+                    creds.host, f"clear_venue_simple_queue: {exc}"
+                ) from exc
+
+            problems: list[str] = []
+            if _static_row_named(rows, name) is not None:
+                problems.append("parent_still_present")
+            if any(_safe_str(row.get("parent")) == name for row in rows):
+                problems.append("rows_still_under_parent")
+            if problems:
+                logger.warning(
+                    "venue_simple_queue_not_cleared",
+                    extra={
+                        "host": creds.host,
+                        "queue_name": name,
+                        "problems": problems,
+                    },
+                )
+            return VenueQueueSyncResult(
+                name=name,
+                device_queue_id=None if removed else _row_id(parent),
+                reparented=unparented,
+                removed=removed,
+                wrote=bool(unparented) or removed,
+                in_sync=not problems,
+                problems=tuple(problems),
+            )
+        finally:
+            api.close()
 
     async def update_simple_queue(
         self,
@@ -7105,6 +8139,128 @@ class MikroTikAdapter:
             ("queue", "simple"),
             fields,
             "update_simple_queue",
+        )
+
+    async def find_client_address(
+        self, creds: DeviceCredentials, *, mac_address: str
+    ) -> str | None:
+        """The address this router currently has for the device with this
+        MAC -- its hotspot host entry first, then its DHCP lease -- or
+        ``None`` when the router knows no such device.
+
+        This is what a per-guest ``/queue simple`` has to target. The
+        address a login *reports* is not evidence: it is a query parameter
+        on the portal URL, filled in by the hotspot's ``$(ip)``, and that is
+        a pool address rather than the device's own on a router whose
+        clients do not lease from the hotspot pool -- an honest guest on
+        such a router reports the wrong one. A copied URL carries somebody
+        else's.
+
+        The hotspot host is asked first because it exists for every device
+        the hotspot has seen, including one that is bypassed and one with a
+        static address the DHCP server never leased. The ARP table is the
+        last resort, for a venue where neither exists for a device the
+        router nevertheless routes for.
+
+        The host's ``address`` -- the device's own -- is preferred over its
+        ``to-address``. They are the same on a router whose clients lease
+        from the hotspot's own pool. Where they are not (clients leasing
+        from another subnet, so the hotspot hands each a pool address), the
+        pool address is what the hotspot's ``$(ip)`` gives the portal, and
+        it stops describing the device as soon as the device is bypassed:
+        observed live, a device holding one address signed in as a pool
+        address, was bypassed, and its queue on the pool address then
+        matched nothing. Which of the two a queue must name *while* a host
+        is still being translated has not been established on hardware.
+
+        A router with no hotspot package is not an error; the lease is then
+        the only source. Among several leases for one MAC a ``bound`` one
+        wins.
+
+        Read-only. Raises ``MikroTikConnectionError`` /
+        ``MikroTikDeviceError`` like every other call here; an unparsable
+        MAC is ``None``, never an exception."""
+        mac = normalize_mac_address(mac_address)
+        if mac is None:
+            return None
+        return await asyncio.to_thread(self._find_client_address_sync, creds, mac)
+
+    def _find_client_address_sync(
+        self, creds: DeviceCredentials, mac: str
+    ) -> str | None:
+        return self._list_client_addresses_sync(creds).get(mac)
+
+    async def list_client_addresses(self, creds: DeviceCredentials) -> dict[str, str]:
+        """``find_client_address`` for every device at once: canonical MAC
+        -> the address this router currently has for it, from one
+        connection and one read each of the hotspot hosts, the DHCP leases
+        and the ARP table, in that order of preference. A device the router
+        has no entry for is simply not a key. Read-only."""
+        return await asyncio.to_thread(self._list_client_addresses_sync, creds)
+
+    def _list_client_addresses_sync(self, creds: DeviceCredentials) -> dict[str, str]:
+        api = self._connect_api(creds)
+        try:
+            found: dict[str, str] = {}
+            # Lowest preference first, so each later source overwrites.
+            try:
+                for row in api.path("ip", "arp"):
+                    mac = _row_mac(dict(row))
+                    address = _safe_str(row.get("address"))
+                    if (
+                        mac
+                        and address
+                        and not _is_truthy(row.get("disabled"))
+                        and not _is_truthy(row.get("invalid"))
+                    ):
+                        found.setdefault(mac, address)
+            except LibRouterosError:
+                pass
+            try:
+                leases = [
+                    lease
+                    for row in api.path(*_DHCP_LEASE_PATH)
+                    if (lease := _lease_from_row(row)) is not None
+                    and lease.address
+                    and not lease.disabled
+                ]
+            except LibRouterosError as exc:
+                raise MikroTikDeviceError(
+                    creds.host, f"list_client_addresses: {exc}"
+                ) from exc
+            by_mac: dict[str, str] = {}
+            for lease in sorted(leases, key=lambda lease: lease.status != "bound"):
+                by_mac.setdefault(lease.mac_address, lease.address)
+            found.update(by_mac)
+            try:
+                hosts: dict[str, str] = {}
+                for row in api.path("ip", "hotspot", "host"):
+                    mac = _row_mac(dict(row))
+                    address = _safe_str(row.get("address")) or _safe_str(
+                        row.get("to-address")
+                    )
+                    if mac and address:
+                        hosts.setdefault(mac, address)
+                found.update(hosts)
+            except LibRouterosError:
+                pass
+            return found
+        finally:
+            api.close()
+
+    async def set_simple_queue_target(
+        self, creds: DeviceCredentials, *, device_queue_id: str, target: str
+    ) -> None:
+        """Points an existing ``/queue simple`` entry at a different
+        address, leaving its rates as they are, and moves it back to the
+        top of the list (see ``create_simple_queue``). For a guest whose
+        lease changed mid-session: the row, its id and its counters stay."""
+        await asyncio.to_thread(
+            self._queue_update_sync,
+            creds,
+            ("queue", "simple"),
+            {".id": device_queue_id, "target": target},
+            "set_simple_queue_target",
         )
 
     async def delete_simple_queue(
@@ -7513,6 +8669,48 @@ class MikroTikAdapter:
         return await asyncio.to_thread(
             self._execute_raw_command_over_api_sync, creds, command, *sentence
         )
+
+    async def probe_api_login(self, creds: DeviceCredentials) -> _users.LoginProbeResult:
+        """One login attempt with ``creds``, over 8728. See
+        :mod:`.mikrotik_local_users` for why this separates refused from
+        unreachable."""
+
+        def connect():  # noqa: ANN202
+            return librouteros.connect(
+                host=creds.host,
+                username=creds.username,
+                password=creds.secret,
+                port=creds.port or _DEFAULT_API_PORT,
+                timeout=creds.timeout_seconds,
+            )
+
+        return await asyncio.to_thread(_users.probe_login, connect)
+
+    async def list_local_users(self, creds: DeviceCredentials) -> list[_users.LocalUser]:
+        def run() -> list[_users.LocalUser]:
+            api = self._connect_api(creds)
+            try:
+                return _users.list_users(api)
+            except (LibRouterosError, OSError) as exc:
+                raise MikroTikDeviceError(creds.host, _describe_exception(exc)) from exc
+            finally:
+                self._safe_close(api)
+
+        return await asyncio.to_thread(run)
+
+    async def set_local_user_password(
+        self, creds: DeviceCredentials, *, username: str, new_password: str
+    ) -> None:
+        def run() -> None:
+            api = self._connect_api(creds)
+            try:
+                _users.set_password(api, username=username, new_password=new_password)
+            except (LibRouterosError, OSError) as exc:
+                raise MikroTikDeviceError(creds.host, _describe_exception(exc)) from exc
+            finally:
+                self._safe_close(api)
+
+        await asyncio.to_thread(run)
 
     def _execute_raw_command_over_api_sync(
         self,
@@ -7961,6 +9159,116 @@ def _build_default_routes(
     return routes
 
 
+_LAN_PORT_PROPLIST = (
+    "name,type,running,disabled,link-downs,last-link-down-time,"
+    "last-link-up-time,rx-byte,tx-byte"
+)
+_LAN_HOST_PROPLIST = "mac-address,on-interface,bridge,local"
+_ROUTEROS_MONTHS = {
+    m: i
+    for i, m in enumerate(
+        ("jan", "feb", "mar", "apr", "may", "jun",
+         "jul", "aug", "sep", "oct", "nov", "dec"),
+        start=1,
+    )
+}
+
+
+def _parse_routeros_local_datetime(value: object) -> datetime | None:
+    """A RouterOS local timestamp as a naive datetime. 7.10+ prints
+    ``2026-10-19 07:09:20``; older releases ``oct/19/2026 07:09:20``."""
+    text = _safe_str(value)
+    if not text:
+        return None
+    try:
+        return datetime.strptime(text, "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        pass
+    match = re.fullmatch(r"([a-z]{3})/(\d{2})/(\d{4}) (\d{2}):(\d{2}):(\d{2})", text)
+    if not match or match.group(1).lower() not in _ROUTEROS_MONTHS:
+        return None
+    mon, day, year, hh, mm, ss = match.groups()
+    try:
+        return datetime(
+            int(year), _ROUTEROS_MONTHS[mon.lower()], int(day),
+            int(hh), int(mm), int(ss),
+        )
+    except ValueError:
+        return None
+
+
+def _router_clock_offset_seconds(
+    clock_rows: Sequence[Mapping[str, object]], now_epoch: float
+) -> float | None:
+    """Router local time minus UTC, in seconds, from ``/system/clock``.
+    Derived from the router's own ``date``+``time`` rather than its
+    ``gmt-offset`` so a router whose clock is simply wrong (no NTP) still
+    converts its own link timestamps consistently."""
+    if not clock_rows:
+        return None
+    row = clock_rows[0]
+    local = _parse_routeros_local_datetime(f"{row.get('date')} {row.get('time')}")
+    if local is None:
+        return None
+    utc_now = datetime.fromtimestamp(now_epoch, tz=UTC).replace(tzinfo=None)
+    return round((local - utc_now).total_seconds())
+
+
+def _router_local_to_utc_iso(value: object, offset: float | None) -> str | None:
+    local = _parse_routeros_local_datetime(value)
+    if local is None or offset is None:
+        return None
+    return (local - timedelta(seconds=offset)).replace(tzinfo=UTC).isoformat()
+
+
+def _build_lan_snapshot(
+    interfaces: Sequence[Mapping[str, object]],
+    hosts: Sequence[Mapping[str, object]],
+    members: Sequence[Mapping[str, object]],
+    offset: float | None,
+) -> LanSnapshot:
+    ports = tuple(
+        LanPort(
+            name=str(row["name"]),
+            type=_safe_str(row.get("type")),
+            running=_is_truthy(row.get("running")),
+            disabled=_is_truthy(row.get("disabled")),
+            link_downs=_safe_int(row.get("link-downs")),
+            last_link_down_at=_router_local_to_utc_iso(
+                row.get("last-link-down-time"), offset
+            ),
+            last_link_up_at=_router_local_to_utc_iso(
+                row.get("last-link-up-time"), offset
+            ),
+            rx_bytes=_safe_int(row.get("rx-byte")),
+            tx_bytes=_safe_int(row.get("tx-byte")),
+        )
+        for row in interfaces
+        if row.get("name")
+    )
+    bridge_hosts = tuple(
+        LanBridgeHost(
+            mac_address=mac,
+            on_interface=_safe_str(row.get("on-interface")),
+            bridge=_safe_str(row.get("bridge")),
+            local=_is_truthy(row.get("local")),
+        )
+        for row in hosts
+        if (mac := normalize_mac_address(row.get("mac-address")))
+    )
+    bridge_of_port = {
+        str(row["interface"]): str(row["bridge"])
+        for row in members
+        if row.get("interface") and row.get("bridge")
+    }
+    return LanSnapshot(
+        ports=ports,
+        hosts=bridge_hosts,
+        bridge_of_port=bridge_of_port,
+        clock_offset_seconds=offset,
+    )
+
+
 def _parse_ping_rows(
     rows: list[dict[str, object]], *, requested_count: int
 ) -> tuple[int, int, float, float | None]:
@@ -8013,6 +9321,332 @@ def _build_hop(hop_number: int, row: dict[str, object]) -> TracerouteHop:
         or loss_default,
         avg_rtt_ms=_parse_routeros_duration_ms(row.get("avg")),
     )
+
+
+_SIMPLE_QUEUE_PATH = ("queue", "simple")
+
+
+def _simple_queue_targets(row: Mapping[str, object]) -> set[str]:
+    """The single hosts a ``/queue simple`` row targets, without the
+    ``/32`` RouterOS prints after them."""
+    return {
+        part.strip().removesuffix("/32")
+        for part in str(row.get("target") or "").split(",")
+        if part.strip()
+    }
+
+
+def _targets_single_hosts(row: Mapping[str, object]) -> bool:
+    """Whether every target of a ``/queue simple`` row is one IPv4 host
+    (``10.5.50.7`` or ``10.5.50.7/32``) -- not a subnet, not an interface."""
+    targets = _simple_queue_targets(row)
+    if not targets:
+        return False
+    for target in targets:
+        try:
+            if ipaddress.ip_address(target).version != 4:
+                return False
+        except ValueError:
+            return False
+    return True
+
+
+def _row_id(row: Mapping[str, object] | None) -> str | None:
+    return None if row is None else _safe_str(row.get(".id"))
+
+
+def _static_row_named(
+    rows: Sequence[Mapping[str, object]], name: str
+) -> Mapping[str, object] | None:
+    """The row with this name that the platform could have written -- a
+    dynamic row of the same name is the device's own and is not it."""
+    for row in rows:
+        if _safe_str(row.get("name")) == name and not _is_truthy(row.get("dynamic")):
+            return row
+    return None
+
+
+def _queue_target_set(row: Mapping[str, object]) -> set[str]:
+    """A row's targets as written, without the ``/32`` RouterOS adds to a
+    single host -- for comparing a subnet row with the subnets it should
+    hold."""
+    return _simple_queue_targets(row)
+
+
+_RATE_SUFFIX_BPS = {"k": 1_000, "m": 1_000_000, "g": 1_000_000_000}
+
+
+def _rate_bps(value: str) -> int | None:
+    """``40960k``, ``40M`` and ``40960000`` are one rate. RouterOS takes the
+    first form and prints the last, so a row cannot be compared with what
+    was sent to it as text."""
+    text = value.strip().lower()
+    if not text:
+        return None
+    factor = _RATE_SUFFIX_BPS.get(text[-1])
+    digits = text[:-1] if factor else text
+    try:
+        return int(float(digits) * (factor or 1))
+    except ValueError:
+        return None
+
+
+def _rate_pair_bps(value: object) -> tuple[int | None, int | None] | None:
+    """A ``max-limit`` (``upload/download``) as two numbers in bits per
+    second, or ``None`` when it is not two rates."""
+    parts = str(value or "").split("/")
+    if len(parts) != 2:
+        return None
+    return (_rate_bps(parts[0]), _rate_bps(parts[1]))
+
+
+def _hotspot_guest_networks(api) -> tuple[str, ...]:  # noqa: ANN001
+    """The private IPv4 networks of the interface(s) this router's hotspot
+    server runs on -- its guest subnet(s), read from the device rather than
+    assumed.
+
+    A venue's guests are the devices on the hotspot's interface, and what
+    addresses they hold is whatever is configured on that interface: one
+    network on a router set up from a blank reset, two on one set up over
+    its factory defaults (observed live). The tunnel and the WAN are other
+    interfaces and never appear. A disabled server or address, an address
+    the device assigned itself, and anything that is not RFC 1918 are left
+    out. No hotspot package, or no enabled server: empty, and the caller
+    writes nothing."""
+    try:
+        interfaces = {
+            name
+            for row in api.path("ip", "hotspot")
+            if not _is_truthy(row.get("disabled"))
+            and (name := _safe_str(row.get("interface")))
+        }
+    except LibRouterosError:
+        return ()
+    if not interfaces:
+        return ()
+    networks: set[str] = set()
+    for row in api.path("ip", "address"):
+        if _safe_str(row.get("interface")) not in interfaces:
+            continue
+        if _is_truthy(row.get("disabled")) or _is_truthy(row.get("invalid")):
+            continue
+        if _is_truthy(row.get("dynamic")):
+            continue
+        try:
+            network = ipaddress.ip_interface(str(row.get("address") or "")).network
+        except ValueError:
+            continue
+        if network.version != 4 or network.prefixlen >= 31:
+            continue
+        if not any(network.subnet_of(private) for private in _RFC1918_NETWORKS):
+            continue
+        networks.add(str(network))
+    return tuple(sorted(networks))
+
+
+_RFC1918_NETWORKS = (
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+)
+
+
+def _venue_queue_problems(
+    rows: Sequence[Mapping[str, object]],
+    *,
+    name: str,
+    parent_id: str,
+    targets: tuple[str, ...],
+    max_limit: str,
+    child_queue_ids: tuple[str, ...],
+) -> tuple[str, ...]:
+    """What the list, as just read, says is wrong with a venue's parent row
+    -- empty when it holds what was asked for."""
+    problems: list[str] = []
+    by_id = {str(row.get(".id")): row for row in rows}
+    parent = by_id.get(parent_id)
+    if parent is None:
+        return ("parent_missing",)
+    if _queue_target_set(parent) != set(targets):
+        problems.append("parent_target_differs")
+    if _rate_pair_bps(parent.get("max-limit")) != _rate_pair_bps(max_limit):
+        problems.append("parent_rate_differs")
+    if any(
+        child_id in by_id
+        and child_id != parent_id
+        and _safe_str(by_id[child_id].get("parent")) != name
+        for child_id in child_queue_ids
+    ):
+        problems.append("child_not_under_parent")
+    # Anything at the top level above the parent takes its traffic before
+    # the parent sees it, so that guest is outside the venue's total.
+    for row in rows:
+        if str(row.get(".id")) == parent_id:
+            break
+        if _safe_str(row.get("parent")) in (None, "", "none"):
+            problems.append("top_level_row_above_parent")
+            break
+    return tuple(problems)
+
+
+def _raise_simple_queue_to_top(api, host: str, device_queue_id: str) -> None:  # noqa: ANN001
+    """Best effort: make ``device_queue_id`` the first ``/queue simple``
+    row, and say so in the log if another row for the same address still
+    sits above it afterwards.
+
+    RouterOS applies the first matching simple queue in list order. A guest
+    who signed in through RADIUS also has a dynamic ``<hotspot-...>`` queue
+    for the same address, made from the rate-limit reply attribute, and the
+    hotspot inserts those at the top -- so the row this adapter just wrote
+    sat below it, matched nothing, and a speed the venue changed afterwards
+    reached nobody until the guest signed in again (observed live: the
+    platform's row at 0 bytes under a dynamic row carrying the traffic).
+
+    Only a row whose every target is one host is raised. A venue-wide row
+    -- a subnet, an interface -- matches every guest, and putting *that*
+    first would shadow each guest's own row, which is the opposite of the
+    point; it stays where ``add`` put it, at the bottom.
+
+    It never raises. The row has already been written; failing the caller
+    here would have it roll back its own record of a row that is on the
+    device. And it does not assume the move worked: whether RouterOS lets a
+    static row sit above a dynamic one has not been established on
+    hardware, so the list is read back and a row that is still shadowed is
+    reported, not presumed fixed."""
+    try:
+        rows = [dict(row) for row in api.path(*_SIMPLE_QUEUE_PATH)]
+        ids = [str(row.get(".id")) for row in rows]
+        if device_queue_id not in ids:
+            return
+        ours = rows[ids.index(device_queue_id)]
+        # A row under a venue's total cap is not the row that has to be
+        # first: its parent is. Raising the child above the parent would be
+        # at best meaningless and at worst take it out from under the cap,
+        # so the parent is what gets moved, and the child stays put.
+        anchor_id = device_queue_id
+        parent_name = _safe_str(ours.get("parent"))
+        if parent_name and parent_name != "none":
+            parent = _static_row_named(rows, parent_name)
+            if parent is None:
+                return
+            anchor_id = str(parent.get(".id"))
+        elif not _targets_single_hosts(ours):
+            return
+        if ids[0] != anchor_id:
+            tuple(
+                api(
+                    "/queue/simple/move",
+                    numbers=anchor_id,
+                    destination=ids[0],
+                )
+            )
+            rows = [dict(row) for row in api.path(*_SIMPLE_QUEUE_PATH)]
+    except LibRouterosError as exc:
+        logger.warning(
+            "simple_queue_raise_failed",
+            extra={"host": host, "device_queue_id": device_queue_id, "error": str(exc)},
+        )
+        return
+    ours = next((r for r in rows if str(r.get(".id")) == device_queue_id), None)
+    if ours is None:
+        return
+    targets = _simple_queue_targets(ours)
+    for row in rows:
+        if str(row.get(".id")) in (device_queue_id, anchor_id):
+            return
+        if targets & _simple_queue_targets(row):
+            logger.warning(
+                "simple_queue_shadowed",
+                extra={
+                    "host": host,
+                    "device_queue_id": device_queue_id,
+                    "shadowed_by": _safe_str(row.get("name")),
+                    "shadowed_by_dynamic": _is_truthy(row.get("dynamic")),
+                },
+            )
+            return
+
+
+def _is_prefixed_uuid_name(name: str | None, prefix: str) -> bool:
+    """Whether ``name`` is ``<prefix><uuid>`` and nothing else -- the shape
+    of a per-guest row's name. ``<prefix>venue-...`` and ``<prefix>qos-...``
+    share the prefix and are other things."""
+    if not name or not name.startswith(prefix):
+        return False
+    try:
+        uuid.UUID(name[len(prefix) :])
+    except ValueError:
+        return False
+    return True
+
+
+def _remove_superseded_simple_queues(  # noqa: ANN001
+    api,
+    host: str,
+    device_queue_id: str,
+    name_prefix: str,
+    keep_queue_ids: tuple[str, ...] = (),
+) -> int:
+    """Remove every other static ``/queue simple`` row named
+    ``<name_prefix><uuid>`` that targets exactly the single host
+    ``device_queue_id`` targets; returns how many went.
+
+    RouterOS applies the first matching simple queue in list order, so two
+    rows for one address are one limit and one row that does nothing --
+    and which is which is decided by the list, not by which is newer. The
+    caller's own bookkeeping removes the row a new one replaces, but as a
+    separate step, on a separate connection, after the new row is written:
+    when that step fails, or its record is rolled back, the old row stays.
+    Where the old row is an unlimited one (``max-limit=0/0``, what "no
+    limit" is written as) and it sits above the new one, the guest runs at
+    full speed under a limit the venue has just set. Observed on hardware
+    as several rows per address with a ``0/0`` row on top.
+
+    Moving the new row to the top covers that only while the move works
+    and nothing is added above it later. Taking the other rows away covers
+    it whatever the order is.
+
+    What is never touched: the row itself; a dynamic row (the device's
+    own -- the hotspot's ``<hotspot-...>`` rows are these, and cannot be
+    removed anyway); a row with any other name; a row whose target is not
+    exactly this one host, which is what keeps a venue's parent row and
+    every other guest's row out of it; and ``keep_queue_ids``.
+
+    A row that has already gone is not an error. Anything else the device
+    refuses is raised to the caller."""
+    path = api.path(*_SIMPLE_QUEUE_PATH)
+    rows = [dict(row) for row in path]
+    ours = next((r for r in rows if str(r.get(".id")) == device_queue_id), None)
+    if ours is None or not _targets_single_hosts(ours):
+        return 0
+    targets = _simple_queue_targets(ours)
+    removed: list[str] = []
+    for row in rows:
+        row_id = str(row.get(".id"))
+        if row_id == device_queue_id or row_id in keep_queue_ids:
+            continue
+        if _is_truthy(row.get("dynamic")):
+            continue
+        if not _is_prefixed_uuid_name(_safe_str(row.get("name")), name_prefix):
+            continue
+        if _simple_queue_targets(row) != targets:
+            continue
+        try:
+            path.remove(row_id)
+        except LibRouterosError as exc:
+            if "no such item" not in str(exc).lower():
+                raise
+        removed.append(_safe_str(row.get("name")) or row_id)
+    if removed:
+        logger.info(
+            "simple_queue_superseded_rows_removed",
+            extra={
+                "host": host,
+                "device_queue_id": device_queue_id,
+                "removed_rows": removed,
+            },
+        )
+    return len(removed)
 
 
 def _max_limit_field(upload_rate_kbps: int, download_rate_kbps: int) -> dict[str, str]:
@@ -8121,6 +9755,78 @@ def _row_mac(row: dict[str, object]) -> str | None:
 # plain numeric `signal` with `rx-rate`/`tx-rate` alongside it, so the
 # parser to write depends on which wireless stack the device actually
 # runs -- which is the version gate described in that method's docstring.
+
+
+def _pool_first_address(ranges: tuple[str, ...]) -> ipaddress.IPv4Address | None:
+    """The first address of an ``/ip pool`` ``ranges`` value (``a-b``,
+    ``a/24`` or a bare ``a``), or ``None`` when it does not parse."""
+    for part in ranges:
+        head = part.split("-", 1)[0].strip()
+        try:
+            if "/" in head:
+                return next(ipaddress.ip_network(head, strict=False).hosts(), None)
+            return ipaddress.IPv4Address(head)
+        except ValueError:
+            continue
+    return None
+
+
+def _join_dhcp_pools(
+    pools: list[Mapping[str, object]],
+    servers: list[Mapping[str, object]],
+    networks: list[Mapping[str, object]],
+) -> list[DhcpPoolState]:
+    """``/ip pool`` + ``/ip dhcp-server`` + ``/ip dhcp-server network`` rows
+    -> one :class:`DhcpPoolState` per pool, in the router's own order.
+
+    A pool is joined to the first server whose ``address-pool`` names it,
+    and to the first network row whose subnet contains the pool's first
+    address -- the same match RouterOS itself makes when it picks which
+    gateway/DNS to hand a lease from that pool."""
+    by_pool: dict[str, Mapping[str, object]] = {}
+    for srv in servers:
+        name = _safe_str(srv.get("address-pool"))
+        if name and name not in by_pool:
+            by_pool[name] = srv
+    parsed_networks: list[tuple[ipaddress.IPv4Network, Mapping[str, object]]] = []
+    for row in networks:
+        try:
+            net = ipaddress.ip_network(str(row.get("address") or ""), strict=False)
+        except ValueError:
+            continue
+        if isinstance(net, ipaddress.IPv4Network):
+            parsed_networks.append((net, row))
+
+    out: list[DhcpPoolState] = []
+    for row in pools:
+        name = _safe_str(row.get("name"))
+        if name is None:
+            continue
+        ranges = tuple(
+            r.strip() for r in str(row.get("ranges") or "").split(",") if r.strip()
+        )
+        srv = by_pool.get(name)
+        first = _pool_first_address(ranges)
+        net_row = next(
+            (r for n, r in parsed_networks if first is not None and first in n), None
+        )
+        dns = _safe_str(net_row.get("dns-server")) if net_row else None
+        out.append(
+            DhcpPoolState(
+                pool_name=name,
+                ranges=ranges,
+                server=_safe_str(srv.get("name")) if srv else None,
+                interface=_safe_str(srv.get("interface")) if srv else None,
+                lease_time=_safe_str(srv.get("lease-time")) if srv else None,
+                server_disabled=_is_truthy(srv.get("disabled")) if srv else False,
+                network=_safe_str(net_row.get("address")) if net_row else None,
+                gateway=_safe_str(net_row.get("gateway")) if net_row else None,
+                dns_servers=tuple(
+                    d.strip() for d in (dns or "").split(",") if d.strip()
+                ),
+            )
+        )
+    return out
 
 
 def _lease_from_row(row: Mapping[str, object]) -> DhcpLease | None:

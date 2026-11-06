@@ -53,7 +53,7 @@ import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Any, Protocol
+from typing import Any, NoReturn, Protocol
 
 from app.common.exceptions import CloudGuestError
 from app.database.utils.pagination import PaginationMeta
@@ -103,13 +103,31 @@ from .exceptions import (
     RemoteBootstrapNeverEnrolledError,
     RouterDecommissionedError,
     RouterLiveCredentialRotationFailedError,
+    RouterLocalAdminDeviceError,
+    RouterLocalAdminNotIssuedError,
+    RouterLocalAdminUnavailableError,
     RouterNotFoundError,
     RouterVendorChangeRefusedError,
     RouterVendorNotProvisionableError,
     RouterVendorNotSupportedError,
 )
+from .local_admin import (
+    LOCAL_ADMIN_STATUS_ACTIVE,
+    LOCAL_ADMIN_STATUS_PENDING,
+    LOCAL_ADMIN_USERNAME,
+    LocalAdminDeviceError,
+    LocalAdminDeviceProtocol,
+    LocalUser,
+    LoginProbeResult,
+    generate_local_admin_password,
+)
 from .models import Router, RouterProvisioningToken
 from .repository import RouterRepositoryProtocol
+from .schemas import (
+    RouterLocalAdminApplyResponse,
+    RouterLocalAdminCheckResponse,
+    RouterLocalAdminSecretResponse,
+)
 from .vendor_capabilities import (
     AGENT_EVIDENCE_FIELDS,
     ARUBA_INSTANT_ON_VENDOR,
@@ -136,6 +154,9 @@ class ControllerContext:
     reason: str | None = None
     last_contacted_at: datetime | None = None
     vendor_claim_is_contradicted: bool = False
+    #: NAS-only rows only (Aruba Instant On): the last RADIUS packet the
+    #: shared listener resolved to this device. ``None`` on every other row.
+    last_radius_at: datetime | None = None
 
 
 logger = logging.getLogger(__name__)
@@ -275,6 +296,7 @@ class RouterService:
         audit_writer: AuditLogWriter | None = None,
         provisioning_token_ttl_hours: int = 24,
         credential_rotator: DeviceCredentialRotatorProtocol | None = None,
+        local_admin_device: LocalAdminDeviceProtocol | None = None,
     ) -> None:
         self.repository = repository
         self.location_lookup = location_lookup
@@ -285,6 +307,7 @@ class RouterService:
         # ``_rotate_live_api_secret_if_needed``'s own docstring for exactly
         # what happens when this is unset vs. configured.
         self.credential_rotator = credential_rotator
+        self.local_admin_device = local_admin_device
 
     # -- reads -----------------------------------------------------------------
 
@@ -396,6 +419,11 @@ class RouterService:
         integrations = await self.repository.integrations_for_routers(
             [r.id for r in controller_rows]
         )
+        radius_activity: dict[uuid.UUID, datetime] = {}
+        nas_only_ids = [r.id for r in controller_rows if is_nas_only(r)]
+        lookup = getattr(self.repository, "radius_activity_for_routers", None)
+        if nas_only_ids and lookup is not None:
+            radius_activity = await lookup(nas_only_ids)
         for router in controller_rows:
             integration = integrations.get(router.id)
             derived = controller_state_for(router, integration)
@@ -413,6 +441,7 @@ class RouterService:
                 # second, more optimistic answer to the same question.
                 last_contacted_at=getattr(integration, "last_sync_at", None),
                 vendor_claim_is_contradicted=False,
+                last_radius_at=radius_activity.get(router.id),
             )
         return contexts
 
@@ -631,10 +660,27 @@ class RouterService:
         kept in the audit metadata) so the AP's real serial can be recorded
         on the new row. A decommissioned row of any other vendor is not
         touched; that is refused with the same 409 as a live one.
+
+        A *live* NAS-only holder whose location has been deleted is an
+        orphan, not a duplicate: archiving a location soft-deletes the
+        location but leaves its fleet rows live, so the AP's serial stayed
+        held by a row nobody can open (prod, 2026-11-01: an AP21 test
+        location deleted 2026-10-02 blocked the same AP at a new venue with
+        "A router with serial number ... already exists"). Such a row is
+        decommissioned first (audited) and then released like any other
+        decommissioned NAS-only row. It cannot authenticate anyone already:
+        the shared listener resolves a NAS only through a live fleet row.
         """
         holders = await self.repository.routers_holding_identity(
             serial_number=serial_number, mac_address=mac_address
         )
+        for holder in holders:
+            if (
+                not holder.is_deleted
+                and is_nas_only(holder)
+                and await self._location_is_deleted(holder.location_id)
+            ):
+                await self._decommission_orphan(actor_user_id, holder)
         for holder in holders:
             if not holder.is_deleted or not is_nas_only(holder):
                 if holder.serial_number == serial_number:
@@ -664,6 +710,37 @@ class RouterService:
                     "released_mac_address": old_mac,
                 },
             )
+
+    async def _location_is_deleted(self, location_id: uuid.UUID) -> bool:
+        """True only when the location row exists and is soft-deleted. A
+        location that cannot be read at all is not treated as deleted: the
+        holder then stays a conflict, which is the old, safe answer."""
+        try:
+            location = await self.location_lookup.get_location(
+                location_id, requesting_organization_id=None, include_deleted=True
+            )
+        except CloudGuestError:
+            return False
+        return bool(location.is_deleted)
+
+    async def _decommission_orphan(
+        self, actor_user_id: uuid.UUID | None, router: Router
+    ) -> None:
+        updated = await self.repository.update_router(
+            router,
+            {"status": RouterStatus.DECOMMISSIONED.value, "updated_by": actor_user_id},
+        )
+        updated = await self.repository.soft_delete_router(updated)
+        await self._audit(
+            actor_user_id,
+            AuditAction.ROUTER_DECOMMISSIONED,
+            router=updated,
+            description=(
+                f"Instant On row '{updated.name}' decommissioned: its location "
+                "was deleted and a new row needs its serial/MAC"
+            ),
+            metadata={"reason": "orphaned_by_deleted_location"},
+        )
 
     async def update_router(
         self,
@@ -1799,6 +1876,31 @@ class RouterService:
             return None
         return decrypt_secret(router.snmp_community_encrypted)
 
+    def get_snmp_credentials(self, router: Router):  # noqa: ANN201
+        """Fully resolved SNMP credentials for the poller (per-router values,
+        platform defaults for v1/v2c), or ``None`` when there is nothing to
+        poll with. See :func:`app.domains.router.snmp.resolve_snmp_credentials`."""
+        from .snmp import resolve_snmp_credentials
+
+        return resolve_snmp_credentials(router)
+
+    async def record_snmp_poll_outcome(
+        self, router: Router, *, status: str, detail: str | None = None
+    ) -> None:
+        """Persist the outcome of one SNMP poll on the router row, so the
+        Master console can say when it last worked and why it did not. A
+        failure never touches ``snmp_last_success_at``. Not audited: this is
+        telemetry, written every sweep."""
+        now = datetime.now(UTC)
+        update: dict[str, object] = {
+            "snmp_last_poll_at": now,
+            "snmp_last_poll_status": status,
+            "snmp_last_poll_detail": (detail[:500] if detail else None),
+        }
+        if status == "ok":
+            update["snmp_last_success_at"] = now
+        await self.repository.update_router(router, update)
+
     async def reveal_credentials(
         self,
         *,
@@ -1828,6 +1930,263 @@ class RouterService:
             ),
         )
         return router
+
+    # -- local admin password ---------------------------------------------------
+
+    def _local_admin_access(self, router: Router) -> tuple[str, str, str]:
+        """Host, username and password the platform connects with. Refuses a
+        router whose connection account IS ``admin``: changing that password
+        would change the platform's own credential as well."""
+        if (router.vendor or "").lower() != "mikrotik":
+            raise RouterLocalAdminUnavailableError(
+                router.id, f"'{router.vendor}' devices are not supported"
+            )
+        host = router.management_ip_address or router.public_ip_address
+        secret = self.get_decrypted_api_secret(router)
+        if not host or not router.api_username or not secret:
+            raise RouterLocalAdminUnavailableError(
+                router.id, "the platform has no API access to this router yet"
+            )
+        if router.api_username == LOCAL_ADMIN_USERNAME:
+            raise RouterLocalAdminUnavailableError(
+                router.id,
+                f"the platform connects to this router as '{LOCAL_ADMIN_USERNAME}'",
+            )
+        return host, router.api_username, secret
+
+    def _local_admin_device(self) -> LocalAdminDeviceProtocol:
+        if self.local_admin_device is None:
+            raise RuntimeError("RouterService has no local_admin_device configured")
+        return self.local_admin_device
+
+    async def check_local_admin_password(
+        self, *, actor_user_id: uuid.UUID | None, router_id: uuid.UUID
+    ) -> RouterLocalAdminCheckResponse:
+        """Reads the device's login state. Writes nothing to the device, though
+        each login attempt appears in its log."""
+        router = await self.get_router(router_id)
+        host, api_user, api_secret = self._local_admin_access(router)
+        device = self._local_admin_device()
+        try:
+            users = await device.list_users(
+                host=host, username=api_user, password=api_secret
+            )
+        except LocalAdminDeviceError as exc:
+            raise RouterLocalAdminDeviceError(router.id, str(exc)) from exc
+        admin_exists = any(u.name == LOCAL_ADMIN_USERNAME for u in users)
+        blank = await device.probe_login(
+            host=host, username=LOCAL_ADMIN_USERNAME, password=""
+        )
+        stored_works: bool | None = None
+        if router.local_admin_password_encrypted is not None:
+            stored = await device.probe_login(
+                host=host,
+                username=LOCAL_ADMIN_USERNAME,
+                password=decrypt_secret(router.local_admin_password_encrypted),
+            )
+            stored_works = stored is LoginProbeResult.ACCEPTED
+        admin_login = {
+            LoginProbeResult.ACCEPTED: "blank",
+            LoginProbeResult.DENIED: "password_set",
+            LoginProbeResult.UNREACHABLE: "unreachable",
+        }[blank]
+        result = RouterLocalAdminCheckResponse(
+            admin_exists=admin_exists,
+            admin_login=admin_login,
+            stored_password_works=stored_works,
+            other_full_access_users=self._other_full_access_users(users, api_user),
+        )
+        await self._audit(
+            actor_user_id,
+            AuditAction.ROUTER_LOCAL_ADMIN_PASSWORD_CHECKED,
+            router=router,
+            description=f"Local admin login checked on router '{router.name}'",
+            metadata=result.model_dump(),
+        )
+        return result
+
+    @staticmethod
+    def _other_full_access_users(
+        users: Sequence[LocalUser], api_user: str
+    ) -> list[str]:
+        """Enabled full-access accounts other than ``admin`` and the platform's.
+        Any of them is another way in that this password does not close."""
+        return sorted(
+            u.name
+            for u in users
+            if u.group == "full"
+            and not u.disabled
+            and u.name not in {LOCAL_ADMIN_USERNAME, api_user}
+        )
+
+    async def _ensure_local_admin_password(self, router: Router) -> str:
+        if router.local_admin_password_encrypted is not None:
+            return decrypt_secret(router.local_admin_password_encrypted)
+        password = generate_local_admin_password()
+        await self.repository.update_router(
+            router,
+            {
+                "local_admin_password_encrypted": encrypt_secret(password),
+                "local_admin_password_status": LOCAL_ADMIN_STATUS_PENDING,
+            },
+        )
+        return password
+
+    def _local_admin_secret_response(
+        self, router: Router, password: str
+    ) -> RouterLocalAdminSecretResponse:
+        return RouterLocalAdminSecretResponse(
+            username=LOCAL_ADMIN_USERNAME,
+            password=password,
+            status=router.local_admin_password_status or LOCAL_ADMIN_STATUS_PENDING,
+            verified_at=router.local_admin_password_verified_at,
+        )
+
+    async def issue_local_admin_password(
+        self, *, actor_user_id: uuid.UUID | None, router_id: uuid.UUID
+    ) -> RouterLocalAdminSecretResponse:
+        """The password for a setup script. Stays ``pending`` until
+        :meth:`apply_local_admin_password` proves it with a login."""
+        router = await self.get_router(router_id)
+        if (router.vendor or "").lower() != "mikrotik":
+            raise RouterLocalAdminUnavailableError(
+                router.id, f"'{router.vendor}' devices are not supported"
+            )
+        # Same refusal as `_local_admin_access`: a script setting this password
+        # would overwrite the credential the platform connects with.
+        if router.api_username == LOCAL_ADMIN_USERNAME:
+            raise RouterLocalAdminUnavailableError(
+                router.id,
+                f"the platform connects to this router as '{LOCAL_ADMIN_USERNAME}'",
+            )
+        password = await self._ensure_local_admin_password(router)
+        await self._audit(
+            actor_user_id,
+            AuditAction.ROUTER_LOCAL_ADMIN_PASSWORD_ISSUED,
+            router=router,
+            description=f"Local admin password issued for router '{router.name}'",
+        )
+        return self._local_admin_secret_response(router, password)
+
+    async def apply_local_admin_password(
+        self, *, actor_user_id: uuid.UUID | None, router_id: uuid.UUID
+    ) -> RouterLocalAdminApplyResponse:
+        """Makes the device's ``admin`` password match the stored one.
+
+        The password is committed before the device is touched. If the request
+        dies after the write, the platform still holds the password the device
+        now has, instead of a router whose password nobody knows.
+
+        ``active`` is only ever set after a fresh login with that password
+        succeeds, because RouterOS cannot read a password back.
+        """
+        router = await self.get_router(router_id)
+        host, api_user, api_secret = self._local_admin_access(router)
+        device = self._local_admin_device()
+        password = await self._ensure_local_admin_password(router)
+        await self.repository.commit()
+
+        before = await device.probe_login(
+            host=host, username=LOCAL_ADMIN_USERNAME, password=password
+        )
+        if before is LoginProbeResult.UNREACHABLE:
+            await self._fail_local_admin_apply(
+                actor_user_id, router, "the router could not be reached"
+            )
+
+        device_changed = before is LoginProbeResult.DENIED
+        if device_changed:
+            try:
+                await device.set_password(
+                    host=host,
+                    username=api_user,
+                    password=api_secret,
+                    target_username=LOCAL_ADMIN_USERNAME,
+                    new_password=password,
+                )
+            except LocalAdminDeviceError as exc:
+                await self._fail_local_admin_apply(actor_user_id, router, str(exc))
+            after = await device.probe_login(
+                host=host, username=LOCAL_ADMIN_USERNAME, password=password
+            )
+            if after is not LoginProbeResult.ACCEPTED:
+                await self._fail_local_admin_apply(
+                    actor_user_id,
+                    router,
+                    f"a login with the new password was {after.value}",
+                )
+
+        verified_at = datetime.now(UTC)
+        await self.repository.update_router(
+            router,
+            {
+                "local_admin_password_status": LOCAL_ADMIN_STATUS_ACTIVE,
+                "local_admin_password_verified_at": verified_at,
+            },
+        )
+        # Informational: not being able to list accounts does not undo a login
+        # that just succeeded.
+        try:
+            others = self._other_full_access_users(
+                await device.list_users(
+                    host=host, username=api_user, password=api_secret
+                ),
+                api_user,
+            )
+        except LocalAdminDeviceError:
+            others = []
+        await self._audit(
+            actor_user_id,
+            AuditAction.ROUTER_LOCAL_ADMIN_PASSWORD_APPLIED,
+            router=router,
+            description=f"Local admin password confirmed on router '{router.name}'",
+            metadata={
+                "device_changed": device_changed,
+                "other_full_access_users": others,
+            },
+        )
+        return RouterLocalAdminApplyResponse(
+            status=LOCAL_ADMIN_STATUS_ACTIVE,
+            verified_at=verified_at,
+            device_changed=device_changed,
+            other_full_access_users=others,
+        )
+
+    async def _fail_local_admin_apply(
+        self, actor_user_id: uuid.UUID | None, router: Router, detail: str
+    ) -> NoReturn:
+        """Records the failure and raises. Commits first, because the raise
+        rolls this request's session back. A password that was active is
+        no longer known to be, so it goes back to ``pending``."""
+        await self.repository.update_router(
+            router, {"local_admin_password_status": LOCAL_ADMIN_STATUS_PENDING}
+        )
+        await self._audit(
+            actor_user_id,
+            AuditAction.ROUTER_LOCAL_ADMIN_PASSWORD_APPLY_FAILED,
+            router=router,
+            description=(
+                f"Local admin password not confirmed on router '{router.name}'"
+            ),
+            metadata={"detail": detail},
+        )
+        await self.repository.commit()
+        raise RouterLocalAdminDeviceError(router.id, detail)
+
+    async def reveal_local_admin_password(
+        self, *, actor_user_id: uuid.UUID | None, router_id: uuid.UUID
+    ) -> RouterLocalAdminSecretResponse:
+        router = await self.get_router(router_id)
+        if router.local_admin_password_encrypted is None:
+            raise RouterLocalAdminNotIssuedError(router.id)
+        password = decrypt_secret(router.local_admin_password_encrypted)
+        await self._audit(
+            actor_user_id,
+            AuditAction.ROUTER_LOCAL_ADMIN_PASSWORD_REVEALED,
+            router=router,
+            description=f"Local admin password revealed for router '{router.name}'",
+        )
+        return self._local_admin_secret_response(router, password)
 
     # -- internal helpers -------------------------------------------------------
 

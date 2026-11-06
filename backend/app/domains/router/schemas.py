@@ -59,6 +59,7 @@ __all__ = [
     "RouterUpdateRequest",
     "RouterManagementAccessRequest",
     "NasOnlySiteCreateRequest",
+    "NasOnlySiteFields",
     "NasOnlySiteCreateResponse",
     "ProvisioningTokenResponse",
     "ProvisioningCheckInRequest",
@@ -264,6 +265,16 @@ class RouterResponse(BaseModel):
             "as 'Last contacted the controller', never as 'last seen'."
         ),
     )
+    last_radius_at: datetime | None = Field(
+        default=None,
+        description=(
+            "Aruba Instant On (NAS-only) rows only: when the venue's access "
+            "points last sent this platform a RADIUS packet (a guest sign-in "
+            "or accounting update). Always null for MikroTik and Omada rows. "
+            "An idle venue sends nothing, so an old value means 'no recent "
+            "guest activity', never 'offline'."
+        ),
+    )
     vendor_claim_is_contradicted: bool = Field(
         default=False,
         description=(
@@ -293,6 +304,10 @@ CUSTOMER_FORBIDDEN_ROUTER_FIELDS: frozenset[str] = frozenset(
         "api_username",
         "api_secret",
         "api_credentials_encrypted",
+        "local_admin_password",
+        "local_admin_password_encrypted",
+        "local_admin_password_status",
+        "local_admin_password_verified_at",
         "snmp_enabled",
         "snmp_community",
         "snmp_community_encrypted",
@@ -395,6 +410,36 @@ class RouterPlatformResponse(RouterResponse):
     has_snmp_community: bool
     snmp_version: str | None = None
     snmp_port: int | None = None
+    # Whether a local admin password exists and has been proven on the device.
+    # Never the password: that leaves only through the audited reveal route.
+    local_admin_password_status: str | None = None
+    local_admin_password_verified_at: datetime | None = None
+
+
+class RouterLocalAdminCheckResponse(BaseModel):
+    """What the device says about its local login right now. Changes nothing."""
+
+    admin_exists: bool
+    # "blank" | "password_set" | "unreachable"
+    admin_login: str
+    # None when no password has been issued for this router yet.
+    stored_password_works: bool | None
+    other_full_access_users: list[str]
+
+
+class RouterLocalAdminApplyResponse(BaseModel):
+    status: str
+    verified_at: datetime | None
+    # Whether this call had to write to the device, or found it already correct.
+    device_changed: bool
+    other_full_access_users: list[str]
+
+
+class RouterLocalAdminSecretResponse(BaseModel):
+    username: str
+    password: str
+    status: str
+    verified_at: datetime | None
 
 
 class RouterListResponse(BaseModel):
@@ -642,30 +687,16 @@ class RouterVendorChangeRequest(BaseModel):
     )
 
 
-class NasOnlySiteCreateRequest(BaseModel):
-    """``POST /platform/routers/instant-on-sites``: add one Aruba Instant On
-    site as one fleet row (PM_SPEC §0.1 items 1, 4, 5).
-
-    ``organization_id`` travels in the body, not in ``X-Organization-Id``:
-    this is a GLOBAL-scoped ``/platform/`` route, and the service checks the
-    location against it -- the same shape as the Omada
-    ``/network-integrations/platform/onboard`` route.
-
-    ``serial_number`` and ``mac_address`` are optional because
-    ``routers.serial_number``/``routers.mac_address`` are NOT NULL and unique
-    but an operator adding a site may not have the AP in hand. Absent, the
-    service records a visibly synthetic pair (``AIO-`` serial, locally
-    administered MAC) rather than a plausible vendor one.
-
-    ``extra="forbid"``: a mis-shaped body (``site_id`` for
-    ``instant_on_site_id``) is a 422, not a 201 that silently stored nothing
-    -- the Omada credential-shape lesson.
-    """
+class NasOnlySiteFields(BaseModel):
+    """The Instant On site itself -- name, optional AP identity, optional
+    Instant On site id/name -- and every rule about them, shared by
+    ``NasOnlySiteCreateRequest`` (Router Fleet's "Add Instant On site") and
+    ``ProvisionLocationRequest.instant_on_site`` (the Add Customer wizard's
+    Aruba option). One definition, so the two forms cannot accept different
+    shapes. See ``NasOnlySiteCreateRequest`` for what each field means."""
 
     model_config = ConfigDict(extra="forbid")
 
-    organization_id: uuid.UUID
-    location_id: uuid.UUID
     name: str = Field(..., min_length=1, max_length=200)
     serial_number: str | None = Field(default=None, min_length=1, max_length=100)
     mac_address: str | None = Field(default=None, min_length=12, max_length=17)
@@ -677,7 +708,7 @@ class NasOnlySiteCreateRequest(BaseModel):
     )
 
     @model_validator(mode="after")
-    def site_name_needs_site_id(self) -> NasOnlySiteCreateRequest:
+    def site_name_needs_site_id(self) -> NasOnlySiteFields:
         if self.instant_on_site_name and not self.instant_on_site_id:
             raise ValueError(
                 "instant_on_site_name needs instant_on_site_id: the site name is "
@@ -708,6 +739,30 @@ class NasOnlySiteCreateRequest(BaseModel):
         if len(bare) == 12 and re.fullmatch(r"[0-9A-Fa-f]{12}", bare):
             value = ":".join(bare[i : i + 2] for i in range(0, 12, 2))
         return _validate_mac(value)
+
+
+class NasOnlySiteCreateRequest(NasOnlySiteFields):
+    """``POST /platform/routers/instant-on-sites``: add one Aruba Instant On
+    site as one fleet row (PM_SPEC §0.1 items 1, 4, 5).
+
+    ``organization_id`` travels in the body, not in ``X-Organization-Id``:
+    this is a GLOBAL-scoped ``/platform/`` route, and the service checks the
+    location against it -- the same shape as the Omada
+    ``/network-integrations/platform/onboard`` route.
+
+    ``serial_number`` and ``mac_address`` are optional because
+    ``routers.serial_number``/``routers.mac_address`` are NOT NULL and unique
+    but an operator adding a site may not have the AP in hand. Absent, the
+    service records a visibly synthetic pair (``AIO-`` serial, locally
+    administered MAC) rather than a plausible vendor one.
+
+    ``extra="forbid"``: a mis-shaped body (``site_id`` for
+    ``instant_on_site_id``) is a 422, not a 201 that silently stored nothing
+    -- the Omada credential-shape lesson.
+    """
+
+    organization_id: uuid.UUID
+    location_id: uuid.UUID
 
 
 class NasOnlySiteCreateResponse(BaseModel):

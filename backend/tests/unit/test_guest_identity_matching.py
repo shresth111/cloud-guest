@@ -80,8 +80,8 @@ class TestPhoneSpellingsResolveToOneGuest:
 class TestNonPhoneIdentifiersAreNotWidened:
     def test_an_email_matches_exactly_and_only(self) -> None:
         """``identifier_match_terms`` never widens anything it cannot prove is
-        a phone number, and ``canonicalize_rule_identifier`` returns emails
-        untouched (case preserved). So an email lookup must stay exact."""
+        a phone number into other *spellings*. An email is one term, compared
+        case-insensitively -- see ``test_guest_identifier_case``."""
         terms = identifier_match_terms("guest@example.com")
 
         assert terms.exact == ("guest@example.com",)

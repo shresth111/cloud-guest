@@ -155,6 +155,10 @@ class IspLinkResponse(BaseModel):
     failover_push_status: str
     failover_push_error: str | None
     failover_pushed_at: datetime | None
+    # The owning router's mode. Under load_balance `role` and
+    # `is_active_uplink` do not say which line carries traffic: both do.
+    # Null on responses that did not read the router.
+    wan_routing_mode: str | None = None
     created_at: datetime
 
 

@@ -760,6 +760,9 @@ class InstantOnClient:
     async def get_alerts(self, site_id: str) -> list[dict[str, Any]]:
         return _elements(await self._site_get(site_id, "alerts"), "alerts")
 
+    async def get_events(self, site_id: str) -> list[dict[str, Any]]:
+        return _elements(await self._site_get(site_id, "events"), "events")
+
     async def get_system_health(self, site_id: str) -> dict[str, Any]:
         payload = await self._site_get(site_id, "systemHealth")
         if not isinstance(payload, dict):

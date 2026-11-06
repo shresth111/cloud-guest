@@ -53,6 +53,8 @@ __all__ = [
     "GuestUpdateProfileRequest",
     "GuestReviewLinkOpenedRequest",
     "GuestReviewLinkOpenedResponse",
+    "GuestReviewPromptShownRequest",
+    "GuestReviewPromptShownResponse",
     "GuestUpdateProfileResponse",
     "GuestConsentRequest",
     "GuestBlockRequest",
@@ -71,6 +73,7 @@ __all__ = [
     "GuestSessionListResponse",
     "GuestLoginResponse",
     "GuestLastEndedSessionResponse",
+    "GuestTrustedDeviceResponse",
     "GuestResponse",
     "GuestDetailResponse",
     "GuestListResponse",
@@ -259,6 +262,30 @@ class GuestUpdateProfileRequest(BaseModel):
     )
 
 
+class GuestSignInNameRequest(BaseModel):
+    """The portal's "Your name" screen, between OTP verify and the hotspot
+    login. Proof of session is the ``guest_id``/``session_id`` pair the
+    login response just issued -- see
+    ``service.GuestService.submit_sign_in_name``.
+
+    ``display_name`` is deliberately loose here (any string up to a
+    generous ceiling) and is cleaned and checked by
+    ``validators.normalize_guest_display_name``, so an empty or
+    whitespace-only name comes back as the stable
+    ``data.code == "guest_name_invalid"`` the portal can show, not as a
+    generic 422 schema error."""
+
+    guest_id: uuid.UUID
+    session_id: uuid.UUID
+    display_name: str = Field(max_length=1000)
+
+
+class GuestSignInNameResponse(BaseModel):
+    guest_id: str
+    display_name: str
+    has_profile: bool
+
+
 class GuestUpdateProfileResponse(BaseModel):
     guest_id: str
     display_name: str | None
@@ -289,6 +316,20 @@ class GuestReviewLinkOpenedResponse(BaseModel):
     # `has_profile`: the caller should never have to re-derive the rule
     # that decides whether the card is finished with.
     has_opened_review_link: bool
+
+
+class GuestReviewPromptShownRequest(BaseModel):
+    """``/portal/review`` was shown to this guest in this session. Two ids
+    and nothing else, like ``GuestReviewLinkOpenedRequest``."""
+
+    guest_id: uuid.UUID
+    session_id: uuid.UUID
+
+
+class GuestReviewPromptShownResponse(BaseModel):
+    # Always false after a successful call: the page has now been shown
+    # in this session. Echoed so the portal never re-derives the rule.
+    review_prompt_due: bool
 
 
 class GuestDisconnectRequest(BaseModel):
@@ -558,6 +599,13 @@ class GuestSessionResponse(BaseModel):
     disconnect_enforced: bool | None = None
     user_agent: str | None
     created_at: datetime
+    #: Aruba Instant On only: the access point (canonical MAC) and SSID this
+    #: session was last reported from by RADIUS accounting, and the AP's name
+    #: from the venue's access-point list. Always ``None`` for MikroTik and
+    #: Omada sessions (nothing else writes ``guest_sessions.ap_mac``).
+    ap_mac: str | None = None
+    ap_ssid: str | None = None
+    ap_name: str | None = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -570,6 +618,49 @@ class GuestSessionListResponse(BaseModel):
     total_pages: int
     has_next: bool
     has_previous: bool
+
+
+class GuestSessionGroupResponse(BaseModel):
+    """One guest at one venue: their sessions there, folded into a row.
+
+    The venue Guests table used to list ``GET /guest-sessions`` row by row,
+    so a guest who reconnected six times was six rows under a "Total guests"
+    tile that counted them once. ``latest_session`` is the session the row
+    describes and acts on -- the newest *active* one when there is one, else
+    the newest -- and ``active_session_ids`` is every session a guest-level
+    Disconnect has to end (a guest on a phone and a laptop has two). The
+    history itself stays one ``GET /guest-sessions?guest_id=`` away."""
+
+    guest_id: str
+    guest_identifier: str | None = None
+    session_count: int
+    active_session_count: int
+    #: Distinct devices across these sessions (a MAC-less session counts none).
+    device_count: int
+    first_started_at: datetime
+    last_started_at: datetime
+    bytes_downloaded_total: int
+    bytes_uploaded_total: int
+    active_session_ids: list[str]
+    latest_session: GuestSessionResponse
+
+
+class GuestSessionGroupListResponse(BaseModel):
+    """Paginated by GUEST, so ``total_items`` is a count of people."""
+
+    items: list[GuestSessionGroupResponse]
+    page: int
+    page_size: int
+    total_items: int
+    total_pages: int
+    has_next: bool
+    has_previous: bool
+    #: Aruba Instant On only: whether a Disconnect at this venue can take the
+    #: device off through the Instant On cloud right now (every cloud-control
+    #: gate open and an Instant On site on record for the location). ``False``
+    #: everywhere else, including every MikroTik and Omada venue, whose
+    #: Disconnect does not read it.
+    instant_on_cloud_disconnect: bool = False
 
 
 class GuestLoginResponse(BaseModel):
@@ -622,13 +713,40 @@ class GuestLoginResponse(BaseModel):
     # See ``models.Guest.review_link_opened_at`` for why the difference
     # matters and why this can never be counted as reviews.
     has_opened_review_link: bool
+    # The "Rate us on Google" page (``/portal/review``) should be shown now.
+    # Computed server-side by ``GuestService.review_prompt_due``: the venue
+    # switched it on with a valid link, and this guest has neither opened
+    # the link at this location nor been shown the page there within the
+    # cooldown. The portal's single source of truth for the page; it
+    # supersedes ``has_opened_review_link``, which stays for older portals.
+    review_prompt_due: bool = False
+    # The review page was shown in this session. ``/portal/session`` keeps
+    # the star-feedback card out of any visit where this is true.
+    review_shown_this_session: bool = False
     # Guest Marketing (contract §5.8): non-null only when the venue's portal
     # has the opt-in turned on, the organization is entitled to the
     # add-on, and this guest has no consent row yet. The portal renders an
     # UNTICKED checkbox from it and never blocks access on it.
     marketing_consent_offer: dict[str, str] | None = None
+    # Name required at sign-in: true when this venue requires a name, this
+    # is an OTP login, and the guest has none on file. The session exists,
+    # but every step that opens the network refuses it (code
+    # ``guest_name_required``) until ``POST /guest/sign-in-name`` stores a
+    # name. The portal shows its one "Your name" screen on this bit and
+    # starts the hotspot login only after that call returns.
+    name_required: bool = False
     session: GuestSessionResponse
     device: GuestDeviceResponse | None
+
+
+class GuestTrustedDeviceResponse(BaseModel):
+    """What ``GET /guest/session/trusted-device`` returns for a Trusted
+    Device at an Aruba Instant On venue: the ``User-Name`` the portal posts
+    to the AP's login form. Always ``mac:<MAC>`` -- the MAC the caller sent,
+    so it discloses nothing the caller did not already have. A hint, not a
+    credential: see ``GuestService.trusted_device_login_identifier``."""
+
+    identifier: str
 
 
 class GuestLastEndedSessionResponse(BaseModel):
@@ -938,6 +1056,60 @@ class PublicNasRegistrationResponse(BaseModel):
     portal_url: PublicPortalUrlView | None = None
 
 
+class ArubaSharedListenerView(BaseModel):
+    """The shared Aruba RADIUS listener, as one venue's setup panel needs it:
+    the alternative to registering the venue's public IP. Identity comes
+    from inside each packet (NAS-Identifier + AP MAC), so the venue's public
+    address may change freely.
+
+    Gap codes: ``listener_not_installed`` (no agent URL on this deployment),
+    ``shared_secret_not_set``, ``hub_not_confirmed``, ``nas_not_registered``,
+    ``no_ap_mac``, ``radius_server_address_not_configured``.
+
+    ``no_ap_mac`` also covers a placeholder: a site added without its AP's
+    MAC carries a minted, locally administered one (``routers.mac_address``
+    is NOT NULL). Then ``ap_mac`` is None and ``ap_mac_placeholder`` is true,
+    so the panel can say "record the AP's real MAC" instead of showing a MAC
+    no access point will ever present.
+    """
+
+    available: bool
+    radius_server: RadiusServerView | None = None
+    auth_port: int
+    accounting_port: int
+    nas_identifier: str
+    ap_mac: str | None = None
+    ap_mac_placeholder: bool = False
+    secret_configured: bool = False
+    secret_fingerprint: str | None = None
+    secret_length: int | None = None
+    secret_rotated_at: str | None = None
+    hub_confirmed: bool = False
+    gaps: list[str] = Field(default_factory=list)
+
+
+class ArubaSharedSecretStatusResponse(BaseModel):
+    """Platform-wide shared Aruba secret: never the secret itself."""
+
+    listener_installed: bool
+    secret_configured: bool
+    secret_fingerprint: str | None = None
+    secret_length: int | None = None
+    secret_rotated_at: str | None = None
+    hub_confirmed: bool = False
+    auth_port: int
+    accounting_port: int
+    radius_server: RadiusServerView | None = None
+
+
+class ArubaSharedSecretRotatedResponse(ArubaSharedSecretStatusResponse):
+    """The one response that carries the shared secret. It breaks every
+    venue on the shared listener until retyped in each Instant On site."""
+
+    shared_secret: str
+    device_action: str
+
+
 class PublicNasStatusResponse(BaseModel):
     """Everything the Master setup panel for a NAS-only device renders.
 
@@ -972,6 +1144,12 @@ class PublicNasStatusResponse(BaseModel):
     )
     portal_url: PublicPortalUrlView | None = None
     gaps: list[str] = Field(default_factory=list)
+    shared_listener: ArubaSharedListenerView | None = Field(
+        default=None,
+        description="The IP-independent alternative: the shared Aruba "
+        "listener (ports 1912/1913, one platform secret, NAS-Identifier + AP "
+        "MAC identify the venue). Null for a non-NAS-only device.",
+    )
 
 
 # The device half of a rotation, stated rather than implied.
@@ -1166,12 +1344,32 @@ class RadiusAccountingRequest(BaseModel):
     bytes_uploaded_total: int | None = Field(default=None, ge=0)
     bytes_downloaded_total: int | None = Field(default=None, ge=0)
     disconnect_reason: str | None = Field(default=None, max_length=255)
+    framed_ip_address: str | None = Field(
+        default=None,
+        description="RADIUS Framed-IP-Address (RFC 2865 s5.8): the guest's IP "
+        "as the NAS saw it. Read only by the Aruba AP + MikroTik gateway "
+        "hybrid, to key the guest's queue on the gateway. An empty or "
+        "malformed value is dropped to None, never a validation error: an "
+        "accounting packet must not be refused over an optional attribute.",
+    )
 
     @field_validator("calling_station_id")
     @classmethod
     def _canonicalize_calling_station_id(cls, value: str | None) -> str | None:
         # Aruba sends bare hex; see `canonicalize_calling_station_id`.
         return canonicalize_calling_station_id(value)
+
+    @field_validator("framed_ip_address", mode="before")
+    @classmethod
+    def _lenient_framed_ip_address(cls, value: object) -> str | None:
+        import ipaddress
+
+        if value is None:
+            return None
+        try:
+            return str(ipaddress.ip_address(str(value).strip()))
+        except ValueError:
+            return None
 
     @model_validator(mode="after")
     def _require_username_for_session_scoped_status_types(

@@ -72,6 +72,7 @@ __all__ = [
     "ProviderPortalContext",
     "ProviderRadiusAuthorizationResult",
     "ProviderRadiusPortalContext",
+    "ProviderRadiusPortalSetup",
     "ProviderSite",
     "ProviderSsid",
     "ProviderTlsObservation",
@@ -477,6 +478,27 @@ class ProviderControllerSetupRequest:
     new_operator_password: str | None = field(default=None, repr=False)
     take_over_ssid_portal: bool = False
     dry_run: bool = True
+    #: Set when the integration is on the RADIUS contract: the portal is
+    #: then written as External RADIUS Server and this is its profile.
+    radius: ProviderRadiusPortalSetup | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderRadiusPortalSetup:
+    """The RADIUS half of :class:`ProviderControllerSetupRequest`.
+
+    ``shared_secret`` is the integration's own NAS secret, read from its
+    ``radius_nas_clients`` row -- the one the hub already holds for this
+    controller. ``repr=False`` keeps it out of tracebacks.
+    """
+
+    server_ip: str
+    server_port: int
+    profile_name: str
+    nas_id: str
+    portal_url_scheme: str
+    portal_url_host_and_query: str
+    shared_secret: str = field(repr=False)
 
 
 @dataclass(frozen=True, slots=True)

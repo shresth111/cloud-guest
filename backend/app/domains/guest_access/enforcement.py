@@ -71,7 +71,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Protocol
 
-from app.domains.router.vendor_capabilities import is_controller_managed
+from app.domains.router.vendor_capabilities import is_controller_managed, is_nas_only
 
 from .constants import BlockEnforcementStatus
 from .device_adapters import (
@@ -84,6 +84,7 @@ from .device_adapters import (
 from .exceptions import (
     BlockEnforcementMissingCredentialsError,
     ControllerSessionTerminationUnavailableError,
+    NasOnlyLiveSessionUnreachableError,
     RouterHasNoHotspotError,
     SessionStillActiveOnDeviceError,
 )
@@ -540,6 +541,16 @@ class LiveSessionTerminator:
         # this is the eighth. Asking the vendor first costs nothing on the
         # MikroTik path, which reaches the same two lines in the same order
         # one branch later, with the same adapter and the same credentials.
+        # A NAS-only access point (Aruba Instant On) is reachable by nothing
+        # this platform has, so there is nothing to attempt -- and asking the
+        # controller path would only answer "could not reach the controller",
+        # a sentence about a fault that does not exist. Said plainly instead,
+        # before any lookup. The block itself is unaffected: the sign-in gate
+        # and the RADIUS authorize re-check both refuse this guest.
+        if is_nas_only(router):
+            return await self._end_on_nas_only_cloud(
+                router, session=session, organization_id=organization_id
+            )
         if is_controller_managed(router):
             return await self._end_on_controller(
                 router, session=session, organization_id=organization_id
@@ -564,6 +575,48 @@ class LiveSessionTerminator:
                 coa_port=outcome.control.coa_port,
             )
         return outcome
+
+    async def _end_on_nas_only_cloud(
+        self,
+        router: BlockRouterRow,
+        *,
+        session: LiveSessionRow,
+        organization_id: uuid.UUID | None,
+    ) -> SessionEndOutcome:
+        """A NAS-only access point (Aruba Instant On) is unreachable from
+        here -- except through the vendor's own cloud, when cloud control is
+        switched on for this router (``network_integration.instant_on_control``,
+        OFF by default). Reached through the controller terminator's
+        ``end_nas_only`` attribute so no wiring site changes.
+
+        Anything short of a confirmed write raises
+        ``NasOnlyLiveSessionUnreachableError`` -- the exact answer this
+        branch gave before cloud control existed -- so a gate that is closed,
+        a session with no device MAC, or a failed Instant On write all keep
+        the honest "they stay online until their session ends"."""
+        end_nas_only = getattr(self.controller_terminator, "end_nas_only", None)
+        if end_nas_only is None:
+            raise NasOnlyLiveSessionUnreachableError(router.id)
+        client_mac = await self._session_mac_address(session)
+        if not client_mac:
+            raise NasOnlyLiveSessionUnreachableError(router.id)
+        ended = await end_nas_only(
+            router_id=router.id,
+            organization_id=organization_id,
+            client_mac=client_mac,
+        )
+        if not ended:
+            raise NasOnlyLiveSessionUnreachableError(router.id)
+        # Instant On listed the device as blocked on read-back, which is what
+        # makes the AP drop it. ``removed=1`` claims exactly that much.
+        return SessionEndOutcome(
+            control=SessionControlSnapshot(
+                hotspot_servers=1, coa_accept=False, coa_port=None
+            ),
+            matched=1,
+            removed=1,
+            still_active=0,
+        )
 
     async def _end_on_controller(
         self,
@@ -948,6 +1001,14 @@ class BlocklistEnforcer:
             session_locations=frozenset(s.location_id for s in sessions),
         )
 
+        # The sessions above are now ended in this platform's records, and
+        # a blocklisted guest is left off the authorized list even while a
+        # row still reads active. Their bypass binding is a separate object
+        # on the router that ending the live session does not remove. Ask
+        # for it to be reconciled; publishes nothing unless switched on,
+        # never raises.
+        await self._request_binding_reconcile(contacted_routers)
+
         logger.info(
             "guest_access_block_enforced",
             extra={
@@ -1116,6 +1177,17 @@ class BlocklistEnforcer:
         return results
 
     # -- internals ---------------------------------------------------------
+
+    @staticmethod
+    async def _request_binding_reconcile(router_ids: set[uuid.UUID]) -> None:
+        """Imported here rather than at module scope: ``guest`` imports this
+        domain, so the reverse import has to be late."""
+        from app.domains.guest.hotspot_binding_events import (  # noqa: PLC0415
+            request_hotspot_binding_reconcile,
+        )
+
+        for router_id in router_ids:
+            await request_hotspot_binding_reconcile(router_id)
 
     @staticmethod
     def _disconnect_reason(reason: str | None) -> str:

@@ -78,7 +78,7 @@ class DashboardScopeLevel(StrEnum):
 
 
 class OrganizationLookupProtocol(Protocol):
-    """The two ``OrganizationService`` methods this module composes with --
+    """The ``OrganizationService`` methods this module composes with --
     reused directly, never reimplemented."""
 
     async def get_organization(
@@ -86,6 +86,14 @@ class OrganizationLookupProtocol(Protocol):
     ) -> Organization: ...
 
     async def list_children(self, organization_id: uuid.UUID) -> list[Organization]: ...
+
+    async def list_organizations(
+        self,
+        *,
+        requesting_organization_id: uuid.UUID | None,
+        page: int = 1,
+        page_size: int = 25,
+    ) -> tuple[list[Organization], object]: ...
 
 
 class LocationLookupProtocol(Protocol):

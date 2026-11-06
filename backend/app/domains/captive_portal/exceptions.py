@@ -27,6 +27,8 @@ from .constants import (
 
 __all__ = [
     "CaptivePortalError",
+    "ReviewStatsLocationNotFoundError",
+    "ReviewStatsCrossLocationError",
     "CaptivePortalConfigNotFoundError",
     "CrossOrganizationCaptivePortalConfigAccessError",
     "InvalidHexColorError",
@@ -117,6 +119,28 @@ class InvalidPortalContentSourceError(CaptivePortalError):
             f"Provide at most one of {field_label} text or {field_label} URL, "
             "not both",
             status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+
+class ReviewStatsLocationNotFoundError(CaptivePortalError):
+    """``GET /captive-portal/review-stats`` named a location that does not
+    exist *or belongs to another organization*. The same 404 for both on
+    purpose: a 403 would confirm that another tenant's location id is
+    real."""
+
+    def __init__(self) -> None:
+        super().__init__("Location not found", status_code=status.HTTP_404_NOT_FOUND)
+
+
+class ReviewStatsCrossLocationError(CaptivePortalError):
+    """The ``X-Location-Id`` header named a different location than the
+    ``location_id`` query parameter. The permission check ran against the
+    header, so it says nothing about the location being read."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "The location header does not match the requested location",
+            status_code=status.HTTP_403_FORBIDDEN,
         )
 
 

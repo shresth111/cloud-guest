@@ -20,7 +20,7 @@ import uuid
 from datetime import datetime
 from typing import Protocol
 
-from sqlalchemy import and_, or_, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.constants import DEFAULT_SORT_FIELD, SortOrder
@@ -418,7 +418,14 @@ class GuestAccessRepository:
         if location_id is not None:
             scope_clause = or_(scope_clause, GuestAccessRule.location_id == location_id)
         terms = identifier_match_terms(identifier)
-        identifier_clause = GuestAccessRule.identifier.in_(terms.exact)
+        # Emails: ``lower()`` so a rule written in mixed case before emails
+        # were normalised still matches the lower-cased login identifier.
+        rule_column = (
+            func.lower(GuestAccessRule.identifier)
+            if terms.casefold
+            else GuestAccessRule.identifier
+        )
+        identifier_clause = rule_column.in_(terms.exact)
         if terms.prefix_patterns:
             # The stored-value-is-longer direction (a rule written in
             # E.164, a guest signing in without the country code). No IN
@@ -507,18 +514,25 @@ class GuestAccessRepository:
         # re-derived so the importer cannot drift from the read path's
         # notion of "the same number"; filtered to the "+"-less half for
         # the reason in the docstring. For an email it is just the address.
+        terms = identifier_match_terms(identifier)
         candidates = [
-            spelling
-            for spelling in identifier_match_terms(identifier).exact
-            if not spelling.startswith("+")
+            spelling for spelling in terms.exact if not spelling.startswith("+")
         ]
         if identifier not in candidates:
             candidates.append(identifier)
+        # Emails compare ``lower()`` -- see ``list_matching_guest_rules``.
+        rule_column = (
+            func.lower(GuestAccessRule.identifier)
+            if terms.casefold
+            else GuestAccessRule.identifier
+        )
+        if terms.casefold:
+            candidates = sorted({c.lower() for c in candidates})
         statement = (
             select(GuestAccessRule)
             .where(
                 GuestAccessRule.organization_id == organization_id,
-                GuestAccessRule.identifier.in_(candidates),
+                rule_column.in_(candidates),
                 GuestAccessRule.rule_type == rule_type,
                 GuestAccessRule.is_deleted.is_(False),
                 scope_clause,

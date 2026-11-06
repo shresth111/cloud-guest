@@ -64,6 +64,7 @@ __all__ = [
     "CONTROLLER_SETUP_OPERATOR_PREFIX",
     "CONTROLLER_SETUP_PORTAL_NAME_MAX_LENGTH",
     "CONTROLLER_SETUP_PORTAL_NAME_PREFIX",
+    "CONTROLLER_SETUP_RADIUS_PROFILE_PREFIX",
     "ControllerAuthMode",
     "ControllerSetupGap",
     "ControllerTlsMode",
@@ -72,6 +73,7 @@ __all__ = [
     "DEFAULT_SESSION_DURATION_SECONDS",
     "DEFAULT_SYNC_INTERVAL_SECONDS",
     "ErrorCode",
+    "HUB_RADIUS_AUTH_PORT",
     "IntegrationEventStatus",
     "IntegrationEventType",
     "IntegrationStatus",
@@ -108,6 +110,8 @@ __all__ = [
     "TASK_RUN_OMADA_USAGE_SYNC_SWEEP",
     "INSTANT_ON_POLL_SWEEP_INTERVAL_SECONDS",
     "TASK_RUN_INSTANT_ON_POLL_SWEEP",
+    "TASK_INSTANT_ON_RELEASE_TRANSIENT_BLOCK",
+    "TASK_INSTANT_ON_CHECK_DISCONNECTED_CLIENT",
 ]
 
 
@@ -517,6 +521,12 @@ class ControllerSetupGap(StrEnum):
     SITE_NOT_SELECTED = PortalReadinessGap.SITE_NOT_SELECTED.value
     FLEET_DEVICE_MISSING = PortalReadinessGap.FLEET_DEVICE_MISSING.value
     GUEST_SSID_MISSING = "guest_ssid_missing"
+    #: RADIUS contract only: the controller's NAS client has not been
+    #: registered, so there is no shared secret to give its RADIUS profile.
+    RADIUS_NAS_NOT_REGISTERED = "radius_nas_not_registered"
+    #: RADIUS contract only: ``hub_radius_public_address`` is unset, so there
+    #: is no address to point the controller's RADIUS profile at.
+    HUB_RADIUS_ADDRESS_MISSING = "hub_radius_address_missing"
 
 
 CONTROLLER_SETUP_GAP_LABELS: dict[ControllerSetupGap, str] = {
@@ -542,7 +552,22 @@ CONTROLLER_SETUP_GAP_LABELS: dict[ControllerSetupGap, str] = {
         PortalReadinessGap.FLEET_DEVICE_MISSING
     ],
     ControllerSetupGap.GUEST_SSID_MISSING: "no guest SSID has been chosen",
+    ControllerSetupGap.RADIUS_NAS_NOT_REGISTERED: (
+        "the controller has not been registered with RADIUS yet (Register "
+        "controller with RADIUS, in the guest portal contract section)"
+    ),
+    ControllerSetupGap.HUB_RADIUS_ADDRESS_MISSING: (
+        "this platform's RADIUS hub address is not configured "
+        "(CLOUDGUEST_HUB_RADIUS_PUBLIC_ADDRESS)"
+    ),
 }
+
+#: The RADIUS profile automatic setup creates on the controller for a
+#: RADIUS-contract venue is named this plus the first 8 hex digits of the
+#: integration id.
+CONTROLLER_SETUP_RADIUS_PROFILE_PREFIX = "Wyfy Guest RADIUS"
+#: The hub's FreeRADIUS authentication port.
+HUB_RADIUS_AUTH_PORT = 1812
 
 #: The display name given to the portal automatic setup creates, before the
 #: integration's short id is appended -- see
@@ -777,6 +802,10 @@ class ErrorCode(StrEnum):
     # Master mapping of a fleet router to an Aruba Instant On site was
     # refused: not a NAS-only device, no location, or a malformed site id.
     INSTANT_ON_SITE_NOT_CONFIGURABLE = "INSTANT_ON_SITE_NOT_CONFIGURABLE"
+    # Master AP-registry write refused (not an Instant On router, bad MAC,
+    # duplicate, or an edit the primary AP cannot take).
+    ARUBA_ACCESS_POINT_INVALID = "ARUBA_ACCESS_POINT_INVALID"
+    ARUBA_ACCESS_POINT_NOT_FOUND = "ARUBA_ACCESS_POINT_NOT_FOUND"
 
 
 # ============================================================================
@@ -972,6 +1001,17 @@ TASK_RUN_INSTANT_ON_POLL_SWEEP = (
     "app.domains.network_integration.instant_on_tasks.run_instant_on_poll_sweep"
 )
 INSTANT_ON_POLL_SWEEP_INTERVAL_SECONDS = 60.0
+
+# Timed unblock after an Instant On "disconnect" (block + hold + unblock).
+# See ``app.domains.network_integration.instant_on_control``.
+TASK_INSTANT_ON_RELEASE_TRANSIENT_BLOCK = (
+    "app.domains.network_integration.instant_on_control.release_transient_block_task"
+)
+# See ``app.domains.network_integration.instant_on_disconnect_check``.
+TASK_INSTANT_ON_CHECK_DISCONNECTED_CLIENT = (
+    "app.domains.network_integration.instant_on_disconnect_check"
+    ".check_disconnected_client_task"
+)
 
 # ============================================================================
 # Portal authorize rate limiting

@@ -41,6 +41,7 @@ __all__ = [
     "CaptivePortalConfigResponse",
     "CaptivePortalConfigListResponse",
     "ResolvedCaptivePortalConfigResponse",
+    "ReviewStatsResponse",
 ]
 
 
@@ -188,6 +189,18 @@ class CaptivePortalConfigCreateRequest(BaseModel):
             "collected here may be mailed offers."
         ),
     )
+    require_guest_name: bool = Field(
+        default=True,
+        description=(
+            "Name required at sign-in. A guest who signs in with a "
+            "one-time code (SMS/WhatsApp/email) and has no name on file "
+            "is asked for it on one screen right after the code verifies, "
+            "and the network is not opened until it is stored -- enforced "
+            "server-side, error code `guest_name_required`. Implies "
+            "`collect_guest_name` (forced on by the server). Defaults ON "
+            "for every venue (owner decision); a venue can switch it off."
+        ),
+    )
     review_card_enabled: bool = Field(
         default=False,
         description=(
@@ -202,9 +215,11 @@ class CaptivePortalConfigCreateRequest(BaseModel):
         max_length=REVIEW_URL_MAX_LENGTH,
         description=(
             "The venue's Google review link, copied from Business Profile "
-            "-> Read reviews -> Get more reviews. Stored **verbatim** -- "
-            "never synthesised from a place id, never normalised, never "
-            "rewritten. Validated on write to be `https` on a Google "
+            "-> Read reviews -> Get more reviews. A pasted link is stored "
+            "**verbatim** -- never normalised, never rewritten. A bare "
+            "Google Place ID (no scheme, dot or slash) is accepted too and "
+            "stored as `https://search.google.com/local/writereview"
+            "?placeid=<id>`. Validated on write to be `https` on a Google "
             "host; the path is deliberately not checked, and the link is "
             "not fetched. Null renders no card at all -- not a disabled "
             "one. (The QR code Google offers alongside this link can only "
@@ -403,6 +418,14 @@ class CaptivePortalConfigUpdateRequest(BaseModel):
     content_survey: dict | None = Field(default=None)
     collect_guest_name: bool | None = Field(default=None)
     collect_guest_email: bool | None = Field(default=None)
+    require_guest_name: bool | None = Field(
+        default=None,
+        description=(
+            "Name required at sign-in. When the merged value is true the "
+            "server also sets `collect_guest_name` true, overriding an "
+            "explicit false in the same payload."
+        ),
+    )
     review_card_enabled: bool | None = Field(default=None)
     review_url: str | None = Field(
         default=None,
@@ -524,6 +547,7 @@ class CaptivePortalConfigResponse(BaseModel):
     content_survey: dict | None
     collect_guest_name: bool
     collect_guest_email: bool
+    require_guest_name: bool
     review_card_enabled: bool
     review_url: str | None
     guest_feedback_enabled: bool
@@ -652,3 +676,14 @@ class ResolvedCaptivePortalConfigResponse(CaptivePortalConfigResponse):
             "same None semantics as background_luminance."
         ),
     )
+
+
+class ReviewStatsResponse(BaseModel):
+    """``GET /captive-portal/review-stats``: one location's review-page
+    numbers. ``opened`` is link opens, never reviews."""
+
+    location_id: str
+    days: int
+    shown: int
+    opened: int
+    since: datetime

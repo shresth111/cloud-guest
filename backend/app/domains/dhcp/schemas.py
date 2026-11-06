@@ -169,6 +169,39 @@ class DhcpLeaseListResponse(BaseModel):
     items: list[DhcpLeaseResponse]
 
 
+class DhcpLivePoolResponse(BaseModel):
+    """One address pool as the router reported it just now -- including
+    pools the platform never created. ``server`` is ``None`` when no DHCP
+    server hands this pool out."""
+
+    pool_name: str
+    ranges: list[str]
+    server: str | None
+    interface: str | None
+    lease_time: str | None
+    server_disabled: bool
+    network: str | None
+    gateway: str | None
+    dns_servers: list[str]
+
+
+class DhcpLivePoolListResponse(BaseModel):
+    router_id: str
+    items: list[DhcpLivePoolResponse]
+
+
+class DhcpLivePoolUpdateRequest(BaseModel):
+    """Edit the router's own pool in place. The range must stay inside the
+    pool's network and not cover the router's address. ``dns_servers``
+    omitted (``None``) leaves the router's DNS alone; ``[]`` is refused as
+    a list of nothing would leave guests with no resolver."""
+
+    range_start: str = Field(min_length=1, max_length=45)
+    range_end: str = Field(min_length=1, max_length=45)
+    lease_time_seconds: int | None = Field(default=None, ge=60, le=604800)
+    dns_servers: list[str] | None = Field(default=None, min_length=1, max_length=3)
+
+
 class DhcpLeaseKeepRequest(BaseModel):
     """Keep this device on this address. ``ip_address`` is the address the
     caller is about to write into a rule; the router refuses (409) if the

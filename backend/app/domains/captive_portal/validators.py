@@ -8,10 +8,11 @@ service layer calls before touching the database.
 from __future__ import annotations
 
 import hashlib
+import math
 import re
 import uuid
 from datetime import datetime, time
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 # Imported, never copied. This is the name the hotspot's own ``dns-name``
@@ -31,7 +32,9 @@ from .constants import (
     MIN_BACKGROUND_FOCAL,
     MIN_BACKGROUND_OVERLAY_STRENGTH,
     MIN_FEEDBACK_DWELL_MINUTES,
+    REVIEW_PLACE_ID_PATTERN,
     REVIEW_URL_ALLOWED_HOST_SUFFIXES,
+    REVIEW_URL_PLACE_ID_TEMPLATE,
     SPLASH_HEADLINE_MAX_LENGTH,
     SPLASH_WELCOME_MESSAGE_MAX_LENGTH,
     GuestFontChoice,
@@ -225,6 +228,30 @@ def validate_feedback_dwell_minutes(value: object) -> None:
     )
     if not in_range:
         raise InvalidFeedbackDwellMinutesError(value)
+
+
+def normalize_review_url(value: str | None) -> str | None:
+    """What gets stored for a pasted review link: a bare Google Place ID
+    becomes ``constants.REVIEW_URL_PLACE_ID_TEMPLATE``, and anything else
+    comes back as given, for ``validate_review_url`` to judge.
+
+    Only a value that matches ``REVIEW_PLACE_ID_PATTERN`` is rewritten. It
+    has no scheme, dot or slash, so it can never be a link, and the
+    rewrite cannot change what a pasted link points at. The id is
+    percent-encoded anyway, so the stored URL never depends on the pattern
+    staying as narrow as it is today.
+
+    ``None`` stays ``None``. Blank stays blank, and the caller treats it as
+    "clear the link", as before.
+    """
+    if value is None:
+        return None
+    candidate = value.strip()
+    if REVIEW_PLACE_ID_PATTERN.fullmatch(candidate):
+        return REVIEW_URL_PLACE_ID_TEMPLATE.format(
+            place_id=quote(candidate, safe="")
+        )
+    return value
 
 
 def validate_review_url(value: str | None) -> None:
@@ -595,9 +622,45 @@ def is_open_now(
     return start_t <= moment.time() <= end_t
 
 
+def seconds_until_closing(
+    *, enabled: bool, timezone: str, schedule: dict, now: datetime | None = None
+) -> int | None:
+    """Seconds from ``now`` until today's Open Hours window ends, or ``None``
+    when there is no closing time to count down to: business hours off, or
+    the venue is not open right now (the caller refuses a closed venue on
+    its own, through ``is_open_now``). Same parsing and the same forgiving
+    failure direction as ``is_open_now`` -- a row it cannot read yields
+    ``None``, "no cap", never an exception.
+
+    A schedule has no overnight windows (``validate_business_hours_schedule``
+    refuses them), so "today's end" is always later today. ``end`` is read
+    as the end of that minute, matching ``is_open_now``'s inclusive
+    ``<= end``."""
+    if not enabled:
+        return None
+    if not is_open_now(enabled=enabled, timezone=timezone, schedule=schedule, now=now):
+        return None
+    try:
+        zone = ZoneInfo(timezone)
+    except (ZoneInfoNotFoundError, ValueError):
+        zone = ZoneInfo("UTC")
+    moment = (now or datetime.now(zone)).astimezone(zone)
+    entry = schedule.get(_WEEKDAYS[moment.weekday()]) or {}
+    try:
+        end_t = time.fromisoformat(entry.get("end"))
+    except (TypeError, ValueError):
+        return None
+    closes_at = moment.replace(
+        hour=end_t.hour, minute=end_t.minute, second=59, microsecond=999999
+    )
+    return max(math.ceil((closes_at - moment).total_seconds()), 1)
+
+
 __all__ = [
+    "seconds_until_closing",
     "validate_hex_color",
     "validate_single_content_source",
+    "normalize_review_url",
     "validate_review_url",
     "validate_feedback_dwell_minutes",
     "compute_terms_version",

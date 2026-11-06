@@ -831,6 +831,156 @@ class HotspotDeviceUnblockResult:
 
 
 @dataclass(frozen=True, slots=True)
+class HotspotBypassBindingResult:
+    """What a router holds after being asked to let one signed-in device
+    through its hotspot now, rather than at the router's next authorized-MAC
+    poll.
+
+    ``outcome`` is exactly one of:
+
+    * ``"created"`` -- there was no ``/ip hotspot ip-binding`` row for the
+      MAC and no live ``/ip hotspot active`` session; one
+      ``type=bypassed comment=cloudguest-authmac`` row was added and read
+      back. ``binding_id`` is its ``.id``.
+    * ``"already_bound"`` -- a binding for the MAC already exists (this
+      platform's, an operator's, a block). Nothing was written.
+      ``existing_bindings`` lists what was found, as ``"<type>:<comment>"``.
+    * ``"active_session"`` -- the MAC is an authenticated hotspot session
+      right now. It is already through the gate; a binding added under it
+      makes RouterOS drop the session. Nothing was written.
+    * ``"no_hotspot"`` -- the router runs no hotspot server, so an
+      ip-binding would bind nothing. Nothing was written.
+    * ``"no_reconciler"`` -- the router has no enabled
+      ``cloudguest-authmac-sched``. Nothing on it would ever remove the
+      row, so none is written. Nothing was written.
+    * ``"raced"`` -- the row was added, and the read-back found a second
+      row for the same MAC that was not there a moment earlier (the
+      router's own poll adding the same binding in the same instant). The
+      row this call added was removed again, by its own ``.id``, so the MAC
+      is left with exactly the row it did not write.
+
+    ``host_state`` is a read, not a write, taken after a ``"created"``:
+    ``"absent"`` (no ``/ip hotspot host`` row for the MAC), ``"bypassed"``,
+    or ``"pending"`` (a host row exists and does not yet read
+    ``bypassed=true``). ``None`` for every other outcome, and when the host
+    table could not be read. It is reported so that what RouterOS does with
+    an existing host when a binding appears can be learned from a fleet's
+    logs; nothing here acts on it.
+    """
+
+    outcome: str
+    hotspot_servers: int
+    binding_id: str | None
+    existing_bindings: tuple[str, ...]
+    host_state: str | None
+
+    @property
+    def created(self) -> bool:
+        return self.outcome == "created"
+
+
+@dataclass(frozen=True, slots=True)
+class HotspotBypassBindingRow:
+    """One ``/ip hotspot ip-binding`` row carrying exactly
+    ``comment=cloudguest-authmac``, as the router reported it.
+    ``mac_address`` is in the canonical ``AA:BB:CC:DD:EE:FF`` spelling."""
+
+    binding_id: str
+    mac_address: str
+    disabled: bool
+
+
+@dataclass(frozen=True, slots=True)
+class HotspotBypassBindingSnapshot:
+    """A read of the session bypasses a router currently holds. Nothing is
+    written to produce it.
+
+    ``bindings`` holds only rows whose comment is exactly
+    ``cloudguest-authmac``; every other binding on the router is invisible
+    here on purpose, so a caller cannot remove what it was never shown.
+    ``unreadable`` counts tagged rows whose ``mac-address`` did not parse
+    as a MAC (left out, never guessed at). ``reconciler_enabled`` says
+    whether the router's own ``cloudguest-authmac-sched`` exists and is
+    enabled -- reported, not acted on."""
+
+    hotspot_servers: int
+    reconciler_enabled: bool
+    bindings: tuple[HotspotBypassBindingRow, ...]
+    unreadable: int
+
+
+@dataclass(frozen=True, slots=True)
+class HotspotBypassRemovalResult:
+    """What a router holds after being asked to take one session bypass
+    away, by ``.id``.
+
+    ``outcome`` is exactly one of:
+
+    * ``"removed"`` -- the row was still this platform's (same ``.id``,
+      comment exactly ``cloudguest-authmac``, same MAC), it was removed,
+      and a second read no longer shows it.
+    * ``"gone"`` -- no row with that ``.id`` any more. Nothing was written.
+    * ``"changed"`` -- a row with that ``.id`` exists but is no longer the
+      one that was listed: its comment or its MAC differs (an operator
+      re-tagged or edited it). Nothing was written.
+
+    The rest describe the device after a ``"removed"`` and are reads:
+
+    * ``other_bindings`` -- rows still naming the MAC, as
+      ``"<type>:<comment>"``: an operator's own bypass, a trusted-device
+      bypass, a block. While one exists the device's access is that row's
+      business and nothing further is done.
+    * ``active_session`` -- the MAC is an authenticated ``/ip hotspot
+      active`` session, which a bypass binding had nothing to do with.
+    * ``host_before`` / ``host_after`` -- the ``/ip hotspot host`` row for
+      the MAC before the removal and immediately after it: ``"absent"``,
+      ``"bypassed"`` or ``"unbypassed"`` (``None`` if unreadable). This is
+      the evidence for what RouterOS does to a bypassed host when its
+      binding goes.
+    * ``hosts_removed`` -- host rows removed by this call: only ones that
+      still read ``bypassed`` after the binding was gone, only when asked
+      to, and only with no other binding and no live session for the MAC.
+    """
+
+    outcome: str
+    other_bindings: tuple[str, ...] = ()
+    active_session: bool = False
+    host_before: str | None = None
+    host_after: str | None = None
+    hosts_removed: int = 0
+
+    @property
+    def removed(self) -> bool:
+        return self.outcome == "removed"
+
+
+@dataclass(frozen=True, slots=True)
+class DhcpPoolState:
+    """One address pool as it lives on the router right now: an ``/ip pool``
+    row joined to the ``/ip dhcp-server`` that hands it out and the
+    ``/ip dhcp-server network`` row whose subnet holds it.
+
+    Most routers never had their pool created through the platform -- the
+    setup script made it -- so this is the only place the customer can see
+    the range their guests are actually getting. ``server``/``interface``
+    are ``None`` for a pool no DHCP server uses (e.g. one only a hotspot
+    profile references); ``network``/``gateway``/``dns_servers`` are empty
+    when no network row covers the range. ``lease_time`` is RouterOS's own
+    duration string (``30m``, ``1d``), passed through.
+    """
+
+    pool_name: str
+    ranges: tuple[str, ...]
+    server: str | None
+    interface: str | None
+    lease_time: str | None
+    server_disabled: bool
+    network: str | None
+    gateway: str | None
+    dns_servers: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class DhcpLease:
     """One ``/ip dhcp-server lease`` row, as the router reported it.
 
@@ -1036,6 +1186,54 @@ class ArpPingResult:
     sent: int
     received: int
     replied_macs: frozenset[str]
+    #: ``avg-rtt`` of the answered probes, milliseconds; ``None`` when
+    #: nothing answered. Defaulted so existing constructions are unchanged.
+    avg_rtt_ms: float | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class LanPort:
+    """One ``/interface`` row, the link facts a monitored device's health
+    is read from. ``last_link_*_at`` are ISO-8601 UTC strings converted
+    from the router's local clock (see ``LanSnapshot``), ``None`` when the
+    router has never recorded that event since boot."""
+
+    name: str
+    type: str | None
+    running: bool
+    disabled: bool
+    link_downs: int | None
+    last_link_down_at: str | None
+    last_link_up_at: str | None
+    rx_bytes: int | None
+    tx_bytes: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class LanBridgeHost:
+    """One ``/interface/bridge/host`` row: which port a MAC was learned on.
+    ``local`` rows are the bridge's own interfaces, not devices."""
+
+    mac_address: str
+    on_interface: str | None
+    bridge: str | None
+    local: bool
+
+
+@dataclass(frozen=True, slots=True)
+class LanSnapshot:
+    """Everything the monitored-hardware health sweep needs from a router's
+    LAN side, read in one API connection (see ``MikroTikAdapter
+    .read_lan_snapshot``). ``bridge_of_port`` maps a bridge member port to
+    its bridge -- the L3 interface an ARP ping must be sent on.
+    ``clock_offset_seconds`` is router-local minus UTC, ``None`` when the
+    clock could not be read (link times are then left ``None`` rather than
+    guessed)."""
+
+    ports: tuple[LanPort, ...]
+    hosts: tuple[LanBridgeHost, ...]
+    bridge_of_port: Mapping[str, str]
+    clock_offset_seconds: float | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1074,6 +1272,34 @@ class QueueDeviceStatus:
     packets_uploaded: int | None
     packets_downloaded: int | None
     queued_bytes: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class VenueQueueSyncResult:
+    """What ``sync_venue_simple_queue`` / ``clear_venue_simple_queue`` did,
+    and what the device held when they finished.
+
+    ``in_sync`` comes from reading ``/queue simple`` back after the last
+    write, never from the absence of an error: a write that RouterOS
+    accepted and did not act on is exactly the case this exists to report.
+    ``problems`` names each thing the read-back found wrong (or the reason
+    nothing was written), as stable short strings a caller can log.
+
+    ``wrote`` is whether this call changed the device at all -- ``False``
+    on a second run against a device that already matches.
+    """
+
+    name: str
+    device_queue_id: str | None = None
+    targets: tuple[str, ...] = ()
+    created: bool = False
+    updated: bool = False
+    reparented: int = 0
+    moved_to_top: bool = False
+    removed: bool = False
+    wrote: bool = False
+    in_sync: bool = True
+    problems: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -1531,6 +1757,15 @@ class DeviceGatewayAdapter(Protocol):
         """
         ...
 
+    async def ensure_host_route(
+        self, creds: DeviceCredentials, *, dst_address: str, gateway: str, comment: str
+    ) -> None:
+        """Make sure one comment-tagged ``dst_address/32`` route leaves by
+        ``gateway``: added when missing, re-pointed when the gateway moved,
+        and no write at all when it is already right. Touches only the route
+        carrying ``comment``."""
+        ...
+
     async def ensure_wan_egress(
         self, creds: DeviceCredentials, *, interface: str
     ) -> None:
@@ -1837,10 +2072,53 @@ class DeviceGatewayAdapter(Protocol):
         burst_threshold_kbps: int | None = None,
         burst_time_seconds: int | None = None,
         priority: int = _DEFAULT_QUEUE_PRIORITY,
+        parent: str | None = None,
     ) -> str:
         """Creates a real ``/queue simple`` entry. Returns the device-side
         queue id. Ported from
-        ``app.domains.queue_management.device_adapters.create_simple_queue``."""
+        ``app.domains.queue_management.device_adapters.create_simple_queue``.
+
+        The new row is then moved to the top of the list, best effort: the
+        first matching row wins, and a dynamic hotspot queue for the same
+        address would otherwise sit above it.
+
+        ``parent`` names an existing simple queue this row is created under
+        (a venue's total cap -- see ``sync_venue_simple_queue``). A row with
+        a parent is not itself moved: its parent is what has to come first."""
+        ...
+
+    async def sync_venue_simple_queue(
+        self,
+        creds: DeviceCredentials,
+        *,
+        name: str,
+        download_rate_kbps: int | None,
+        upload_rate_kbps: int | None,
+        child_queue_ids: Sequence[str] = (),
+        targets: Sequence[str] | None = None,
+        comment: str | None = None,
+    ) -> VenueQueueSyncResult:
+        """Makes one parent ``/queue simple`` named ``name`` hold a venue's
+        total speed, with ``child_queue_ids`` under it, in one connection.
+
+        ``targets`` are the subnets it covers; ``None`` means "ask the
+        device": the networks of the interface(s) its hotspot server runs
+        on. When none can be found nothing is written and the result says
+        so. A ``None`` rate is unlimited in that direction.
+
+        Creates the row if absent, changes it only where it differs, puts
+        each listed child under it, keeps it first in the list, and reads
+        the list back. Idempotent: a second call writes nothing."""
+        ...
+
+    async def clear_venue_simple_queue(
+        self, creds: DeviceCredentials, *, name: str
+    ) -> VenueQueueSyncResult:
+        """Removes the parent queue named ``name``: every row under it is
+        first returned to the top level (``parent=none``), then the parent
+        is removed, then the list is read back. A parent that still has a
+        row under it is never removed. Idempotent: absent is success, with
+        nothing written."""
         ...
 
     async def update_simple_queue(
@@ -1857,7 +2135,29 @@ class DeviceGatewayAdapter(Protocol):
         priority: int = _DEFAULT_QUEUE_PRIORITY,
     ) -> None:
         """Updates an existing ``/queue simple`` entry's rate/burst/
-        priority fields."""
+        priority fields, and moves it back to the top of the list (see
+        ``create_simple_queue``)."""
+        ...
+
+    async def find_client_address(
+        self, creds: DeviceCredentials, *, mac_address: str
+    ) -> str | None:
+        """The address the device currently has for the client with this
+        MAC (hotspot host, then DHCP lease), or ``None`` if it knows no
+        such client. Read-only."""
+        ...
+
+    async def list_client_addresses(self, creds: DeviceCredentials) -> dict[str, str]:
+        """Canonical MAC -> current address for every client the device
+        knows, by the same sources and preference as
+        ``find_client_address``, in one connection. Read-only."""
+        ...
+
+    async def set_simple_queue_target(
+        self, creds: DeviceCredentials, *, device_queue_id: str, target: str
+    ) -> None:
+        """Re-points an existing ``/queue simple`` entry at ``target``
+        without touching its rates."""
         ...
 
     async def delete_simple_queue(
@@ -2115,7 +2415,12 @@ __all__ = [
     "HotspotSessionControl",
     "HotspotDisconnectResult",
     "HotspotDeviceBlockResult",
+    "HotspotBypassBindingResult",
+    "HotspotBypassBindingRow",
+    "HotspotBypassBindingSnapshot",
+    "HotspotBypassRemovalResult",
     "DhcpLease",
+    "DhcpPoolState",
     "DhcpLeaseKeepResult",
     "HotspotDeviceUnblockResult",
     "FloodLimitStatus",
@@ -2129,10 +2434,14 @@ __all__ = [
     "ProvisionResult",
     "SpeedTestResult",
     "ArpPingResult",
+    "LanBridgeHost",
+    "LanPort",
+    "LanSnapshot",
     "PingResult",
     "TracerouteHop",
     "TracerouteResult",
     "QueueDeviceStatus",
+    "VenueQueueSyncResult",
     "DeviceDiscoveryResult",
     "DeviceHealthResult",
     "DeviceInterfaceCounters",

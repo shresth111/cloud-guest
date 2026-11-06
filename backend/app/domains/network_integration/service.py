@@ -92,6 +92,7 @@ from redis.asyncio import Redis
 from app.common.exceptions import CloudGuestError
 from app.core.config import Settings, get_settings
 from app.domains.rbac.location_scope import LocationScope, enforce_entity_location
+from app.domains.router.crypto import decrypt_secret
 
 from .constants import (
     AUDIT_ENTITY_TYPE,
@@ -99,11 +100,13 @@ from .constants import (
     CONTROLLER_SETUP_OPERATOR_PREFIX,
     CONTROLLER_SETUP_PORTAL_NAME_MAX_LENGTH,
     CONTROLLER_SETUP_PORTAL_NAME_PREFIX,
+    CONTROLLER_SETUP_RADIUS_PROFILE_PREFIX,
     DEFAULT_CONTROLLER_TLS_MODE,
     DEFAULT_PORTAL_AUTH_MODE,
     DEFAULT_SYNC_INTERVAL_SECONDS,
     FLEET_DEVICE_DEFAULT_MODEL_BY_PROVIDER,
     GUEST_OPERATOR_CREDENTIAL_FIELDS,
+    HUB_RADIUS_AUTH_PORT,
     MIN_SYNC_INTERVAL_SECONDS,
     PORTAL_AUTHORIZE_DIAGNOSTICS_KEY,
     PORTAL_AUTHORIZE_DIAGNOSTICS_ON_SUCCESS,
@@ -185,6 +188,7 @@ from .providers.base import (
     ProviderDevice,
     ProviderPortalContext,
     ProviderRadiusPortalContext,
+    ProviderRadiusPortalSetup,
     ProviderSite,
     ProviderSsid,
     ProviderTlsObservation,
@@ -336,6 +340,20 @@ class GuestSessionLookupProtocol(Protocol):
     async def get_guest_by_id(self, guest_id: uuid.UUID) -> Any: ...
 
 
+class RadiusNasLookupProtocol(Protocol):
+    """How this domain finds the NAS client a RADIUS-contract controller was
+    registered as -- for its shared secret, which "Configure controller"
+    writes into the controller's RADIUS profile.
+
+    One line, satisfied as-is by
+    ``app.domains.guest.repository.GuestRepository``, for the same reasons
+    ``GuestSessionLookupProtocol`` is: no service graph, and no direction
+    from the guest domain back into this one.
+    """
+
+    async def get_nas_client_by_router(self, router_id: uuid.UUID) -> Any: ...
+
+
 class GuestSessionTerminatorProtocol(Protocol):
     """How this domain *ends* a ``GuestSession``. One method.
 
@@ -374,6 +392,23 @@ class GuestSessionTerminatorProtocol(Protocol):
         actor_user_id: uuid.UUID | None = None,
         reason: str | None = None,
     ) -> Any: ...
+
+
+class GuestNameGateProtocol(Protocol):
+    """Name required at sign-in, asked at the network-enforcement step.
+
+    Satisfied as-is by ``GuestService.require_session_name``: raises
+    ``GuestNameRequiredError`` (403, ``data.code == "guest_name_required"``)
+    when the venue requires a name, the session is an OTP session, and the
+    guest has none on file. Consulted only AFTER ``_resolve_portal_session``
+    has proven the session, so it never answers anything about a session id
+    the caller could not already authorize with.
+
+    Optional like the other guest-domain seams; absent (a unit test
+    constructing this service directly) means no name gate.
+    """
+
+    async def require_session_name(self, *, session_id: uuid.UUID) -> None: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -794,6 +829,15 @@ NAS_ONLY_DISCONNECT_REASON = (
     "Wyfy can't disconnect a device from Aruba Instant On access points. The "
     "guest stays online until their session time runs out."
 )
+#: A device block at an Aruba Instant On venue whose Instant On cloud control
+#: is not switched on. Says what DOES work (the sign-in block, our own record)
+#: and what is needed for the device half -- never "can't disconnect".
+NAS_ONLY_DEVICE_BLOCK_NEEDS_CLOUD_REASON = (
+    "Keeping this device off the WiFi needs Instant On cloud control, which "
+    "isn't switched on for this venue yet. Ask your Wyfy Guest contact to turn "
+    "it on. Blocking the guest under Blocked Guests already stops them signing "
+    "in again."
+)
 NAS_ONLY_STATS_REASON = "Data usage isn't reported for this venue yet."
 NAS_ONLY_LIVENESS_REASON = (
     "This venue's access points are managed in Aruba's Instant On app. Wyfy "
@@ -801,22 +845,31 @@ NAS_ONLY_LIVENESS_REASON = (
 )
 
 
-def nas_only_client_capabilities() -> ClientCapabilitiesReport:
-    """Every client action unsupported, each with the sentence the venue
-    owner reads, and a liveness of ``None`` -- nothing here ever measures a
-    NAS-only vendor's access points, which is "not measured", not "down"."""
-    reasons = {
+def nas_only_client_capabilities(
+    *, cloud_control: bool = False
+) -> ClientCapabilitiesReport:
+    """What a NAS-only venue's per-client actions can do, each with the
+    sentence the venue owner reads, and a liveness of ``None`` -- nothing here
+    ever measures a NAS-only vendor's access points, which is "not measured",
+    not "down".
+
+    ``cloud_control`` (Aruba Instant On, every cloud-control gate open): block
+    and unblock are supported -- a persistent Instant On MAC block, read back
+    (``instant_on_control.instant_on_block_device``). Per-client speed stays
+    unsupported on every path: Instant On has no per-client rate."""
+    block_reason = NAS_ONLY_DEVICE_BLOCK_NEEDS_CLOUD_REASON
+    reasons: dict[str, str | None] = {
         "set_rate_limit": NAS_ONLY_SPEED_REASON,
         "clear_rate_limit": NAS_ONLY_SPEED_REASON,
-        "block": NAS_ONLY_DISCONNECT_REASON,
-        "unblock": NAS_ONLY_DISCONNECT_REASON,
+        "block": None if cloud_control else block_reason,
+        "unblock": None if cloud_control else block_reason,
         "list_blocked": NAS_ONLY_DISCONNECT_REASON,
         "disconnect": NAS_ONLY_DISCONNECT_REASON,
         "client_stats": NAS_ONLY_STATS_REASON,
     }
     return ClientCapabilitiesReport(
         capabilities={
-            name: {"supported": False, "reason": reason}
+            name: {"supported": reason is None, "reason": reason}
             for name, reason in reasons.items()
         },
         controller=ControllerLiveness(
@@ -854,7 +907,9 @@ class NetworkIntegrationService:
         audit_writer: AuditLogWriter | None = None,
         guest_session_lookup: GuestSessionLookupProtocol | None = None,
         guest_session_terminator: GuestSessionTerminatorProtocol | None = None,
+        radius_nas_lookup: RadiusNasLookupProtocol | None = None,
         fleet_device_provisioner: FleetDeviceProvisionerProtocol | None = None,
+        guest_name_gate: GuestNameGateProtocol | None = None,
         provider_resolver=get_network_provider,
         url_resolver=None,
         redis: Redis | None = None,
@@ -869,11 +924,16 @@ class NetworkIntegrationService:
         # degradation -- ``disconnect_guest`` refuses rather than
         # reporting a guest session ended that it never ended.
         self.guest_session_terminator = guest_session_terminator
+        # Optional for the same reason; only "Configure controller" on the
+        # RADIUS contract reads it, and that path refuses without it.
+        self.radius_nas_lookup = radius_nas_lookup
         # Optional, and its absence is an error rather than a degradation:
         # only the Master onboarding path uses it, and that path refuses
         # outright when it is missing. See
         # ``create_integration_with_fleet_device``.
         self.fleet_device_provisioner = fleet_device_provisioner
+        # See ``GuestNameGateProtocol``.
+        self.guest_name_gate = guest_name_gate
         # Injectable so tests substitute a fake provider without the
         # gateway package installed, and so a second provider needs no
         # change here. Production always passes the real registry.
@@ -3415,7 +3475,71 @@ class NetworkIntegrationService:
             gaps.append(ControllerSetupGap.FLEET_DEVICE_MISSING)
         if not integration.guest_ssid_id and not integration.guest_ssid_name:
             gaps.append(ControllerSetupGap.GUEST_SSID_MISSING)
+        if (
+            integration.portal_mode == PortalAuthMode.RADIUS.value
+            and not self.settings.hub_radius_public_address.strip()
+        ):
+            gaps.append(ControllerSetupGap.HUB_RADIUS_ADDRESS_MISSING)
         return gaps
+
+    async def _controller_setup_radius(
+        self, integration: NetworkIntegration, *, dry_run: bool
+    ) -> ProviderRadiusPortalSetup | None:
+        """The RADIUS half of the setup request, or ``None`` off that contract.
+
+        Everything comes from this platform's own records: the hub address
+        from settings, the NAS identifier and secret from the NAS client the
+        controller was registered as (``Register controller with RADIUS``).
+        The secret is the one the hub already holds, so the controller and
+        the hub agree by construction -- nobody types it. A controller that
+        was never registered is refused here, before the controller is
+        contacted, rather than given a profile with no secret behind it.
+        """
+        if integration.portal_mode != PortalAuthMode.RADIUS.value:
+            return None
+        nas_client = None
+        if self.radius_nas_lookup is not None and integration.router_id is not None:
+            nas_client = await self.radius_nas_lookup.get_nas_client_by_router(
+                integration.router_id
+            )
+        if nas_client is None:
+            error = ControllerSetupPreconditionsError(
+                [ControllerSetupGap.RADIUS_NAS_NOT_REGISTERED]
+            )
+            await self._record_setup_event(
+                integration,
+                dry_run=dry_run,
+                ok=False,
+                message=error.message,
+                error_code=error.code.value,
+                context={
+                    "missing": [ControllerSetupGap.RADIUS_NAS_NOT_REGISTERED.value]
+                },
+            )
+            raise error
+        radius_url = build_external_portal_url(
+            organization_id=integration.organization_id,
+            location_id=integration.location_id,
+            router_id=integration.router_id,
+            provider=integration.provider,
+            portal_mode=PortalAuthMode.RADIUS.value,
+        )
+        if radius_url is None:  # pragma: no cover - excluded by the gaps
+            raise ControllerSetupPreconditionsError(
+                [ControllerSetupGap.FLEET_DEVICE_MISSING]
+            )
+        return ProviderRadiusPortalSetup(
+            server_ip=self.settings.hub_radius_public_address.strip(),
+            server_port=HUB_RADIUS_AUTH_PORT,
+            profile_name=(
+                f"{CONTROLLER_SETUP_RADIUS_PROFILE_PREFIX} "
+                f"({integration.id.hex[:8]})"
+            ),
+            nas_id=str(nas_client.nas_identifier),
+            portal_url_scheme=radius_url.scheme,
+            portal_url_host_and_query=radius_url.host_and_query,
+            shared_secret=decrypt_secret(nas_client.shared_secret_encrypted),
+        )
 
     async def _refuse_shared_controller_site(
         self, integration: NetworkIntegration
@@ -3606,6 +3730,7 @@ class NetworkIntegrationService:
                 [ControllerSetupGap.FLEET_DEVICE_MISSING]
             )
         pre_auth_host = portal_url.host_and_query.split("/", 1)[0]
+        radius = await self._controller_setup_radius(integration, dry_run=dry_run)
         _, location_name = (
             await self.repository.resolve_display_names([integration])
         ).get(integration.id, (None, None))
@@ -3660,6 +3785,7 @@ class NetworkIntegrationService:
             new_operator_password=new_password,
             take_over_ssid_portal=take_over_ssid_portal,
             dry_run=dry_run,
+            radius=radius,
         )
         config = self._connection_config(integration, credentials)
         try:
@@ -4074,6 +4200,13 @@ class NetworkIntegrationService:
                 },
             )
             raise GuestSessionNotActiveError()
+        # Name required at sign-in -- after the session is proven, so the
+        # distinct ``guest_name_required`` answer is only ever given to a
+        # caller already holding a real, matching session and device. This
+        # is the step that opens the network at Omada/Aruba venues; without
+        # it the portal's "Your name" screen would be UI-only.
+        if self.guest_name_gate is not None:
+            await self.guest_name_gate.require_session_name(session_id=session_id)
         return session, normalized_mac
 
     async def authorize_portal_client(
@@ -4918,7 +5051,11 @@ class NetworkIntegrationService:
                 caller_location_scope=self.caller_location_scope,
                 error=CrossLocationNetworkIntegrationAccessError(),
             )
-            return nas_only_client_capabilities()
+            return nas_only_client_capabilities(
+                cloud_control=await self._instant_on_cloud_control(
+                    location_id=location_id, organization_id=organization_id
+                )
+            )
         capabilities = provider_impl.client_capabilities(config)
         return ClientCapabilitiesReport(
             capabilities={
@@ -5072,6 +5209,103 @@ class NetworkIntegrationService:
             during_sync=False,
         )
 
+    async def _nas_only_location(
+        self, *, location_id: uuid.UUID, organization_id: uuid.UUID | None
+    ) -> bool:
+        """A live NAS-only router at this location of the caller's own
+        organization (both in the WHERE clause), and the caller's location
+        confinement allows it."""
+        if organization_id is None:
+            return False
+        vendor = await self.repository.nas_only_vendor_for_location(
+            location_id=location_id, organization_id=organization_id
+        )
+        if vendor is None:
+            return False
+        enforce_entity_location(
+            entity_location_id=location_id,
+            caller_location_scope=self.caller_location_scope,
+            error=CrossLocationNetworkIntegrationAccessError(),
+        )
+        return True
+
+    async def _instant_on_cloud_control(
+        self, *, location_id: uuid.UUID, organization_id: uuid.UUID | None
+    ) -> bool:
+        session = getattr(self.repository, "session", None)
+        if session is None or organization_id is None:
+            return False
+        from .instant_on_control import instant_on_control_present
+
+        return await instant_on_control_present(
+            session, location_id=location_id, organization_id=organization_id
+        )
+
+    async def _instant_on_device_write(
+        self,
+        *,
+        location_id: uuid.UUID,
+        organization_id: uuid.UUID | None,
+        client_mac: str,
+        action: str,
+        actor_user_id: uuid.UUID | None,
+    ) -> ClientActionResult:
+        """Block / unblock one device at an Aruba Instant On venue, through
+        Instant On's cloud (a persistent MAC block, read back before it is
+        reported). Reached only when no Omada controller resolves for the
+        location, so an Omada venue never gets here.
+
+        * Not a NAS-only location of the caller -> the same
+          :class:`LocationHasNoControllerError` as before (no probing).
+        * Cloud control not switched on -> :class:`ClientActionUnavailableError`
+          with the sentence saying what is needed. Nothing is sent.
+        * Instant On did not confirm -> ``performed: False`` (never a success
+          on a 2xx alone).
+        """
+        if not await self._nas_only_location(
+            location_id=location_id, organization_id=organization_id
+        ):
+            raise LocationHasNoControllerError()
+        try:
+            mac = normalize_client_mac(client_mac)
+        except ValueError as exc:
+            raise NetworkIntegrationUrlRejectedError(str(exc)) from exc
+        session = getattr(self.repository, "session", None)
+        if session is None:
+            raise ClientActionUnavailableError(
+                action, NAS_ONLY_DEVICE_BLOCK_NEEDS_CLOUD_REASON
+            )
+        from .instant_on_control import (
+            instant_on_block_device,
+            instant_on_release_device,
+        )
+
+        call = (
+            instant_on_block_device if action == "block" else instant_on_release_device
+        )
+        outcome = await call(
+            session,
+            location_id=location_id,
+            organization_id=organization_id,
+            client_mac=mac,
+        )
+        if outcome.status == "unavailable":
+            raise ClientActionUnavailableError(
+                action, NAS_ONLY_DEVICE_BLOCK_NEEDS_CLOUD_REASON
+            )
+        performed = outcome.status == "enforced"
+        logger.info(
+            "instant_on_client_action",
+            extra={
+                "location_id": str(location_id),
+                "action": action,
+                "performed": performed,
+                "error_code": outcome.error_code,
+                "actor_user_id": str(actor_user_id) if actor_user_id else None,
+            },
+        )
+        return ClientActionResult(action=action, performed=performed, client_mac=mac)
+
     async def block_client(
         self,
         *,
@@ -5099,13 +5333,22 @@ class NetworkIntegrationService:
         the grant survives while the device can no longer associate, but
         nobody has watched it happen.
         """
-        integration, provider_impl, config, mac = await self._client_action(
-            location_id=location_id,
-            organization_id=organization_id,
-            client_mac=client_mac,
-            action="block",
-            actor_user_id=actor_user_id,
-        )
+        try:
+            integration, provider_impl, config, mac = await self._client_action(
+                location_id=location_id,
+                organization_id=organization_id,
+                client_mac=client_mac,
+                action="block",
+                actor_user_id=actor_user_id,
+            )
+        except LocationHasNoControllerError:
+            return await self._instant_on_device_write(
+                location_id=location_id,
+                organization_id=organization_id,
+                client_mac=client_mac,
+                action="block",
+                actor_user_id=actor_user_id,
+            )
         try:
             performed = await provider_impl.block_client(
                 config, str(integration.external_site_id), mac
@@ -5129,13 +5372,22 @@ class NetworkIntegrationService:
         actor_user_id: uuid.UUID | None,
     ) -> ClientActionResult:
         """Clear a controller-side block. Idempotent on the controller."""
-        integration, provider_impl, config, mac = await self._client_action(
-            location_id=location_id,
-            organization_id=organization_id,
-            client_mac=client_mac,
-            action="unblock",
-            actor_user_id=actor_user_id,
-        )
+        try:
+            integration, provider_impl, config, mac = await self._client_action(
+                location_id=location_id,
+                organization_id=organization_id,
+                client_mac=client_mac,
+                action="unblock",
+                actor_user_id=actor_user_id,
+            )
+        except LocationHasNoControllerError:
+            return await self._instant_on_device_write(
+                location_id=location_id,
+                organization_id=organization_id,
+                client_mac=client_mac,
+                action="unblock",
+                actor_user_id=actor_user_id,
+            )
         try:
             performed = await provider_impl.unblock_client(
                 config, str(integration.external_site_id), mac

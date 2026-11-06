@@ -11,7 +11,11 @@ from app.domains.otp.constants import OtpChannel
 from app.domains.otp.exceptions import InvalidOtpIdentifierError
 from app.domains.otp.validators import validate_identifier
 
-from .constants import SLACK_ONBOARDING_RECIPIENT, NotificationChannelType
+from .constants import (
+    SALES_WEBHOOK_RECIPIENT,
+    SLACK_ONBOARDING_RECIPIENT,
+    NotificationChannelType,
+)
 from .exceptions import InvalidNotificationRecipientError
 
 
@@ -30,9 +34,16 @@ def validate_recipient(recipient: str, channel: NotificationChannelType) -> None
     for a caller to smuggle a webhook URL, an email address or anything
     else tenant-derived into a column that ends up on a Master ops
     screen. The webhook itself is resolved from ``Settings`` at dispatch
-    time and never travels through this table."""
+    time and never travels through this table.
+
+    ``WEBHOOK`` follows exactly the same rule against
+    ``SALES_WEBHOOK_RECIPIENT``."""
     if channel is NotificationChannelType.SLACK:
         if recipient != SLACK_ONBOARDING_RECIPIENT:
+            raise InvalidNotificationRecipientError(recipient, channel.value)
+        return
+    if channel is NotificationChannelType.WEBHOOK:
+        if recipient != SALES_WEBHOOK_RECIPIENT:
             raise InvalidNotificationRecipientError(recipient, channel.value)
         return
     try:

@@ -33,6 +33,7 @@ __all__ = [
     "RouterVendorChangeRefusedError",
     "RouterLiveCredentialRotationFailedError",
     "NasOnlySiteRefusedError",
+    "RouterNasOnlyOperationError",
 ]
 
 
@@ -212,6 +213,36 @@ class RouterVendorNotProvisionableError(RouterError):
         )
 
 
+class RouterLocalAdminUnavailableError(RouterError):
+    """This router cannot have its local admin password managed, and retrying
+    will not change that. 422 for the same reason as the vendor refusal above."""
+
+    def __init__(self, router_id: uuid.UUID, reason: str) -> None:
+        super().__init__(
+            f"Local admin password is not available for router {router_id}: {reason}",
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        )
+
+
+class RouterLocalAdminNotIssuedError(RouterError):
+    def __init__(self, router_id: uuid.UUID) -> None:
+        super().__init__(
+            f"No local admin password has been issued for router {router_id}",
+            status_code=status.HTTP_404_NOT_FOUND,
+        )
+
+
+class RouterLocalAdminDeviceError(RouterError):
+    """The device could not be reached, refused the change, or did not accept a
+    login with the new password afterwards. The password stays ``pending``."""
+
+    def __init__(self, router_id: uuid.UUID, detail: str) -> None:
+        super().__init__(
+            f"Local admin password was not confirmed on router {router_id}: {detail}",
+            status_code=status.HTTP_502_BAD_GATEWAY,
+        )
+
+
 class RouterLiveCredentialRotationFailedError(RouterError):
     """Raised by ``RouterService.update_router`` when an ``api_secret``
     change is being applied to a router that already has a *working*
@@ -341,3 +372,21 @@ class NasOnlySiteRefusedError(RouterError):
                 str(existing_router_id) if existing_router_id else None
             ),
         }
+
+
+class RouterNasOnlyOperationError(RouterError):
+    """A device operation that needs a RouterOS API session was asked of an
+    Aruba Instant On (NAS-only) row, which has none: it is configured in the
+    Instant On app and reaches this platform only over RADIUS. 409 with
+    ``data.code = NAS_ONLY_DEVICE`` so a console can say so, instead of the
+    "missing credentials" refusal that invited an operator to add some."""
+
+    CODE = "NAS_ONLY_DEVICE"
+
+    def __init__(self, router_id: uuid.UUID, operation: str) -> None:
+        super().__init__(
+            f"'{operation}' is not available for router {router_id}: it is an "
+            "Aruba Instant On access point, managed in the Instant On app.",
+            status_code=status.HTTP_409_CONFLICT,
+        )
+        self.data = {"code": self.CODE, "operation": operation}

@@ -229,9 +229,139 @@ TASK_REAPPLY_POLICY_ASSIGNMENTS = (
 # schedule.
 SCHEDULE_SWEEP_INTERVAL_SECONDS = 300.0
 
+# Aruba AP + MikroTik gateway hybrid (see ``speed_gateway.py``). Apply and
+# release are enqueued from the shared Aruba RADIUS accounting endpoint; the
+# reconcile sweep is the retry and the cleanup for every other session end.
+TASK_APPLY_ARUBA_HYBRID_QUEUE = (
+    "app.domains.queue_management.tasks.apply_aruba_hybrid_queue"
+)
+TASK_RELEASE_ARUBA_HYBRID_QUEUE = (
+    "app.domains.queue_management.tasks.release_aruba_hybrid_queue"
+)
+TASK_RECONCILE_ARUBA_HYBRID_QUEUES = (
+    "app.domains.queue_management.tasks.reconcile_aruba_hybrid_queues"
+)
+ARUBA_HYBRID_RECONCILE_INTERVAL_SECONDS = 120.0
+
+
+TASK_RELEASE_ENDED_SESSION_QUEUES = (
+    "app.domains.queue_management.tasks.release_ended_session_queues"
+)
+
+# Every 2 minutes. A session's ``/queue simple`` row has no lifetime of its
+# own on the router: nothing there removes it when the guest's session ends,
+# and RouterOS applies the FIRST matching row for an address, so a row left
+# behind keeps deciding the speed of whoever holds that address next. The
+# login path already retires a previous holder's row when the next guest
+# signs in on the same address, so this cadence is not what protects the
+# next guest -- it bounds how long a dead session's row stays on the device
+# and how long its assignment keeps reading ACTIVE.
+RELEASE_ENDED_SESSION_QUEUES_INTERVAL_SECONDS = 120.0
+
+# An assignment younger than this is never judged. ``assign_guest_queue``
+# runs in the worker and can create the assignment before the login
+# request that enqueued it has committed the session row (see
+# ``guest.tasks._assign_guest_queue_async``), so "no live session with this
+# id" is briefly true of a guest who is signing in right now.
+RELEASE_ENDED_SESSION_QUEUES_GRACE_SECONDS = 300.0
+
+
+TASK_BACKFILL_UNASSIGNED_SESSION_QUEUES = (
+    "app.domains.queue_management.tasks.backfill_unassigned_session_queues"
+)
+
+# Every 5 minutes. This is the net under the login's own queue task, not the
+# thing that normally gives a guest their speed, so it does not need the
+# release sweep's cadence: it only ever finds work after a router failed to
+# answer three times in a row. And where a router is still not answering,
+# each run costs one connection timeout on the device-I/O queue -- once
+# every five minutes is a cost worth paying to notice the router is back,
+# once every two is not.
+BACKFILL_UNASSIGNED_SESSION_QUEUES_INTERVAL_SECONDS = 300.0
+
+# A session younger than this is not looked at. The login's own task
+# (``guest.tasks.assign_guest_queue``) may still be working on it: up to
+# three retries thirty seconds apart, each of which can spend a full
+# connection timeout before failing -- about two and a half minutes at
+# worst. Five minutes is clear of that with room to spare, and is the same
+# figure the release sweep waits before judging a new assignment.
+BACKFILL_UNASSIGNED_SESSION_QUEUES_MIN_AGE_SECONDS = 300.0
+
+# The most sessions one run tries to write a queue for -- device attempts,
+# not sessions examined. Each is a fresh RouterOS API connection on the
+# shared device-I/O queue; this bounds a run to well under its own interval
+# even when every write is slow. Overridable per deployment
+# (``Settings.guest_queue_backfill_max_per_run``).
+BACKFILL_UNASSIGNED_SESSION_QUEUES_MAX_PER_RUN = 25
+
+# How many unassigned sessions one run reads. Much larger than the cap
+# above on purpose: sessions that can never be given a queue (an address
+# that is not on the venue's LAN, a controller-run venue) are skipped at no
+# cost and must not crowd out the ones that can.
+BACKFILL_UNASSIGNED_SESSION_QUEUES_SCAN_LIMIT = 1000
+
+
+# The name of every per-assignment ``/queue simple`` row is this followed by
+# the assignment's id. It is also how a guest session's new row finds the
+# rows it replaces on the device (``device_adapters.BaseQueueAdapter
+# .create_simple_queue``'s ``supersede_name_prefix``).
+GUEST_QUEUE_NAME_PREFIX = "cloudguest-"
+
+# A session with no queue assignment is sent its speed in the RADIUS reply
+# instead (``QueueManagementService.rate_limit_reply_for_authorize``), but
+# not while it is younger than this. The hotspot authorizes a second or two
+# after the sign-in that enqueued the session's queue write, and that write
+# -- three tries thirty seconds apart, each able to spend a whole connection
+# timeout -- may still be on its way. Answering with a rate then gives the
+# guest a dynamic hotspot queue *and*, moments later, this platform's own:
+# two rows for one address, which is the fault this fallback must not bring
+# back.
+RADIUS_RATE_FALLBACK_MIN_SESSION_AGE_SECONDS = 150.0
+
+# After a policy re-apply in which some guest's write failed, the task runs
+# again this many seconds later (up to its own ``max_retries``). A re-apply
+# is idempotent -- a guest already at the published rate costs no device
+# call -- so the repeat only does the work that was left.
+REAPPLY_POLICY_ASSIGNMENTS_RETRY_SECONDS = 30
+
+
+# ---------------------------------------------------------------------------
+# A venue's total speed cap (``BandwidthPolicyRules.venue_*_rate_kbps``)
+# ---------------------------------------------------------------------------
+#
+# One parent ``/queue simple`` per router, targeting the guest subnet, with
+# every guest's own per-session row under it. The name carries the first
+# eight characters of the location id, like the per-session rows carry
+# their assignment id: enough to tell two venues' rows apart on a router
+# somebody is reading by hand, and a name this platform can find again
+# without keeping a device id for it.
+VENUE_QUEUE_NAME_PREFIX = "cloudguest-venue-"
+
+# Written on the parent row so a person looking at the router can tell it
+# is the platform's and what it is for.
+VENUE_QUEUE_COMMENT = "cloudguest: venue total speed cap -- managed by the platform"
+
+# Target types the REST API no longer accepts a new assignment for. They
+# were always saved and never enforced: nothing reads an ORGANIZATION or
+# LOCATION row, and a ROUTER row was pushed with an empty ``target``. A
+# venue's total cap is the policy's ``venue_*_rate_kbps`` now, not a row of
+# one of these types. Existing rows are left alone.
+UNENFORCED_QUEUE_TARGET_TYPES: frozenset[QueueTargetType] = frozenset(
+    {
+        QueueTargetType.ORGANIZATION,
+        QueueTargetType.LOCATION,
+        QueueTargetType.ROUTER,
+    }
+)
 
 __all__ = [
     "QueueType",
+    "VENUE_QUEUE_NAME_PREFIX",
+    "GUEST_QUEUE_NAME_PREFIX",
+    "RADIUS_RATE_FALLBACK_MIN_SESSION_AGE_SECONDS",
+    "REAPPLY_POLICY_ASSIGNMENTS_RETRY_SECONDS",
+    "VENUE_QUEUE_COMMENT",
+    "UNENFORCED_QUEUE_TARGET_TYPES",
     "MIN_QUEUE_PRIORITY",
     "MAX_QUEUE_PRIORITY",
     "DEFAULT_QUEUE_PRIORITY",
@@ -246,5 +376,17 @@ __all__ = [
     "QueueTemplatePersona",
     "TASK_SWEEP_SCHEDULE_TRANSITIONS",
     "TASK_REAPPLY_POLICY_ASSIGNMENTS",
+    "TASK_RELEASE_ENDED_SESSION_QUEUES",
+    "RELEASE_ENDED_SESSION_QUEUES_INTERVAL_SECONDS",
+    "RELEASE_ENDED_SESSION_QUEUES_GRACE_SECONDS",
+    "TASK_BACKFILL_UNASSIGNED_SESSION_QUEUES",
+    "BACKFILL_UNASSIGNED_SESSION_QUEUES_INTERVAL_SECONDS",
+    "BACKFILL_UNASSIGNED_SESSION_QUEUES_MIN_AGE_SECONDS",
+    "BACKFILL_UNASSIGNED_SESSION_QUEUES_MAX_PER_RUN",
+    "BACKFILL_UNASSIGNED_SESSION_QUEUES_SCAN_LIMIT",
     "SCHEDULE_SWEEP_INTERVAL_SECONDS",
+    "TASK_APPLY_ARUBA_HYBRID_QUEUE",
+    "TASK_RELEASE_ARUBA_HYBRID_QUEUE",
+    "TASK_RECONCILE_ARUBA_HYBRID_QUEUES",
+    "ARUBA_HYBRID_RECONCILE_INTERVAL_SECONDS",
 ]

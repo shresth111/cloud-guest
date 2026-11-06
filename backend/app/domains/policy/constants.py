@@ -124,21 +124,28 @@ class PolicyAssignmentTargetType(StrEnum):
     > Group Policies flow: create a group, map it to a location, then map
     specific guests into it) targets one specific
     ``app.domains.guest.models.Guest`` row instead of a platform ``User``.
-    Deliberately unvalidated against a real guest existence check (no
-    ``guest_lookup`` composed into ``PolicyService``, unlike
-    ``user_lookup``/``role_lookup``): ``policy`` composes no *feature*
-    domain (see ``service.py``'s module docstring) and ``guest`` already
-    depends on ``policy`` the other way round via ``PolicyLookupProtocol``,
-    so validating this target here would be circular. ``target_id`` is
-    trusted the same way ``PolicyAssignment.scope_id``/
-    ``QueueAssignment.target_id`` already are -- the caller (the real
-    guest picker UI, fed from the same organization's own guest list) is
-    responsible for supplying a real id, not this column."""
+    Validated at write time: ``PolicyService.create_assignment`` checks the
+    guest exists and belongs to the policy's organization (or a direct MSP
+    child), through ``GuestLookupProtocol`` -- implemented by
+    ``PolicyRepository.get_guest_organization_id`` as a column-only read of
+    ``guests``, so ``policy`` still imports nothing from the ``guest``
+    domain. Resolution additionally ignores any candidate whose policy
+    belongs to another organization (rows written before that check)."""
 
     NONE = "none"
     USER = "user"
     ROLE = "role"
     GUEST = "guest"
+    # "This policy is offered here, to its mapped members only." An Access
+    # Tier used to be mapped to a location with a ``NONE`` assignment --
+    # the very row that makes a policy the location's default -- so mapping
+    # a tier applied it to every guest at the venue, and the newest one
+    # won. ``MEMBERS`` records the mapping without making the policy a
+    # candidate for anyone: ``PolicyRepository.list_candidate_assignments``
+    # never selects it, so it grants nothing by itself. Who the tier applies
+    # to is said only by the ``GUEST`` assignments at the same scope.
+    # ``target_id`` is always ``NULL``.
+    MEMBERS = "members"
 
 
 class PolicyVersionStatus(StrEnum):

@@ -37,7 +37,6 @@ from wyfy_device_gateway.snmp_poller import (
     SnmpInterfaceCounters,
 )
 
-from app.domains.provisioning_engine import service as provisioning_engine_service
 from app.domains.provisioning_engine.repository import (
     ProvisioningEngineRepositoryProtocol,
 )
@@ -45,7 +44,8 @@ from app.domains.provisioning_engine.service import (
     SnmpMetricsPollSweepSummary,
     run_router_snmp_metrics_poll_sweep,
 )
-from app.domains.router.crypto import decrypt_secret
+from app.domains.router import snmp as router_snmp_module
+from app.domains.router.crypto import decrypt_secret, encrypt_secret
 from app.domains.router.exceptions import RouterNotFoundError
 from app.domains.router.models import Router
 from app.domains.router.service import RouterService
@@ -115,6 +115,7 @@ class FakeSettings:
     snmp_default_version: str = "2c"
     snmp_default_port: int = 161
     snmp_poll_timeout_seconds: int = 5
+    snmp_poller_source_addresses: str = "172.31.38.118/32"
 
 
 @dataclass
@@ -128,6 +129,9 @@ class FakeRouterLookup:
     routers: dict[uuid.UUID, Router] = field(default_factory=dict)
     snmp_communities: dict[uuid.UUID, str | None] = field(default_factory=dict)
     heartbeats: list[uuid.UUID] = field(default_factory=list)
+    poll_outcomes: list[tuple[uuid.UUID, str, str | None]] = field(
+        default_factory=list
+    )
 
     def add(self, router: Router, *, snmp_community: str | None = None) -> Router:
         self.routers[router.id] = router
@@ -162,6 +166,20 @@ class FakeRouterLookup:
 
     def get_decrypted_snmp_community(self, router: Router) -> str | None:
         return self.snmp_communities.get(router.id)
+
+    def get_snmp_credentials(self, router: Router):  # noqa: ANN201
+        # The real resolution, against the fake's per-router community --
+        # the sweep's credential logic lives in app.domains.router.snmp now.
+        community = self.snmp_communities.get(router.id)
+        router.snmp_community_encrypted = (
+            encrypt_secret(community) if community else None
+        )
+        return router_snmp_module.resolve_snmp_credentials(router)
+
+    async def record_snmp_poll_outcome(
+        self, router: Router, *, status: str, detail: str | None = None
+    ) -> None:
+        self.poll_outcomes.append((router.id, status, detail))
 
 
 @dataclass
@@ -363,9 +381,7 @@ class TestRouterSnmpMetricsPollSweep:
         self, monkeypatch: pytest.MonkeyPatch, **overrides: object
     ) -> None:
         settings = FakeSettings(**overrides)
-        monkeypatch.setattr(
-            provisioning_engine_service, "get_settings", lambda: settings
-        )
+        monkeypatch.setattr(router_snmp_module, "get_settings", lambda: settings)
 
     async def test_successful_poll_records_snapshot_composing_onto_existing_table(
         self, monkeypatch: pytest.MonkeyPatch
@@ -400,6 +416,7 @@ class TestRouterSnmpMetricsPollSweep:
         # see record_health_snapshot's own "call_heartbeat=False" docstring.
         assert recorded["call_heartbeat"] is False
         assert router_lookup.heartbeats == []
+        assert router_lookup.poll_outcomes == [(router.id, "ok", None)]
         assert recorded["interface_traffic_counters"] == [
             {
                 "if_index": 1,
@@ -433,6 +450,8 @@ class TestRouterSnmpMetricsPollSweep:
         assert poller.calls == []
         assert router_provisioning.health_snapshots_recorded == []
         assert router_provisioning.failed_health_checks_recorded == []
+        # The skip is written down, not silent.
+        assert [o[1] for o in router_lookup.poll_outcomes] == ["not_configured"]
 
     async def test_falls_back_to_platform_default_community(
         self, monkeypatch: pytest.MonkeyPatch
@@ -456,7 +475,7 @@ class TestRouterSnmpMetricsPollSweep:
         assert summary.checked == 1
         assert poller.calls == [router.management_ip_address]
 
-    async def test_snmp_connection_error_records_failed_health_check(
+    async def test_snmp_timeout_recorded_on_router_not_as_unhealthy_snapshot(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         self._patch_settings(monkeypatch)
@@ -483,13 +502,16 @@ class TestRouterSnmpMetricsPollSweep:
         assert summary == SnmpMetricsPollSweepSummary(
             checked=0, unreachable=1, skipped=0, errors=0
         )
-        assert len(router_provisioning.failed_health_checks_recorded) == 1
-        failed = router_provisioning.failed_health_checks_recorded[0]
-        assert failed["router_id"] == router.id
-        assert failed["metrics_source"] == "snmp"
+        # A silent agent is a fact about the monitoring channel, not the
+        # device: no UNHEALTHY row in the venue owner's health history.
+        assert router_provisioning.failed_health_checks_recorded == []
         assert router_provisioning.health_snapshots_recorded == []
+        assert router_lookup.poll_outcomes == [
+            (router.id, "no_response", router_lookup.poll_outcomes[0][2])
+        ]
+        assert "timeout" in (router_lookup.poll_outcomes[0][2] or "")
 
-    async def test_snmp_device_error_also_records_failed_health_check(
+    async def test_snmp_device_error_records_error_outcome(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         self._patch_settings(monkeypatch)
@@ -513,6 +535,8 @@ class TestRouterSnmpMetricsPollSweep:
         )
 
         assert summary.unreachable == 1
+        assert router_lookup.poll_outcomes[0][1] == "error"
+        assert router_provisioning.failed_health_checks_recorded == []
 
     async def test_per_router_failure_isolation(
         self, monkeypatch: pytest.MonkeyPatch
@@ -600,3 +624,26 @@ class TestRouterSnmpMetricsPollSweep:
 
         recorded = router_provisioning.health_snapshots_recorded[0]
         assert recorded["interface_traffic_counters"] is None
+
+
+class TestSnmpSweepVendorGate:
+    async def test_controller_vendor_is_skipped_and_recorded(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        settings = FakeSettings()
+        monkeypatch.setattr(router_snmp_module, "get_settings", lambda: settings)
+        for vendor in ("tplink_omada", "aruba_instant_on"):
+            router = _make_router(snmp_enabled=True)
+            router.vendor = vendor
+            router_lookup = FakeRouterLookup()
+            router_lookup.add(router, snmp_community="public123")
+            poller = FakeSnmpPoller()
+            summary = await run_router_snmp_metrics_poll_sweep(
+                _StubRepository([router]),
+                router_lookup,
+                FakeRouterProvisioningLookup(),
+                snmp_poller=poller,
+            )
+            assert summary.skipped == 1
+            assert poller.calls == []
+            assert router_lookup.poll_outcomes[0][1] == "not_configured"

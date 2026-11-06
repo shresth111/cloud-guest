@@ -29,6 +29,7 @@ __all__ = [
     "PolicyRollbackTargetNotPublishedError",
     "PolicyRollbackTargetMismatchError",
     "PolicyAssignmentGuestAlreadyMappedError",
+    "PolicyAssignmentTargetGuestNotFoundError",
 ]
 
 
@@ -99,10 +100,21 @@ class PolicyRulesValidationError(PolicyError):
     ``schemas.POLICY_RULE_SCHEMAS`` -- see that registry's own docstring for
     which types have a concrete schema vs. the generic passthrough."""
 
-    def __init__(self, policy_type: str, detail: str) -> None:
+    def __init__(
+        self,
+        policy_type: str,
+        detail: str,
+        *,
+        field_errors: list[dict[str, str]] | None = None,
+    ) -> None:
+        # ``field_errors`` is the same refusal, one entry per offending
+        # field (``{"field": ..., "message": ...}``), so a form can put the
+        # sentence beside the input it is about instead of parsing the
+        # message above. Additive: the message and status are unchanged.
         super().__init__(
             f"Invalid rules payload for policy type '{policy_type}': {detail}",
             status_code=status.HTTP_400_BAD_REQUEST,
+            data={"field_errors": field_errors} if field_errors else None,
         )
 
 
@@ -156,7 +168,7 @@ class PolicyAssignmentTargetIdRequiredError(PolicyError):
 class PolicyAssignmentTargetIdNotAllowedError(PolicyError):
     def __init__(self) -> None:
         super().__init__(
-            "target_id must not be set for target_type 'none'",
+            "target_id must not be set for target_type 'none' or 'members'",
             status_code=status.HTTP_400_BAD_REQUEST,
         )
 
@@ -184,6 +196,19 @@ class PolicyAssignmentTargetRoleNotFoundError(PolicyError):
     def __init__(self, role_id: object) -> None:
         super().__init__(
             f"Cannot target a policy assignment at unknown role: {role_id}",
+            status_code=status.HTTP_404_NOT_FOUND,
+        )
+
+
+class PolicyAssignmentTargetGuestNotFoundError(PolicyError):
+    """The guest a GUEST-targeted assignment names does not exist, or does
+    not belong to the organization that owns the policy. Both read as the
+    same 404 so a caller cannot probe whether another tenant's guest id is
+    real."""
+
+    def __init__(self, guest_id: object) -> None:
+        super().__init__(
+            f"Cannot target a policy assignment at unknown guest: {guest_id}",
             status_code=status.HTTP_404_NOT_FOUND,
         )
 

@@ -1067,3 +1067,79 @@ class TestEveryRouteRequiresPermission:
             assert (
                 route.dependencies != []
             ), f"{route.path} ({route.methods}) has no permission dependency"
+
+
+# ============================================================================
+# The device sync binds registered hardware's IP (static DHCP lease)
+# ============================================================================
+
+
+class TestSyncPinsMonitoredHardwareLeases:
+    def _router(self):
+        router = Router(
+            organization_id=uuid.uuid4(),
+            location_id=uuid.uuid4(),
+            name="Library Hall",
+            serial_number="SN-1",
+            vendor="mikrotik",
+            status="online",
+            settings={},
+        )
+        router.id = uuid.uuid4()
+        return router
+
+    async def test_registered_macs_are_pinned(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from app.domains.connected_devices import tasks
+
+        seen: list[set[str]] = []
+
+        class FakeRepo:
+            async def list_monitored_macs_for_router(self, router_id):
+                return {"E4:FA:C4:3B:90:46"}
+
+        async def fake_pin(self, router, macs, *, actor_user_id):
+            seen.append(set(macs))
+            return []
+
+        monkeypatch.setattr(tasks.DhcpService, "pin_device_leases", fake_pin)
+        await tasks._pin_monitored_hardware_leases(
+            object(), FakeRepo(), object(), self._router()
+        )
+        assert seen == [{"E4:FA:C4:3B:90:46"}]
+
+    async def test_no_registered_hardware_makes_no_router_call(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from app.domains.connected_devices import tasks
+
+        class FakeRepo:
+            async def list_monitored_macs_for_router(self, router_id):
+                return set()
+
+        async def must_not_run(self, *a, **k):
+            raise AssertionError("no MACs, no RouterOS call")
+
+        monkeypatch.setattr(tasks.DhcpService, "pin_device_leases", must_not_run)
+        await tasks._pin_monitored_hardware_leases(
+            object(), FakeRepo(), object(), self._router()
+        )
+
+    async def test_a_failure_never_breaks_the_sync(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from app.domains.connected_devices import tasks
+
+        class FakeRepo:
+            async def list_monitored_macs_for_router(self, router_id):
+                return {"E4:FA:C4:3B:90:46"}
+
+        async def boom(self, *a, **k):
+            raise RuntimeError("router unreachable")
+
+        monkeypatch.setattr(tasks.DhcpService, "pin_device_leases", boom)
+        # Returns normally: the sync that already succeeded is not undone.
+        await tasks._pin_monitored_hardware_leases(
+            object(), FakeRepo(), object(), self._router()
+        )

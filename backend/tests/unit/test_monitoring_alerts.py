@@ -185,6 +185,7 @@ class FakeIspLink:
     router_id: uuid.UUID
     provider_name: str
     health_status: str | None
+    is_enabled: bool = True
 
 
 @dataclass
@@ -3679,3 +3680,119 @@ async def test_a_default_rule_pointed_somewhere_else_is_left_alone():
 
     assert repo.rule_channels[hardware_rule.id] == [chosen_by_the_operator]
     assert "Network hardware down" not in report.rules_linked_to_channel
+
+
+class TestIspLinkAlertsArePerLine:
+    """The alert key stopped at the router, so every line on a multi-WAN
+    router shared one alert."""
+
+    @staticmethod
+    async def _venue(statuses: list[str]):
+        repo = FakeRepository()
+        service = AlertService(repo)
+        org_id, location_id, router_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+        links = [
+            FakeIspLink(
+                id=uuid.uuid4(),
+                organization_id=org_id,
+                location_id=location_id,
+                router_id=router_id,
+                provider_name=f"ISP{index + 1}",
+                health_status=status,
+            )
+            for index, status in enumerate(statuses)
+        ]
+        repo.isp_links.extend(links)
+        rule = await repo.create_alert_rule(
+            **_alert_rule_fields(
+                trigger_type=AlertTriggerType.HEALTH_STATUS_CHANGE,
+                target_component=ALERT_TARGET_ISP_LINK,
+                condition_config={"expected_status": "unhealthy"},
+                organization_id=org_id,
+            )
+        )
+        return repo, service, links, rule
+
+    @pytest.mark.parametrize(
+        "statuses",
+        [["unhealthy", "healthy"], ["healthy", "unhealthy"]],
+        ids=["first-line-down", "second-line-down"],
+    )
+    async def test_one_of_two_down_alerts_once_and_stays_open(
+        self, statuses: list[str]
+    ) -> None:
+        _repo, service, links, _rule = await self._venue(statuses)
+        down = next(link for link in links if link.health_status == "unhealthy")
+
+        first = await service.evaluate_alert_rules()
+        assert [alert.message for alert in first.triggered] == [
+            f"{down.provider_name} is down"
+        ]
+        assert first.resolved == []
+        for _ in range(3):
+            again = await service.evaluate_alert_rules()
+            assert again.triggered == []
+            assert again.resolved == []
+
+    async def test_two_of_three_down_gives_each_line_its_own_alert(self) -> None:
+        _repo, service, links, _rule = await self._venue(
+            ["unhealthy", "unhealthy", "healthy"]
+        )
+        result = await service.evaluate_alert_rules()
+        assert sorted(alert.message for alert in result.triggered) == [
+            "ISP1 is down",
+            "ISP2 is down",
+        ]
+        assert result.resolved == []
+
+        # One recovers: only its alert closes.
+        links[0].health_status = "healthy"
+        result = await service.evaluate_alert_rules()
+        assert result.triggered == []
+        assert [alert.message for alert in result.resolved] == ["ISP1 is up"]
+
+    async def test_a_second_line_failing_later_still_alerts(self) -> None:
+        _repo, service, links, _rule = await self._venue(["unhealthy", "healthy"])
+        await service.evaluate_alert_rules()
+        links[1].health_status = "unhealthy"
+        result = await service.evaluate_alert_rules()
+        assert [alert.message for alert in result.triggered] == ["ISP2 is down"]
+
+    async def test_no_reading_neither_raises_nor_clears_an_alert(self) -> None:
+        _repo, service, links, _rule = await self._venue(["unhealthy", "healthy"])
+        await service.evaluate_alert_rules()
+        links[0].health_status = "unknown"
+        links[1].health_status = "unknown"
+        result = await service.evaluate_alert_rules()
+        assert result.triggered == []
+        assert result.resolved == []
+
+    async def test_disabling_a_line_clears_its_alert(self) -> None:
+        _repo, service, links, _rule = await self._venue(["unhealthy", "healthy"])
+        await service.evaluate_alert_rules()
+        links[0].is_enabled = False
+        result = await service.evaluate_alert_rules()
+        assert len(result.resolved) == 1
+        assert result.triggered == []
+
+    async def test_deleting_a_line_clears_its_alert(self) -> None:
+        repo, service, links, _rule = await self._venue(["unhealthy", "healthy"])
+        await service.evaluate_alert_rules()
+        repo.isp_links.remove(links[0])
+        result = await service.evaluate_alert_rules()
+        assert len(result.resolved) == 1
+        assert result.triggered == []
+
+    async def test_an_alert_opened_before_the_per_line_key_drains(self) -> None:
+        """Open rows from before the fix have no subject. They must close
+        without leaving the down line unalerted."""
+        repo, service, links, rule = await self._venue(["unhealthy", "healthy"])
+        await service.evaluate_alert_rules()
+        legacy = next(iter(repo.alerts.values()))
+        legacy.subject_id = None
+
+        await service.evaluate_alert_rules()
+        await service.evaluate_alert_rules()
+
+        open_alerts = await repo.list_open_alerts_for_rule(rule_id=rule.id)
+        assert [alert.subject_id for alert in open_alerts] == [links[0].id]

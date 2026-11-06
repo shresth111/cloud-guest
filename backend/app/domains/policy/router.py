@@ -43,6 +43,7 @@ from .schemas import (
     PolicyVersionCreateRequest,
     PolicyVersionResponse,
     ResolvedPolicyResponse,
+    with_venue_rate_keys,
 )
 from .service import PolicyService
 
@@ -64,8 +65,9 @@ def _request_id(request: Request) -> str:
     return str(getattr(request.state, "request_id", ""))
 
 
-def _policy_response(policy: Policy) -> PolicyResponse:
+def _policy_response(policy: Policy, *, member_count: int = 0) -> PolicyResponse:
     return PolicyResponse(
+        member_count=member_count,
         id=str(policy.id),
         organization_id=str(policy.organization_id) if policy.organization_id else None,
         policy_type=PolicyType(policy.policy_type),
@@ -89,7 +91,7 @@ def _version_response(version: PolicyVersion) -> PolicyVersionResponse:
         policy_id=str(version.policy_id),
         version_number=version.version_number,
         status=version.status,
-        rules=version.rules,
+        rules=with_venue_rate_keys(version.rules),
         published_at=version.published_at,
         created_at=version.created_at,
     )
@@ -112,6 +114,47 @@ def _assignment_response(assignment: PolicyAssignment) -> PolicyAssignmentRespon
 # ============================================================================
 # Resolution -- registered before /{policy_id}, see module docstring.
 # ============================================================================
+
+
+_REAPPLY_DISPATCH_COUNTDOWN_SECONDS = 3
+
+
+def _dispatch_bandwidth_reapply(
+    policy_id: uuid.UUID,
+    *,
+    version_id: uuid.UUID | None = None,
+    location_id: uuid.UUID | None = None,
+) -> None:
+    """Ask the worker to re-resolve the live guest queues this policy
+    reaches. Never raises: the policy change it follows has already been
+    saved and is correct for every next login either way.
+
+    ``location_id`` names a location the task could no longer find from
+    the policy's own active mappings -- the one a mapping was just removed
+    from.
+
+    The task import is function-local to keep the module-import graph
+    acyclic (see the note above the router definition)."""
+    try:
+        from app.domains.queue_management.tasks import (  # noqa: PLC0415
+            reapply_policy_assignments,
+        )
+
+        # A short countdown, not ``.delay()``: the request's transaction
+        # commits only after this handler returns (``get_db_session``
+        # commits after its ``yield``), so a worker that picks the task up
+        # at once reads the policy as it was *before* this change -- and a
+        # brand-new assignment is simply not there yet.
+        reapply_policy_assignments.apply_async(
+            kwargs={
+                "policy_id": str(policy_id),
+                "version_id": str(version_id) if version_id is not None else "",
+                "location_id": str(location_id) if location_id is not None else "",
+            },
+            countdown=_REAPPLY_DISPATCH_COUNTDOWN_SECONDS,
+        )
+    except Exception:  # noqa: BLE001 -- never fail the request over a dispatch hiccup
+        logger.exception("bandwidth_publish_reapply_dispatch_failed")
 
 
 @router.get(
@@ -182,7 +225,7 @@ async def resolve_effective_policy(
             policy_type=resolved.policy_type,
             organization_id=resolved.organization_id,
             location_id=resolved.location_id,
-            rules=resolved.rules,
+            rules=with_venue_rate_keys(resolved.rules),
             source=resolved.source,
             user_id=resolved.user_id,
         ).model_dump(),
@@ -284,8 +327,12 @@ async def list_policies(
         page=page,
         page_size=page_size,
     )
+    member_counts = await service.member_counts([policy.id for policy in policies])
     payload = PolicyListResponse(
-        items=[_policy_response(policy) for policy in policies],
+        items=[
+            _policy_response(policy, member_count=member_counts.get(policy.id, 0))
+            for policy in policies
+        ],
         page=meta.page,
         page_size=meta.page_size,
         total_items=meta.total_items,
@@ -320,8 +367,11 @@ async def get_policy(
     assignments = await service.list_assignments(
         policy_id=policy.id, requesting_organization_id=requesting_organization_id
     )
+    member_counts = await service.member_counts([policy.id])
     payload = PolicyDetailResponse(
-        **_policy_response(policy).model_dump(),
+        **_policy_response(
+            policy, member_count=member_counts.get(policy.id, 0)
+        ).model_dump(),
         versions=[_version_response(v) for v in versions],
         assignments=[_assignment_response(a) for a in assignments],
     )
@@ -351,6 +401,11 @@ async def deactivate_policy(
         requesting_organization_id=requesting_organization_id,
         actor_user_id=uuid.UUID(user.id),
     )
+    # Deleting a tier, or a location's own limits, changes what the guests
+    # already online are entitled to exactly as a publish does. The policy
+    # keeps its mappings, so the task still finds every location it reached,
+    # and resolution there no longer sees it.
+    _dispatch_bandwidth_reapply(policy_id)
     return build_response(
         success=True,
         message="Policy deactivated",
@@ -423,17 +478,7 @@ async def publish_policy_version(
     # correct for every *next* login either way. The import is
     # function-local to keep the module-import graph acyclic (see the note
     # above the router definition).
-    try:
-        from app.domains.queue_management.tasks import (
-            reapply_policy_assignments,
-        )
-
-        reapply_policy_assignments.delay(
-            policy_id=str(policy_id),
-            version_id=str(version_id),
-        )
-    except Exception:  # noqa: BLE001 -- never fail a publish over a dispatch hiccup
-        logger.exception("bandwidth_publish_reapply_dispatch_failed")
+    _dispatch_bandwidth_reapply(policy_id, version_id=version_id)
     return build_response(
         success=True,
         message="Policy version published",
@@ -499,6 +544,14 @@ async def create_policy_assignment(
         target_type=payload.target_type,
         target_id=payload.target_id,
     )
+    # Mapping a policy to a location changes what that location's guests
+    # are entitled to exactly as a publish does, and it was the one of the
+    # two that told nobody. The dashboard's first save of a venue's speed
+    # publishes the version and THEN creates this assignment, so the
+    # publish-time re-apply above ran against a policy mapped to no
+    # location, found nothing to do, and the guests already online kept
+    # the speed they signed in with. Same task, same best-effort posture.
+    _dispatch_bandwidth_reapply(policy_id)
     return build_response(
         success=True,
         message="Policy assignment created",
@@ -549,6 +602,16 @@ async def deactivate_policy_assignment(
         assignment_id=assignment_id,
         requesting_organization_id=requesting_organization_id,
         actor_user_id=uuid.UUID(user.id),
+    )
+    # Removing a member, or taking a tier off a location, must reach the
+    # guests who are online now -- they kept the tier's speed until their
+    # next sign-in. The mapping is no longer active, so its location is
+    # passed explicitly.
+    _dispatch_bandwidth_reapply(
+        policy_id,
+        location_id=(
+            assignment.scope_id if assignment.scope_type == "location" else None
+        ),
     )
     return build_response(
         success=True,

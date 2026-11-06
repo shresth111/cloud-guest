@@ -18,6 +18,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .constants import (
     CAMPAIGN_VARIABLE_MAX_LENGTHS,
+    MAX_SELECTED_GUESTS,
     MAX_TEST_ADDRESSES,
     NOT_SEEN_FOR_DAYS_MAX,
     Channel,
@@ -38,6 +39,12 @@ class AudienceFilter(_Strict):
     max_visits: int | None = Field(default=None, ge=0)
     not_seen_for_days: int | None = Field(default=None, ge=1, le=NOT_SEEN_FOR_DAYS_MAX)
     require_name: bool = False
+    # Hand-picked guests, narrowing the filters above. Consent, opt-out, blocks
+    # and suppression still apply to every one: this can only remove people from
+    # the audience, never add someone the filters and consent would exclude.
+    guest_ids: list[uuid.UUID] | None = Field(
+        default=None, min_length=1, max_length=MAX_SELECTED_GUESTS
+    )
 
     @model_validator(mode="after")
     def _ranges(self) -> AudienceFilter:
@@ -54,6 +61,16 @@ class AudienceFilter(_Strict):
         ):
             raise ValueError("min_visits must not exceed max_visits")
         return self
+
+
+class AudienceCandidatesRequest(_Strict):
+    """The reachable guests behind a filter, for picking recipients by hand.
+    ``audience.guest_ids`` is ignored here: the list shows who can be picked."""
+
+    audience: AudienceFilter
+    search: str | None = Field(default=None, max_length=120)
+    page: int = Field(default=1, ge=1)
+    page_size: int = Field(default=50, ge=1, le=200)
 
 
 class PortalConsentUpdate(_Strict):

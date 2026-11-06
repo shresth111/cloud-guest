@@ -23,16 +23,29 @@ from datetime import UTC, datetime, timedelta
 from app.domains.connected_devices.device_adapters import (
     ArpPingResult,
     DiscoveredDevice,
+    LanSnapshot,
     PingResult,
 )
 from app.domains.connected_devices.exceptions import ConnectedDeviceConnectionError
-from app.domains.connected_devices.models import ConnectedDevice
+from app.domains.connected_devices.models import (
+    ConnectedDevice,
+    MonitoredDeviceEvent,
+    MonitoredDeviceHealth,
+)
 from app.domains.connected_devices.service import (
-    run_monitored_hardware_liveness_sweep,
+    run_monitored_hardware_liveness_sweep as _sweep_core,
 )
 from app.domains.monitored_hardware.models import MonitoredHardware
 from app.domains.router.exceptions import RouterNotFoundError
 from app.domains.router.models import Router
+
+
+async def run_monitored_hardware_liveness_sweep(*args, **kwargs):
+    """These tests pin what ONE probe concludes, so they run with no
+    debounce. The debounce, reasons and port facts are tested in
+    ``test_monitored_device_health.py``."""
+    kwargs.setdefault("down_after_failures", 1)
+    return await _sweep_core(*args, **kwargs)
 
 
 def _now() -> datetime:
@@ -138,10 +151,48 @@ class FakeLivenessRepository:
         default_factory=list
     )
 
+    health: dict[uuid.UUID, MonitoredDeviceHealth] = field(default_factory=dict)
+    events: list[MonitoredDeviceEvent] = field(default_factory=list)
+
     async def list_monitored_targets(
         self,
     ) -> list[tuple[ConnectedDevice, MonitoredHardware]]:
         return list(self.targets)
+
+    async def get_health_for_devices(self, device_ids):
+        return {i: self.health[i] for i in device_ids if i in self.health}
+
+    async def save_health(self, existing, fields):
+        row = existing or MonitoredDeviceHealth(id=uuid.uuid4())
+        for key, value in fields.items():
+            setattr(row, key, value)
+        self.health[row.connected_device_id] = row
+        return row
+
+    async def add_device_event(self, **fields):
+        row = MonitoredDeviceEvent(id=uuid.uuid4(), **fields)
+        self.events.append(row)
+        return row
+
+    async def count_link_flaps_since(self, device_ids, since):
+        wanted = set(device_ids)
+        out: dict[uuid.UUID, int] = {}
+        for e in self.events:
+            if (
+                e.kind == "link_down"
+                and e.connected_device_id in wanted
+                and e.occurred_at >= since
+            ):
+                out[e.connected_device_id] = out.get(e.connected_device_id, 0) + (
+                    e.count or 0
+                )
+        return out
+
+    async def prune_device_events(self, before):
+        kept = [e for e in self.events if e.occurred_at >= before]
+        pruned = len(self.events) - len(kept)
+        self.events = kept
+        return pruned
 
     async def update_device(
         self, device: ConnectedDevice, data: dict[str, object]
@@ -193,6 +244,17 @@ class FakePingAdapter:
     #: target IP -> MACs that answer an ARP ping there.
     arp_replies: dict[str, frozenset[str]] = field(default_factory=dict)
     arp_ping_calls: list[dict[str, object]] = field(default_factory=list)
+    #: What ``read_lan_snapshot`` returns; ``None`` -> an empty snapshot.
+    snapshot: LanSnapshot | None = None
+    snapshot_calls: int = 0
+
+    async def read_lan_snapshot(self, credentials) -> LanSnapshot:
+        self.snapshot_calls += 1
+        if self.raise_connection_error:
+            raise ConnectedDeviceConnectionError(credentials.host, "down in test")
+        return self.snapshot or LanSnapshot(
+            ports=(), hosts=(), bridge_of_port={}, clock_offset_seconds=None
+        )
 
     async def ping(self, credentials, *, target: str, count: int) -> PingResult:
         self.ping_calls.append({"target": target, "count": count})

@@ -1064,6 +1064,7 @@ class OmadaProvider:
         """
         from wyfy_device_gateway.controller_contract import (  # noqa: PLC0415
             PortalSetupSpec,
+            RadiusPortalSpec,
         )
 
         spec = PortalSetupSpec(
@@ -1083,6 +1084,19 @@ class OmadaProvider:
             new_operator_password=request.new_operator_password,
             take_over_ssid_portal=request.take_over_ssid_portal,
             dry_run=request.dry_run,
+            radius=(
+                None
+                if request.radius is None
+                else RadiusPortalSpec(
+                    server_ip=request.radius.server_ip,
+                    server_port=request.radius.server_port,
+                    profile_name=request.radius.profile_name,
+                    nas_id=request.radius.nas_id,
+                    portal_url_scheme=request.radius.portal_url_scheme,
+                    portal_url=request.radius.portal_url_host_and_query,
+                    shared_secret=request.radius.shared_secret,
+                )
+            ),
         )
         report = await self._call(config, "configure_external_portal", spec)
         block = getattr(report, "block", None)

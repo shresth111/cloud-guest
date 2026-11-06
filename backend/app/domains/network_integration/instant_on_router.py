@@ -21,7 +21,10 @@ by venue owners). Keyed on a fleet ``router_id``. The one write,
 it maps the router to its Instant On site and sets the per-venue flags. Its
 body carries no organization or location -- both are copied from the router.
 
-Nothing here writes to Instant On.
+Nothing here writes to Instant On, except ``PUT /routers/{router_id}/
+guest-rate-limit`` -- Master only, GLOBAL, behind
+``Settings.instant_on_cloud_control_enabled`` + the router allowlist, and a
+preview (``dry_run``, the default) unless explicitly asked to apply.
 """
 
 from __future__ import annotations
@@ -31,9 +34,12 @@ from collections.abc import Callable
 from typing import Any
 
 from fastapi import APIRouter, Depends, Request
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.common.responses import ApiResponse, build_response
 from app.core.config import get_settings
+from app.core.logging import get_logger
+from app.database.session import get_db_session
 from app.domains.auth.models import AuthUser
 from app.domains.rbac.dependencies import (
     CurrentOrganization,
@@ -41,6 +47,7 @@ from app.domains.rbac.dependencies import (
     RequirePermission,
 )
 from app.domains.rbac.enums import ScopeType
+from app.domains.rbac.location_scope import CallerLocationScope, LocationScope
 from app.domains.router.dependencies import get_router_service
 from app.domains.router.service import RouterService
 
@@ -52,16 +59,26 @@ from .instant_on_schemas import (
     InstantOnClientItem,
     InstantOnClientUsageItem,
     InstantOnCustomerView,
+    InstantOnEventItem,
+    InstantOnGuestNetworksResponse,
+    InstantOnGuestRateLimitRequest,
+    InstantOnGuestRateLimitResponse,
+    InstantOnGuestRateLimitState,
     InstantOnHealthItem,
     InstantOnPlatformView,
     InstantOnSiteConfigRequest,
     InstantOnSitesResponse,
     InstantOnSiteStatus,
     InstantOnSsidItem,
+    InstantOnVenueGuestSpeedRequest,
+    InstantOnVenueGuestSpeedResponse,
+    InstantOnVenueNetworkTotalRequest,
 )
 from .instant_on_service import InstantOnKind, InstantOnReadService, InstantOnView
 
 __all__ = ["instant_on_customer_router", "instant_on_platform_router"]
+
+logger = get_logger(__name__)
 
 instant_on_customer_router = APIRouter(
     prefix="/network-integrations", tags=["Instant On (customer)"]
@@ -71,6 +88,9 @@ instant_on_platform_router = APIRouter(
 )
 
 _CUSTOMER_PERMISSION = RequirePermission("locations.read", scope=ScopeType.ORGANIZATION)
+_CUSTOMER_SPEED_UPDATE = RequirePermission(
+    "bandwidth.update", scope=ScopeType.ORGANIZATION
+)
 _PLATFORM_READ = RequirePermission("network_integrations.read", scope=ScopeType.GLOBAL)
 _PLATFORM_UPDATE = RequirePermission(
     "network_integrations.update", scope=ScopeType.GLOBAL
@@ -83,6 +103,7 @@ _ITEM_MODELS: dict[InstantOnKind, type] = {
     InstantOnKind.ALERTS: InstantOnAlertItem,
     InstantOnKind.HEALTH: InstantOnHealthItem,
     InstantOnKind.CLIENT_USAGE: InstantOnClientUsageItem,
+    InstantOnKind.EVENTS: InstantOnEventItem,
 }
 
 _PATH_SEGMENT: dict[InstantOnKind, str] = {
@@ -92,6 +113,7 @@ _PATH_SEGMENT: dict[InstantOnKind, str] = {
     InstantOnKind.ALERTS: "alerts",
     InstantOnKind.HEALTH: "health",
     InstantOnKind.CLIENT_USAGE: "client-usage",
+    InstantOnKind.EVENTS: "events",
 }
 
 
@@ -159,6 +181,7 @@ for _kind in (
     InstantOnKind.CLIENTS,
     InstantOnKind.SSIDS,
     InstantOnKind.ALERTS,
+    InstantOnKind.EVENTS,
 ):
     instant_on_customer_router.add_api_route(
         f"/locations/{{location_id}}/instant-on/{_PATH_SEGMENT[_kind]}",
@@ -166,6 +189,185 @@ for _kind in (
         methods=["GET"],
         response_model=ApiResponse[InstantOnCustomerView[_ITEM_MODELS[_kind]]],  # type: ignore[index]
         dependencies=[Depends(_CUSTOMER_PERMISSION)],
+    )
+
+
+# ---------------------------------------------------------------------------
+# Customer: the guest network's speed (one cap for every device on it)
+# ---------------------------------------------------------------------------
+
+
+def _venue_speed_payload(result: Any) -> dict[str, Any]:
+    from .instant_on_control import GUEST_SPEED_PRESETS_MBPS
+
+    def net(n: Any) -> dict[str, Any]:
+        return {
+            "network_id": n.network_id,
+            "network_name": n.network_name,
+            "enabled": n.enabled,
+            "download_mbps": n.download_mbps,
+            "upload_mbps": n.upload_mbps,
+            "other_mode_limit": n.other_mode_limit,
+            "network_download_mbps": n.network_download_mbps,
+            "network_upload_mbps": n.network_upload_mbps,
+        }
+
+    return InstantOnVenueGuestSpeedResponse(
+        status=result.status,
+        reason=result.reason,
+        message=result.message,
+        presets_mbps=list(GUEST_SPEED_PRESETS_MBPS),
+        network_total_write_enabled=get_settings().instant_on_network_total_write_enabled,
+        preview=(
+            {
+                "network_id": result.preview.network_id,
+                "download_mbps": result.preview.download_mbps,
+                "upload_mbps": result.preview.upload_mbps,
+                "replaces_per_device": result.preview.replaces_per_device,
+            }
+            if result.preview is not None
+            else None
+        ),
+        networks=[net(n) for n in result.networks],  # type: ignore[misc]
+        applied=net(result.applied) if result.applied is not None else None,  # type: ignore[arg-type]
+    ).model_dump(mode="json")
+
+
+@instant_on_customer_router.get(
+    "/locations/{location_id}/instant-on/guest-speed",
+    response_model=ApiResponse[InstantOnVenueGuestSpeedResponse],
+    dependencies=[Depends(_CUSTOMER_PERMISSION)],
+)
+async def get_location_instant_on_guest_speed(
+    location_id: uuid.UUID,
+    request: Request,
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    caller_location_scope: LocationScope = Depends(CallerLocationScope),
+    db: AsyncSession = Depends(get_db_session),
+) -> dict[str, Any]:
+    """The venue's guest WiFi networks and the speed every device on each
+    is held to, read live from Instant On. ``unavailable`` (nothing sent)
+    unless Instant On cloud control is switched on for the venue's access
+    point. A location outside the caller's organization or location grants
+    reads exactly like one without cloud control."""
+    from .instant_on_control import VenueGuestSpeed, read_venue_guest_speed
+
+    allowed = caller_location_scope is None or location_id in caller_location_scope
+    result = (
+        await read_venue_guest_speed(
+            db, organization_id=requesting_organization_id, location_id=location_id
+        )
+        if allowed
+        else VenueGuestSpeed(status="unavailable", reason="cloud_control_not_enabled")
+    )
+    return build_response(
+        success=True,
+        message="Guest network speed",
+        data=_venue_speed_payload(result),
+        request_id=_request_id(request),
+    )
+
+
+@instant_on_customer_router.put(
+    "/locations/{location_id}/instant-on/guest-speed",
+    response_model=ApiResponse[InstantOnVenueGuestSpeedResponse],
+    dependencies=[Depends(_CUSTOMER_SPEED_UPDATE)],
+)
+async def set_location_instant_on_guest_speed(
+    location_id: uuid.UUID,
+    payload: InstantOnVenueGuestSpeedRequest,
+    request: Request,
+    user: AuthUser = Depends(CurrentUser),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    caller_location_scope: LocationScope = Depends(CallerLocationScope),
+    db: AsyncSession = Depends(get_db_session),
+) -> dict[str, Any]:
+    """Set one speed (10..100 Mbps presets, or no limit) for EVERY device on
+    one of the venue's guest networks, through Instant On's cloud. Written
+    as the whole network object with only the speed fields changed, then
+    read back: ``applied`` only when Instant On reports the new cap. The
+    network's PSK and RADIUS secret travel back to Instant On unchanged and
+    never appear in a log or in this response."""
+    from fastapi import HTTPException, status
+
+    from .instant_on_control import VenueGuestSpeed, set_venue_guest_speed
+
+    allowed = caller_location_scope is None or location_id in caller_location_scope
+    if not allowed:
+        result = VenueGuestSpeed(
+            status="unavailable", reason="cloud_control_not_enabled"
+        )
+    else:
+        try:
+            result = await set_venue_guest_speed(
+                db,
+                organization_id=requesting_organization_id,
+                location_id=location_id,
+                network_id=payload.network_id,
+                download_mbps=payload.download_mbps,
+                upload_mbps=payload.upload_mbps,
+                actor_user_id=uuid.UUID(str(user.id)),
+            )
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)
+            ) from exc
+    return build_response(
+        success=True,
+        message="Guest network speed",
+        data=_venue_speed_payload(result),
+        request_id=_request_id(request),
+    )
+
+
+@instant_on_customer_router.put(
+    "/locations/{location_id}/instant-on/network-total",
+    response_model=ApiResponse[InstantOnVenueGuestSpeedResponse],
+    dependencies=[Depends(_CUSTOMER_SPEED_UPDATE)],
+)
+async def set_location_instant_on_network_total(
+    location_id: uuid.UUID,
+    payload: InstantOnVenueNetworkTotalRequest,
+    request: Request,
+    user: AuthUser = Depends(CurrentUser),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    caller_location_scope: LocationScope = Depends(CallerLocationScope),
+    db: AsyncSession = Depends(get_db_session),
+) -> dict[str, Any]:
+    """One total for one guest WiFi network (per SSID, not per venue). Previews
+    unless ``dry_run`` is false. Replaces a per-device cap: one mode per network.
+    Off unless ``instant_on_network_total_write_enabled`` and cloud control are on.
+    Applied only when Instant On's read-back shows the new total."""
+    from fastapi import HTTPException, status
+
+    from .instant_on_control import VenueGuestSpeed, set_venue_network_total
+
+    allowed = caller_location_scope is None or location_id in caller_location_scope
+    if not allowed:
+        result = VenueGuestSpeed(
+            status="unavailable", reason="cloud_control_not_enabled"
+        )
+    else:
+        try:
+            result = await set_venue_network_total(
+                db,
+                organization_id=requesting_organization_id,
+                location_id=location_id,
+                network_id=payload.network_id,
+                download_mbps=payload.download_mbps,
+                upload_mbps=payload.upload_mbps,
+                dry_run=payload.dry_run,
+                actor_user_id=uuid.UUID(str(user.id)),
+            )
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)
+            ) from exc
+    return build_response(
+        success=True,
+        message="Guest network total",
+        data=_venue_speed_payload(result),
+        request_id=_request_id(request),
     )
 
 
@@ -311,6 +513,201 @@ async def list_instant_on_account_sites(request: Request) -> dict[str, Any]:
     return build_response(
         success=True,
         message="Instant On account sites",
+        data=body.model_dump(mode="json"),
+        request_id=_request_id(request),
+    )
+
+
+@instant_on_platform_router.put(
+    "/routers/{router_id}/guest-rate-limit",
+    response_model=ApiResponse[InstantOnGuestRateLimitResponse],
+    dependencies=[Depends(_PLATFORM_UPDATE)],
+)
+async def set_instant_on_guest_rate_limit(
+    router_id: uuid.UUID,
+    payload: InstantOnGuestRateLimitRequest,
+    request: Request,
+    user: AuthUser = Depends(CurrentUser),
+    db: AsyncSession = Depends(get_db_session),
+) -> dict[str, Any]:
+    """Master: preview or apply the guest SSID's per-client speed cap on
+    Instant On. This is the only speed control Instant On has -- one cap for
+    every guest on the SSID (no per-guest rate exists on any path we can
+    reach; see INSTANT_ON_CLOUD_CONTROL.md). Applying writes to Instant On
+    and is read back; a cap Instant On did not keep is ``failed``."""
+    import httpx
+
+    from .instant_on_control import build_live_control_client, resolve_control_target
+    from .instant_on_repository import InstantOnRepository
+    from .providers.aruba_instant_on_client import InstantOnError
+
+    settings = get_settings()
+    site = await InstantOnRepository(db).get_site_for_router(router_id)
+    target = (
+        await resolve_control_target(
+            db,
+            organization_id=site.organization_id,
+            router_id=router_id,
+            settings=settings,
+        )
+        if site is not None
+        else None
+    )
+    requested = InstantOnGuestRateLimitState(
+        network_id=payload.network_id,
+        enabled=payload.download_mbps is not None or payload.upload_mbps is not None,
+        download_mbps=payload.download_mbps,
+        upload_mbps=payload.upload_mbps,
+    )
+
+    def _state(limit: Any) -> InstantOnGuestRateLimitState:
+        return InstantOnGuestRateLimitState(
+            network_id=limit.network_id,
+            network_name=limit.network_name,
+            enabled=limit.enabled,
+            download_mbps=limit.download_mbps,
+            upload_mbps=limit.upload_mbps,
+        )
+
+    if target is None:
+        body = InstantOnGuestRateLimitResponse(
+            status="unavailable",
+            reason="cloud_control_not_enabled",
+            message=(
+                "Instant On cloud control is not switched on for this device "
+                "(global flag, router allowlist, write account, site mapping)."
+            ),
+            requested=requested,
+        )
+    else:
+        async with httpx.AsyncClient(
+            timeout=settings.instant_on_http_timeout_seconds
+        ) as http:
+            client = build_live_control_client(
+                http, settings, secret_arn=target.secret_arn
+            )
+            try:
+                before = await client.get_guest_network_rate_limit(
+                    target.site_id, payload.network_id
+                )
+                if before.other_mode_limit:
+                    # Also on a preview: it must not promise a write that the
+                    # provider refuses.
+                    body = InstantOnGuestRateLimitResponse(
+                        status="failed",
+                        reason="network_wide_limit_set",
+                        message=(
+                            "This network has a network-wide limit set in the "
+                            "Instant On app. Change it there."
+                        ),
+                        before=_state(before),
+                        requested=requested,
+                    )
+                elif payload.dry_run:
+                    body = InstantOnGuestRateLimitResponse(
+                        status="preview", before=_state(before), requested=requested
+                    )
+                else:
+                    after = await client.set_guest_network_rate_limit(
+                        target.site_id,
+                        payload.network_id,
+                        download_mbps=payload.download_mbps,
+                        upload_mbps=payload.upload_mbps,
+                    )
+                    logger.info(
+                        "instant_on_guest_rate_limit_applied",
+                        extra={
+                            "router_id": str(router_id),
+                            "actor_user_id": str(user.id),
+                        },
+                    )
+                    body = InstantOnGuestRateLimitResponse(
+                        status="applied",
+                        before=_state(before),
+                        requested=requested,
+                        after=_state(after),
+                    )
+            except InstantOnError as error:
+                body = InstantOnGuestRateLimitResponse(
+                    status="failed",
+                    reason=error.code,
+                    message=str(error),
+                    requested=requested,
+                )
+    return build_response(
+        success=True,
+        message="Instant On guest speed limit",
+        data=body.model_dump(mode="json"),
+        request_id=_request_id(request),
+    )
+
+
+@instant_on_platform_router.get(
+    "/routers/{router_id}/guest-networks",
+    response_model=ApiResponse[InstantOnGuestNetworksResponse],
+    dependencies=[Depends(_PLATFORM_READ)],
+)
+async def list_instant_on_guest_networks(
+    router_id: uuid.UUID,
+    request: Request,
+    db: AsyncSession = Depends(get_db_session),
+) -> dict[str, Any]:
+    """Master: the venue's guest SSIDs with their current per-client caps,
+    read live through the write account (cloud control must be enabled for
+    this router). Read-only; feeds the speed-tiers-by-SSID screen."""
+    import httpx
+
+    from .instant_on_control import build_live_control_client, resolve_control_target
+    from .instant_on_repository import InstantOnRepository
+    from .providers.aruba_instant_on_client import InstantOnError
+
+    settings = get_settings()
+    site = await InstantOnRepository(db).get_site_for_router(router_id)
+    target = (
+        await resolve_control_target(
+            db,
+            organization_id=site.organization_id,
+            router_id=router_id,
+            settings=settings,
+        )
+        if site is not None
+        else None
+    )
+    if target is None:
+        body = InstantOnGuestNetworksResponse(
+            status="unavailable", reason="cloud_control_not_enabled"
+        )
+    else:
+        async with httpx.AsyncClient(
+            timeout=settings.instant_on_http_timeout_seconds
+        ) as http:
+            client = build_live_control_client(
+                http, settings, secret_arn=target.secret_arn
+            )
+            try:
+                limits = await client.list_guest_network_rate_limits(target.site_id)
+            except InstantOnError as error:
+                body = InstantOnGuestNetworksResponse(
+                    status="failed", reason=error.code, message=str(error)
+                )
+            else:
+                body = InstantOnGuestNetworksResponse(
+                    status="ok",
+                    networks=[
+                        InstantOnGuestRateLimitState(
+                            network_id=n.network_id,
+                            network_name=n.network_name,
+                            enabled=n.enabled,
+                            download_mbps=n.download_mbps,
+                            upload_mbps=n.upload_mbps,
+                            is_guest=n.is_guest,
+                        )
+                        for n in limits
+                    ],
+                )
+    return build_response(
+        success=True,
+        message="Instant On guest networks",
         data=body.model_dump(mode="json"),
         request_id=_request_id(request),
     )

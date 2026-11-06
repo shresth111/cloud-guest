@@ -30,6 +30,25 @@ _PHONE_RE = re.compile(r"^\+?[1-9]\d{7,14}$")
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 
+def normalize_otp_identifier(identifier: str) -> str:
+    """Strips whitespace and lower-cases an email address (anything
+    containing ``@``); phone numbers are only stripped.
+
+    Applied by ``OtpService.request_otp`` *and* ``verify_otp`` so the
+    ``otp_requests`` row, the per-identifier Redis rate-limit key and the
+    verify lookup all use one spelling: a code requested as
+    ``Guest@Gmail.com`` verifies as ``guest@gmail.com``, and case variants
+    of one inbox share one rate-limit window instead of each getting their
+    own. Kept identical to ``app.domains.guest.validators
+    .normalize_identifier`` (the guest identity key the login step stores)
+    without importing it -- the guest domain depends on this one, not the
+    reverse."""
+    stripped = identifier.strip()
+    if "@" in stripped:
+        return stripped.lower()
+    return stripped
+
+
 def validate_identifier(identifier: str, channel: OtpChannel) -> None:
     """Raises ``InvalidOtpIdentifierError`` if ``identifier`` is not a
     plausible phone number (``SMS``/``WHATSAPP``) or email address
@@ -45,4 +64,4 @@ def validate_identifier(identifier: str, channel: OtpChannel) -> None:
             raise InvalidOtpIdentifierError(channel.value, identifier)
 
 
-__all__ = ["validate_identifier"]
+__all__ = ["normalize_otp_identifier", "validate_identifier"]

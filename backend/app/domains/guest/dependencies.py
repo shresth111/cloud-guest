@@ -22,10 +22,15 @@ from fastapi import Depends, Request
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import get_settings
 from app.database.redis import get_redis_client
 from app.database.session import get_db_session
 from app.domains.captive_portal.dependencies import get_captive_portal_service
 from app.domains.captive_portal.service import CaptivePortalService
+from app.domains.device_logs.server_events import (
+    PortalLoginEventRecorder,
+    RadiusEventRecorder,
+)
 from app.domains.guest_access.dependencies import get_guest_access_service
 from app.domains.guest_access.enforcement import LiveSessionTerminator
 from app.domains.guest_access.service import GuestAccessService
@@ -64,6 +69,7 @@ from .repository import (
     RadiusNasCodeCounterRepository,
 )
 from .service import GuestAnalyticsService, GuestService, RadiusService
+from .ssid_tier_service import SsidTierRepository, SsidTierService
 
 
 def get_guest_repository(
@@ -194,7 +200,11 @@ def get_guest_service(
     ``GuestRepository`` already injected here rather than through another
     ``Depends`` -- both are exactly what it needs, and ``GuestRepository``
     already satisfies ``DeviceLookupProtocol``."""
-    from .tasks import enqueue_guest_queue_assignment
+    from .tasks import (
+        enqueue_guest_queue_assignment,
+        enqueue_hotspot_gate_open,
+        enqueue_nas_only_usage_cut,
+    )
 
     return GuestService(
         repository,
@@ -207,6 +217,11 @@ def get_guest_service(
         access_control_hook=guest_access_service,
         queue_assignment_hook=queue_management_service,
         queue_assignment_dispatcher=enqueue_guest_queue_assignment,
+        # Opens the router's hotspot gate a few seconds after sign-in,
+        # from the worker, instead of leaving the guest without internet
+        # until the router's own one-minute poll -- see ``hotspot_gate``.
+        hotspot_gate_dispatcher=enqueue_hotspot_gate_open,
+        nas_only_usage_cut_dispatcher=enqueue_nas_only_usage_cut,
         session_end_hook=LiveSessionTerminator(
             router_lookup=router_service,
             device_lookup=repository,
@@ -223,6 +238,8 @@ def get_guest_service(
         team_quota_hook=team_quota_resolver,
         redis=redis,
         caller_location_scope=caller_location_scope,
+        # NetLogs: portal sign-in failures, on a session of their own.
+        login_event_recorder=PortalLoginEventRecorder(get_settings()),
     )
 
 
@@ -230,6 +247,18 @@ def get_nas_code_counter_repository(
     db: AsyncSession = Depends(get_db_session),
 ) -> NasCodeCounterRepositoryProtocol:
     return RadiusNasCodeCounterRepository(db)
+
+
+def get_ssid_tier_repository(
+    session: AsyncSession = Depends(get_db_session),
+) -> SsidTierRepository:
+    return SsidTierRepository(session)
+
+
+def get_ssid_tier_service(
+    repository: SsidTierRepository = Depends(get_ssid_tier_repository),
+) -> SsidTierService:
+    return SsidTierService(repository)
 
 
 def get_radius_service(
@@ -245,6 +274,8 @@ def get_radius_service(
         get_queue_management_service
     ),
     caller_location_scope: LocationScope = Depends(OptionalCallerLocationScope),
+    db: AsyncSession = Depends(get_db_session),
+    ssid_tier_repository: SsidTierRepository = Depends(get_ssid_tier_repository),
 ) -> RadiusService:
     """Queue Management Engine addition: wires ``QueueManagementService`` in
     as ``RadiusService``'s optional ``queue_lookup`` hook -- the one
@@ -261,6 +292,13 @@ def get_radius_service(
         audit_writer=audit_repository,
         queue_lookup=queue_management_service,
         caller_location_scope=caller_location_scope,
+        # NetLogs: one row per Authorize verdict, in this request's own
+        # transaction (SAVEPOINT; never fails the verdict).
+        radius_event_recorder=RadiusEventRecorder(db, get_settings()),
+        bandwidth_attribute_router_ids=(
+            get_settings().radius_bandwidth_attribute_router_id_set
+        ),
+        ssid_tier_lookup=ssid_tier_repository,
     )
 
 

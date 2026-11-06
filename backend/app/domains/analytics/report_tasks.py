@@ -72,7 +72,10 @@ from app.database.redis import create_redis_client
 from app.database.session import SessionLocal
 from app.domains.guest.repository import GuestRepository
 from app.domains.guest.service import GuestAnalyticsService
-from app.domains.location.repository import LocationRepository
+from app.domains.location.repository import (
+    LocationCodeCounterRepository,
+    LocationRepository,
+)
 from app.domains.location.service import LocationService
 from app.domains.notification.constants import (
     NotificationChannelType,
@@ -316,6 +319,7 @@ async def _run_scheduled_reports_async(
             location_service = LocationService(
                 LocationRepository(session),
                 organization_service,
+                location_code_counter=LocationCodeCounterRepository(session),
                 audit_writer=rbac_repository,
             )
             role_resolver = RoleResolver(rbac_repository)

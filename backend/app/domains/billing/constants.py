@@ -151,6 +151,24 @@ class PlanFeatureKey(StrEnum):
     # (see FEATURE_REQUIRES below).
     GUEST_MARKETING_BYO = "guest_marketing_byo"
 
+    # -- Traffic flow, customer side (the venue page shown as "Traffic
+    # Lens", ``app.domains.traffic_flow`` customer routes). BOOLEAN, off by
+    # default and carried by no seeded plan, so every organization starts
+    # locked and is unlocked per organization from the Master console, the
+    # same way as GUEST_MARKETING. It gates what a CUSTOMER may read; the
+    # Master console's own traffic-flow screens do not depend on it, and it
+    # does not switch collection on for any router.
+    TRAFFIC_FLOW = "traffic_flow"
+    # -- Traffic flow records, customer side: the per-flow table (source and
+    # destination address and port, NAT, bytes) for the customer's own venue.
+    # A SECOND add-on on top of TRAFFIC_FLOW (see FEATURE_REQUIRES), because
+    # a row puts a device beside the address it reached and the aggregates
+    # do not. BOOLEAN, off by default, carried by no seeded plan, unlocked
+    # per organization from the Master console and never implied by
+    # TRAFFIC_FLOW. It does not switch record storage on: that is the
+    # platform's CLOUDGUEST_TRAFFIC_FLOW_RECORDS_ENABLED.
+    TRAFFIC_FLOW_RECORDS = "traffic_flow_records"
+
 
 class PlanFeatureType(StrEnum):
     """The value-shape a :class:`~.models.PlanFeature` row carries -- see
@@ -223,6 +241,8 @@ BOOLEAN_FEATURE_KEYS: frozenset[PlanFeatureKey] = frozenset(
         PlanFeatureKey.ISP_FAILOVER,
         PlanFeatureKey.GUEST_MARKETING,
         PlanFeatureKey.GUEST_MARKETING_BYO,
+        PlanFeatureKey.TRAFFIC_FLOW,
+        PlanFeatureKey.TRAFFIC_FLOW_RECORDS,
     }
 )
 
@@ -232,7 +252,12 @@ BOOLEAN_FEATURE_KEYS: frozenset[PlanFeatureKey] = frozenset(
 # an override silently diverging from a customer's plan is a billing act,
 # and each add-on that can be sold separately is a product decision.
 ADDON_FEATURE_KEYS: frozenset[PlanFeatureKey] = frozenset(
-    {PlanFeatureKey.GUEST_MARKETING, PlanFeatureKey.GUEST_MARKETING_BYO}
+    {
+        PlanFeatureKey.GUEST_MARKETING,
+        PlanFeatureKey.GUEST_MARKETING_BYO,
+        PlanFeatureKey.TRAFFIC_FLOW,
+        PlanFeatureKey.TRAFFIC_FLOW_RECORDS,
+    }
 )
 
 # An add-on that only means anything on top of another one. The entitlement
@@ -241,6 +266,8 @@ ADDON_FEATURE_KEYS: frozenset[PlanFeatureKey] = frozenset(
 # is off while Guest Marketing itself is locked.
 FEATURE_REQUIRES: dict[PlanFeatureKey, PlanFeatureKey] = {
     PlanFeatureKey.GUEST_MARKETING_BYO: PlanFeatureKey.GUEST_MARKETING,
+    # Flow records are a view inside the Traffic Lens page.
+    PlanFeatureKey.TRAFFIC_FLOW_RECORDS: PlanFeatureKey.TRAFFIC_FLOW,
 }
 TIER_FEATURE_KEYS: frozenset[PlanFeatureKey] = frozenset({PlanFeatureKey.SUPPORT_LEVEL})
 

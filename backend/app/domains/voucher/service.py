@@ -372,6 +372,7 @@ class VoucherService:
         has_manage_permission: bool,
         plan_id: uuid.UUID | None = None,
         series_id: uuid.UUID | None = None,
+        session_timeout_minutes: int | None = None,
     ) -> VoucherBatch:
         validate_quantity(quantity)
         validate_code_length(code_length)
@@ -408,6 +409,7 @@ class VoucherService:
             code_length=code_length,
             code_prefix=code_prefix,
             validity_minutes=validity_minutes,
+            session_timeout_minutes=session_timeout_minutes,
             batch_expires_at=batch_expires_at,
             max_uses_per_voucher=max_uses_per_voucher,
             data_limit_mb=data_limit_mb,
@@ -689,6 +691,14 @@ class VoucherService:
         ):
             raise CrossOrganizationVoucherPlanAccessError()
         return plan
+
+    async def get_voucher_by_id(self, voucher_id: uuid.UUID) -> Voucher | None:
+        """The redeemed voucher behind a guest session, by the id the session
+        copied at login (``GuestSession.voucher_id``). Read by
+        ``GuestService.nas_only_authorize_standing``: at a NAS-only venue the
+        RADIUS reply is the only way a voucher's own ``expires_at`` (or a
+        batch revocation) can reach a guest who is already online."""
+        return await self.repository.get_voucher_by_id(voucher_id)
 
     async def get_plan_queue_profile_id(self, plan_id: uuid.UUID) -> uuid.UUID | None:
         """The single, narrow read ``app.domains.guest.service.GuestService

@@ -397,6 +397,29 @@ class PortalSetupOutcome(StrEnum):
 
 
 @dataclass(frozen=True, slots=True)
+class RadiusPortalSpec:
+    """The RADIUS half of a portal set up on the RADIUS contract.
+
+    When a :class:`PortalSetupSpec` carries one, the portal is written as
+    *External RADIUS Server* (the controller authenticates the guest against
+    ``server_ip``) with an *External Web Portal* at ``portal_url`` -- instead
+    of as an External Portal Server. ``profile_name`` names the controller
+    RADIUS profile this caller owns; it is created when absent and corrected
+    when its server or secret drifted. ``shared_secret`` is the NAS secret
+    the hub already holds for this controller, excluded from ``repr`` and
+    never put in a report.
+    """
+
+    server_ip: str
+    server_port: int
+    profile_name: str
+    nas_id: str
+    portal_url_scheme: str
+    portal_url: str
+    shared_secret: str = field(repr=False)
+
+
+@dataclass(frozen=True, slots=True)
 class PortalSetupSpec:
     """The desired external-portal state for ONE integration on ONE site.
 
@@ -433,6 +456,8 @@ class PortalSetupSpec:
     new_operator_password: str | None = field(default=None, repr=False)
     take_over_ssid_portal: bool = False
     dry_run: bool = True
+    #: Set on the RADIUS contract; see :class:`RadiusPortalSpec`.
+    radius: RadiusPortalSpec | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -648,5 +673,6 @@ __all__ = [
     "PortalSetupOutcome",
     "PortalSetupReport",
     "PortalSetupSpec",
+    "RadiusPortalSpec",
     "PortalSetupStep",
 ]

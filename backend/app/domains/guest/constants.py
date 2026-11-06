@@ -227,6 +227,32 @@ BYTES_PER_MB = 1024 * 1024
 SET_PASSWORD_SESSION_WINDOW_MINUTES = 15
 
 # ============================================================================
+# Name required at sign-in (captive_portal_configs.require_guest_name)
+# ============================================================================
+
+#: Matches ``Guest.display_name``'s own ``String(200)`` column and the
+#: post-connect profile request's ``max_length``. Applied AFTER trimming
+#: and whitespace collapsing.
+GUEST_DISPLAY_NAME_MAX_LENGTH = 200
+
+#: The OTP methods the requirement applies to. Voucher, password, PIN and
+#: MAC-whitelist sessions are deliberately out of scope (owner decision):
+#: their sign-in is unchanged, and their sessions are never held for a
+#: name.
+NAME_REQUIRED_AUTH_METHODS = frozenset(
+    {
+        GuestAuthMethod.OTP_SMS.value,
+        GuestAuthMethod.OTP_EMAIL.value,
+        GuestAuthMethod.OTP_WHATSAPP.value,
+    }
+)
+
+#: Stable error codes, carried in the error body's ``data.code``. The
+#: portal keys its copy on these, never on the message text.
+GUEST_NAME_REQUIRED_CODE = "guest_name_required"
+GUEST_NAME_INVALID_CODE = "guest_name_invalid"
+
+# ============================================================================
 # Portal PIN -- device-scoped quick-login (Phase 1 BhaiFi-parity follow-on).
 # ============================================================================
 
@@ -514,6 +540,23 @@ SESSION_PRESENCE_DISCONNECT_REASON = "device_left_network"
 SESSION_PRESENCE_SWEEP_LOCK_REDIS_KEY = "cloudguest:guest:session-presence-sweep:lock"
 SESSION_PRESENCE_SWEEP_LOCK_TTL_SECONDS = 240
 
+# When the presence sweep last read a router's host table *successfully*,
+# as a Unix timestamp. Written by ``tasks.reconcile_router_session_presence``
+# after every good read and read back by the timeout sweep, which is the
+# only way that sweep can tell "this guest's device has been silent" from
+# "nobody has been able to look" -- see
+# ``validators.idle_verdict_is_evidenced``.
+#
+# The value carries the judgement, not the key's existence: the timeout
+# sweep compares it against the moment the session crossed its own idle
+# cutoff, so a TTL is only garbage collection. A day is far longer than any
+# idle cutoff plus grace a venue can configure, and short enough that a
+# decommissioned router's key does not sit in Redis indefinitely.
+SESSION_PRESENCE_READ_AT_REDIS_KEY = (
+    "cloudguest:guest:session-presence:read-at:{router_id}"
+)
+SESSION_PRESENCE_READ_AT_TTL_SECONDS = 24 * 60 * 60
+
 # ============================================================================
 # Fair Usage Policy (FUP) quota tracking -- Phase 1 BhaiFi-parity.
 # See ``models.GuestQuotaUsage``'s own docstring and ``service.py``'s "FUP
@@ -642,6 +685,104 @@ TASK_ASSIGN_GUEST_QUEUE = "app.domains.guest.tasks.assign_guest_queue"
 # outage pile retries onto it.
 ASSIGN_GUEST_QUEUE_MAX_RETRIES = 3
 ASSIGN_GUEST_QUEUE_RETRY_BACKOFF_SECONDS = 30
+
+# ============================================================================
+# Opening the hotspot gate at sign-in -- see ``hotspot_gate``'s module
+# docstring for the measurement and the design.
+# ============================================================================
+#: Takes a NAS-only guest over their data cap off the venue through Instant On
+#: cloud control, from the worker. Not from the accounting request: rlm_rest
+#: gives that request far less time than an Instant On call can take.
+TASK_ENFORCE_NAS_ONLY_USAGE_CUT = "app.domains.guest.tasks.enforce_nas_only_usage_cut"
+TASK_OPEN_HOTSPOT_GATE = "app.domains.guest.tasks.open_hotspot_gate"
+
+# Few and close together. A retry exists for two things only: the sign-in
+# request's own commit not having landed when the worker looked (the session
+# is not yet among the router's ACTIVE sessions), and a router that did not
+# answer once. Past ~15 seconds there is nothing left to win -- the router's
+# own one-minute poll opens the gate regardless, exactly as it does today.
+OPEN_HOTSPOT_GATE_MAX_RETRIES = 2
+OPEN_HOTSPOT_GATE_RETRY_BACKOFF_SECONDS = 4
+
+# One RouterOS API connection, bounded well under the retry spacing. The
+# login is not waiting on this (it runs in the worker), but a worker slot
+# is, and an unreachable router should give it back quickly.
+HOTSPOT_GATE_DEVICE_TIMEOUT_SECONDS = 5
+
+# The instant before which a session's binding must not be written: every
+# request that (re-)enqueues the push for a session moves it to "now + the
+# configured delay". The delay exists so the guest's browser can log in to
+# the hotspot first, and a countdown alone only keeps that promise for the
+# request that started it -- a task enqueued at sign-in ran a fraction of a
+# second after a guest submitted the name the venue requires, found the
+# session admitted, and wrote the binding under the browser's own login
+# POST (measured: sign-in at T, name at T+3.6 s, binding at T+4.2 s; the
+# POST then reached a bypassed host and was answered "501"). The value is
+# epoch seconds; the key lives one second longer than the delay it records,
+# so one that is still there always means "not yet".
+HOTSPOT_GATE_NOT_BEFORE_KEY = "guest:hotspot-gate-not-before:{session_id}"
+
+# The same push for a device an admin has just marked Trusted -- see
+# ``hotspot_gate.open_hotspot_gate_for_trusted_entry``. Without it the
+# device waits for the router's next one-minute poll like a guest did, and
+# is shown the login page in the meantime.
+TASK_OPEN_HOTSPOT_GATE_FOR_TRUSTED_DEVICE = (
+    "app.domains.guest.tasks.open_hotspot_gate_for_trusted_device"
+)
+
+# Only long enough for the request that created or changed the entry to
+# commit. There is no browser login to wait for here: nobody has signed in.
+# An entry the worker cannot see yet is retried on the sign-in push's own
+# spacing (``OPEN_HOTSPOT_GATE_RETRY_BACKOFF_SECONDS``).
+TRUSTED_DEVICE_HOTSPOT_GATE_DELAY_SECONDS = 1.0
+
+# A device can be marked Trusted while it is signed in. The push above then
+# writes nothing -- the gateway will not put a bypass on a MAC with a live
+# hotspot session -- and when that session ends the device would wait for
+# the router's next one-minute poll. This task is asked for at session end
+# and adds the binding once the live session is gone.
+TASK_OPEN_HOTSPOT_GATE_FOR_ENDED_SESSION_DEVICE = (
+    "app.domains.guest.tasks.open_hotspot_gate_for_ended_session_device"
+)
+
+# Long enough for the request that ended the session to commit and for the
+# router to have dropped the live hotspot session it was asked to end.
+ENDED_SESSION_TRUSTED_GATE_DELAY_SECONDS = 4.0
+
+# ----------------------------------------------------------------------------
+# Taking a session bypass back off the router -- see
+# ``hotspot_binding_reconcile``'s module docstring.
+# ----------------------------------------------------------------------------
+TASK_RECONCILE_HOTSPOT_BINDINGS = "app.domains.guest.tasks.reconcile_hotspot_bindings"
+TASK_RECONCILE_HOTSPOT_BINDINGS_FOR_SCOPE = (
+    "app.domains.guest.tasks.reconcile_hotspot_bindings_for_scope"
+)
+TASK_RUN_HOTSPOT_BINDING_RECONCILE_SWEEP = (
+    "app.domains.guest.tasks.run_hotspot_binding_reconcile_sweep"
+)
+
+# Every 2 minutes, the cadence of the ended-session queue release it sits
+# beside. The event-driven runs are what make a disconnect prompt; this is
+# the net under them -- a path that ends a session without asking, an event
+# whose task was lost, a Trusted Device entry that simply expired -- and it
+# is what clears the rows the old router script has already left behind.
+# One RouterOS API connection per switched-on router per run, and nothing at
+# all while the feature is off.
+HOTSPOT_BINDING_RECONCILE_SWEEP_INTERVAL_SECONDS = 120.0
+
+# A binding is removed only if its MAC is unlisted at two reads this far
+# apart (and the second is taken immediately before the removal). It is the
+# window in which a guest who is signing in again -- an ended session, then
+# a new one a moment later -- becomes listed and is kept. Short on purpose:
+# it is slept per router that has something to remove, inside a sequential
+# sweep.
+HOTSPOT_BINDING_RECONCILE_GRACE_SECONDS = 3.0
+
+# How long one event-driven request stands for every other request about
+# the same router, on top of the configured delay. A sweep that expires
+# thirty sessions at one venue should cost that venue's router one
+# connection, not thirty.
+HOTSPOT_BINDING_RECONCILE_DEDUPE_KEY = "guest:hotspot-binding-reconcile:{router_id}"
 
 # ============================================================================
 # FreeRADIUS ``rlm_rest``-style integration -- see ``service.py``'s module
@@ -792,7 +933,38 @@ NAS_SHARED_SECRET_DEFAULT_LENGTH_BYTES = 32
 WHITELIST_ONLY_LOGIN_FAILURE_REASON = "WhitelistOnlyAccessDeniedError"
 
 
+class InternetConfirmationSource(StrEnum):
+    """What set ``GuestSession.internet_confirmed_at`` -- each one a reading
+    taken from the NAS or controller, never this platform's own request.
+    See that column's docstring."""
+
+    #: RADIUS Accounting-Start: the NAS opened an accounting session for
+    #: the guest, which it does only once it has let the device through.
+    RADIUS_ACCOUNTING_START = "radius_accounting_start"
+    #: RADIUS Interim-Update: the same, for a session whose Start was
+    #: missed (lost packet, deploy window, hub restart).
+    RADIUS_ACCOUNTING_INTERIM = "radius_accounting_interim"
+    #: Gate push read ``/ip hotspot active``: the MAC is a logged-in hotspot
+    #: session on the MikroTik right now.
+    MIKROTIK_HOTSPOT_ACTIVE = "mikrotik_hotspot_active"
+    #: Gate push added the binding, read it back, and the MikroTik's
+    #: ``/ip hotspot host`` row for the MAC reads ``bypassed=true``.
+    MIKROTIK_HOST_BYPASSED = "mikrotik_host_bypassed"
+    #: Gate push found the router already holding a ``type=bypassed``
+    #: binding for the MAC (its own authorized-MAC poll got there first)
+    #: and no ``blocked`` one.
+    MIKROTIK_BINDING_BYPASSED = "mikrotik_binding_bypassed"
+    #: Omada Open-API client read (the usage sweep's) reports the device
+    #: ``authStatus`` authorized.
+    OMADA_CLIENT_AUTHORIZED = "omada_client_authorized"
+
+
 __all__ = [
+    "InternetConfirmationSource",
+    "GUEST_DISPLAY_NAME_MAX_LENGTH",
+    "GUEST_NAME_INVALID_CODE",
+    "GUEST_NAME_REQUIRED_CODE",
+    "NAME_REQUIRED_AUTH_METHODS",
     "WHITELIST_ONLY_LOGIN_FAILURE_REASON",
     "GuestAuthMethod",
     "GuestSessionStatus",
@@ -815,6 +987,8 @@ __all__ = [
     "SESSION_PRESENCE_DISCONNECT_REASON",
     "SESSION_PRESENCE_SWEEP_LOCK_REDIS_KEY",
     "SESSION_PRESENCE_SWEEP_LOCK_TTL_SECONDS",
+    "SESSION_PRESENCE_READ_AT_REDIS_KEY",
+    "SESSION_PRESENCE_READ_AT_TTL_SECONDS",
     "TASK_RUN_FUP_TIME_ACCRUAL_SWEEP",
     "FUP_TIME_ACCRUAL_SWEEP_INTERVAL_SECONDS",
     "TASK_RUN_QUOTA_RESET_SWEEP",
@@ -823,6 +997,17 @@ __all__ = [
     "TASK_RUN_OPEN_HOURS_ENFORCEMENT_SWEEP",
     "OPEN_HOURS_ENFORCEMENT_SWEEP_INTERVAL_SECONDS",
     "TASK_ASSIGN_GUEST_QUEUE",
+    "TASK_ENFORCE_NAS_ONLY_USAGE_CUT",
+    "TASK_OPEN_HOTSPOT_GATE",
+    "OPEN_HOTSPOT_GATE_MAX_RETRIES",
+    "OPEN_HOTSPOT_GATE_RETRY_BACKOFF_SECONDS",
+    "HOTSPOT_GATE_DEVICE_TIMEOUT_SECONDS",
+    "TASK_RECONCILE_HOTSPOT_BINDINGS",
+    "TASK_RECONCILE_HOTSPOT_BINDINGS_FOR_SCOPE",
+    "TASK_RUN_HOTSPOT_BINDING_RECONCILE_SWEEP",
+    "HOTSPOT_BINDING_RECONCILE_SWEEP_INTERVAL_SECONDS",
+    "HOTSPOT_BINDING_RECONCILE_GRACE_SECONDS",
+    "HOTSPOT_BINDING_RECONCILE_DEDUPE_KEY",
     "ASSIGN_GUEST_QUEUE_MAX_RETRIES",
     "ASSIGN_GUEST_QUEUE_RETRY_BACKOFF_SECONDS",
     "QUOTA_RESET_SWEEP_INTERVAL_SECONDS",

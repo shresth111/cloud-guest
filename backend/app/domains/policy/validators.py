@@ -43,7 +43,17 @@ def validate_rules(policy_type: PolicyType, rules: dict[str, Any]) -> dict[str, 
     try:
         validated = schema.model_validate(rules)
     except ValidationError as exc:
-        raise PolicyRulesValidationError(policy_type.value, str(exc)) from exc
+        raise PolicyRulesValidationError(
+            policy_type.value,
+            str(exc),
+            field_errors=[
+                {
+                    "field": ".".join(str(part) for part in error["loc"]),
+                    "message": str(error["msg"]).removeprefix("Value error, "),
+                }
+                for error in exc.errors()
+            ],
+        ) from exc
     return validated.model_dump()
 
 
@@ -88,7 +98,12 @@ def validate_assignment_target(*, target_type: str, target_id: object | None) ->
         resolved_target_type = PolicyAssignmentTargetType(target_type)
     except ValueError as exc:
         raise InvalidPolicyAssignmentTargetTypeError(target_type) from exc
-    if resolved_target_type == PolicyAssignmentTargetType.NONE:
+    if resolved_target_type in (
+        PolicyAssignmentTargetType.NONE,
+        # A tier-to-location mapping names no one: its members are the
+        # ``GUEST`` assignments beside it.
+        PolicyAssignmentTargetType.MEMBERS,
+    ):
         if target_id is not None:
             raise PolicyAssignmentTargetIdNotAllowedError()
     elif target_id is None:

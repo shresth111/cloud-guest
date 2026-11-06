@@ -43,6 +43,7 @@ from .contract import (
     RogueDhcpAlertStatus,
     SpeedTestResult,
     TracerouteResult,
+    VenueQueueSyncResult,
     VlanConfig,
     VlanHotspotConfig,
     WanHealth,
@@ -177,7 +178,26 @@ class _StubAdapter:
         burst_threshold_kbps: int | None = None,
         burst_time_seconds: int | None = None,
         priority: int = 8,
+        parent: str | None = None,
     ) -> str:
+        raise self._not_implemented()
+
+    async def sync_venue_simple_queue(
+        self,
+        creds: DeviceCredentials,
+        *,
+        name: str,
+        download_rate_kbps: int | None,
+        upload_rate_kbps: int | None,
+        child_queue_ids: Sequence[str] = (),
+        targets: Sequence[str] | None = None,
+        comment: str | None = None,
+    ) -> VenueQueueSyncResult:
+        raise self._not_implemented()
+
+    async def clear_venue_simple_queue(
+        self, creds: DeviceCredentials, *, name: str
+    ) -> VenueQueueSyncResult:
         raise self._not_implemented()
 
     async def update_simple_queue(
@@ -192,6 +212,19 @@ class _StubAdapter:
         burst_threshold_kbps: int | None = None,
         burst_time_seconds: int | None = None,
         priority: int = 8,
+    ) -> None:
+        raise self._not_implemented()
+
+    async def find_client_address(
+        self, creds: DeviceCredentials, *, mac_address: str
+    ) -> str | None:
+        raise self._not_implemented()
+
+    async def list_client_addresses(self, creds: DeviceCredentials) -> dict[str, str]:
+        raise self._not_implemented()
+
+    async def set_simple_queue_target(
+        self, creds: DeviceCredentials, *, device_queue_id: str, target: str
     ) -> None:
         raise self._not_implemented()
 
@@ -362,6 +395,11 @@ class _StubAdapter:
     ) -> None:
         raise self._not_implemented()
 
+    async def ensure_host_route(
+        self, creds: DeviceCredentials, *, dst_address: str, gateway: str, comment: str
+    ) -> None:
+        raise self._not_implemented()
+
     async def ensure_wan_egress(self, creds: DeviceCredentials, *, interface: str) -> None:
         raise self._not_implemented()
 
@@ -398,6 +436,9 @@ class _StubAdapter:
             "push_hotspot_certificate": False,
             "create_simple_queue": False,
             "update_simple_queue": False,
+            "find_client_address": False,
+            "list_client_addresses": False,
+            "set_simple_queue_target": False,
             "delete_simple_queue": False,
             "create_queue_tree": False,
             "apply_pcq": False,
@@ -429,6 +470,7 @@ class _StubAdapter:
             "delete_qos_packet_mark": False,
             "delete_content_filter_rule": False,
             "ensure_wan_egress": False,
+            "ensure_host_route": False,
             "read_default_routes": False,
             "set_default_route_distances": False,
             "read_network_snapshot": False,

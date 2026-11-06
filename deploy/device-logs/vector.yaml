@@ -1,0 +1,97 @@
+# Device Logs collector (Vector) -- see backend/app/domains/device_logs and
+# ~/wyfy-ops/syslog/DESIGN.md.
+#
+# Routers send RFC 3164 syslog over UDP inside their WireGuard tunnel to the
+# hub's tunnel address; the hub DNATs it here (udp/5514) WITHOUT masquerade,
+# so the packet's source address is still the router's tunnel IP -- which is
+# how the API attributes each line to a router. If every line arrives
+# "unattributed", the hub is SNATing: fix that, do not work around it here.
+#
+# Two outputs, deliberately unequal:
+#   raw_archive -- EVERY line, before any throttle, gzip NDJSON per hour. This
+#                  is the copy kept for the retention period (CERT-In 180 d).
+#                  Local volume for now; the S3 + Object Lock sink below is
+#                  an owner-approved next step (new paid resource).
+#   api_ingest  -- throttled per source, batched to the API, which parses,
+#                  attributes, MASKS phone numbers / e-mails and indexes into
+#                  Postgres for the Master viewer.
+
+data_dir: /var/lib/vector
+
+sources:
+  routers_udp:
+    type: socket
+    mode: udp
+    address: 0.0.0.0:5514
+    max_length: 16384
+
+transforms:
+  shape:
+    type: remap
+    inputs: [routers_udp]
+    source: |
+      . = {
+        "received_at": format_timestamp!(.timestamp, format: "%+"),
+        "source_ip": to_string!(.host),
+        "raw": to_string!(.message)
+      }
+
+  # A router with `log=yes` on a busy NAT rule can emit thousands of lines a
+  # second. The archive still gets all of them; the online index does not.
+  throttle_index:
+    type: throttle
+    inputs: [shape]
+    key_field: "{{ source_ip }}"
+    threshold: 3000
+    window_secs: 60
+
+sinks:
+  raw_archive:
+    type: file
+    inputs: [shape]
+    path: /var/lib/wyfy-device-logs/%Y/%m/%d/%H.ndjson.gz
+    compression: gzip
+    encoding:
+      codec: json
+
+  api_ingest:
+    type: http
+    inputs: [throttle_index]
+    uri: "${DEVICE_LOGS_INGEST_URL}"
+    method: post
+    encoding:
+      codec: json
+    # The http sink sends a batch as a JSON array; the endpoint wants
+    # {"events": [...]} (strict schema, at most 1000 per request).
+    payload_prefix: '{"events":'
+    payload_suffix: "}"
+    request:
+      headers:
+        Content-Type: application/json
+        X-Device-Logs-Secret: "${DEVICE_LOGS_INGEST_SECRET}"
+    batch:
+      max_events: 500
+      timeout_secs: 2
+    # An API restart or deploy must not lose lines or back-pressure the
+    # archive: buffer on disk, drop the newest only when that is full.
+    buffer:
+      type: disk
+      max_size: 268435488
+      when_full: drop_newest
+
+  # --- Owner-approved next step (DESIGN §7): uncomment after the bucket
+  # (ap-south-1, Object Lock compliance 180 d, versioning) and an instance
+  # profile limited to s3:PutObject exist. Then keep raw_archive as a short
+  # local buffer only.
+  # raw_archive_s3:
+  #   type: aws_s3
+  #   inputs: [shape]
+  #   bucket: <archive bucket name>   (Vector interpolates env vars even in comments)
+  #   region: ap-south-1
+  #   key_prefix: "device-logs/%Y/%m/%d/%H/"
+  #   compression: gzip
+  #   encoding:
+  #     codec: json
+  #   batch:
+  #     timeout_secs: 300
+  #     max_bytes: 50000000

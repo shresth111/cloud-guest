@@ -563,6 +563,15 @@ MODULE_ACTIONS: Mapping[PermissionModule, tuple[PermissionAction, ...]] = {
     # the future deactivate/reactivate action (see models.py's `status`
     # column comment -- no API surface for it yet).
     PermissionModule.CHANNEL_PARTNERS: (_A.CREATE, _A.READ, _A.MANAGE),
+    # Traffic Flows: READ (the Master overview + config preview) and UPDATE
+    # (apply/disable /ip traffic-flow on a router, dry-run by default).
+    # NOTE FOR DEPLOY: new keys -- re-run ``python -m app.domains.rbac.seed``.
+    PermissionModule.TRAFFIC_FLOWS: (_A.READ, _A.UPDATE),
+    # Venue Traffic: READ only. A customer cannot switch collection on or
+    # off -- that is TRAFFIC_FLOWS.UPDATE, Master only -- so there is no
+    # write action to seed.
+    # NOTE FOR DEPLOY: new key -- re-run ``python -m app.domains.rbac.seed``.
+    PermissionModule.VENUE_TRAFFIC: (_A.READ,),
     # Network Integrations: plain CRUD on the integration row plus MANAGE
     # (the platform-console enable/disable, a real admin action distinct
     # from a field edit -- the same reasoning
@@ -583,6 +592,24 @@ MODULE_ACTIONS: Mapping[PermissionModule, tuple[PermissionAction, ...]] = {
         _A.DELETE,
         _A.MANAGE,
     ),
+    # Device Logs: READ is the Master log viewer, the per-router status and
+    # the rendered paste script; MANAGE is "write remote logging onto (or
+    # remove it from) a real router over the API". Nothing else exists, so
+    # nothing else is seeded.
+    #
+    # NOTE FOR DEPLOY: seeding is a manual entrypoint -- re-run
+    # ``python -m app.domains.rbac.seed`` or every caller, Super Admin
+    # included, gets a 403 on /platform/device-logs.
+    PermissionModule.DEVICE_LOGS: (_A.READ, _A.MANAGE),
+    # NetLogs (customer): READ only -- the list, summary and CSV export.
+    # Nothing a customer does here writes anything.
+    # NOTE FOR DEPLOY: new key -- re-run ``python -m app.domains.rbac.seed``
+    # or every customer gets a 403 on /device-logs.
+    PermissionModule.NETWORK_LOGS: (_A.READ,),
+    # IPDR: READ (masked Connections table) and EXPORT (unmasked CSV).
+    # NOTE FOR DEPLOY: new keys -- re-run ``python -m app.domains.rbac.seed``
+    # or every customer gets a 403 on /ipdr.
+    PermissionModule.IPDR: (_A.READ, _A.EXPORT),
 }
 
 MODULE_DISPLAY_NAMES: Mapping[PermissionModule, str] = {
@@ -648,6 +675,11 @@ MODULE_DISPLAY_NAMES: Mapping[PermissionModule, str] = {
     PermissionModule.READINESS: "Router Readiness Checklist",
     PermissionModule.CHANNEL_PARTNERS: "Channel Partners",
     PermissionModule.NETWORK_INTEGRATIONS: "Network Integrations",
+    PermissionModule.TRAFFIC_FLOWS: "Traffic Flows",
+    PermissionModule.VENUE_TRAFFIC: "Venue Traffic",
+    PermissionModule.DEVICE_LOGS: "Device Logs",
+    PermissionModule.NETWORK_LOGS: "Network Logs",
+    PermissionModule.IPDR: "IPDR (CERT-In format)",
 }
 
 # The narrowest scope each module's permissions are meaningful at. A
@@ -814,6 +846,21 @@ MODULE_NARROWEST_SCOPE: Mapping[PermissionModule, ScopeType] = {
     # non-GLOBAL system role below now carries the same explicit
     # ``_L.NONE`` override those three do.
     PermissionModule.NETWORK_INTEGRATIONS: ScopeType.GLOBAL,
+    # Guest browsing metadata, Master console only -- see the enum comment.
+    PermissionModule.TRAFFIC_FLOWS: ScopeType.GLOBAL,
+    # One venue's traffic, read by that venue's owner. LOCATION is the
+    # narrowest scope so a route can pin the check to the venue it reads.
+    PermissionModule.VENUE_TRAFFIC: ScopeType.LOCATION,
+    # Device Logs is a Master-console surface: the lines span every tenant
+    # and carry guest identifiers. Same GLOBAL-only shape (and the same
+    # explicit NONE on every non-GLOBAL role) as NETWORK_INTEGRATIONS.
+    PermissionModule.DEVICE_LOGS: ScopeType.GLOBAL,
+    # One venue's device log lines, read by that venue's people. LOCATION is
+    # the narrowest scope so a site-level role can hold it for its own site.
+    PermissionModule.NETWORK_LOGS: ScopeType.LOCATION,
+    # Law-enforcement data about every guest of the organization: never a
+    # site-level grant. ORGANIZATION is the narrowest scope.
+    PermissionModule.IPDR: ScopeType.ORGANIZATION,
 }
 
 
@@ -960,6 +1007,10 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
             # here the same way SYSTEM_SETTINGS/WHITE_LABEL above are
             # deliberately lowered off this role's own FULL default.
             _M.DEVICE_CONSOLE: _L.NONE,
+            # IPDR (guest identity beside every address reached) is the
+            # venue owner's, requested per case; platform staff do not get it
+            # by role. Super Admin keeps it for support under owner control.
+            _M.IPDR: _L.NONE,
         },
     ),
     SystemRoleDefinition(
@@ -984,6 +1035,12 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
             # for this job -- FULL, not just OPERATE like this role's other
             # overrides above.
             _M.SUPPORT_TICKETS: _L.FULL,
+            # Guest browsing metadata: Super Admin / Platform Admin only.
+            _M.TRAFFIC_FLOWS: _L.NONE,
+            # Venue traffic is for the venue owner only (see organization-owner).
+            _M.VENUE_TRAFFIC: _L.NONE,
+            # IPDR: Owner/Admin only (law-enforcement data).
+            _M.IPDR: _L.NONE,
         },
     ),
     SystemRoleDefinition(
@@ -1047,6 +1104,12 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
             # is onboarded and credentialled from the Master console only.
             # See MODULE_NARROWEST_SCOPE's own entry.
             _M.NETWORK_INTEGRATIONS: _L.NONE,
+            _M.TRAFFIC_FLOWS: _L.NONE,
+            # Venue traffic is for the venue owner only (see organization-owner).
+            _M.VENUE_TRAFFIC: _L.NONE,
+            # IPDR: Owner/Admin only (law-enforcement data).
+            _M.IPDR: _L.NONE,
+            _M.DEVICE_LOGS: _L.NONE,
         },
     ),
     SystemRoleDefinition(
@@ -1080,6 +1143,12 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
             # NETWORK_INTEGRATIONS is GLOBAL-only -- see MSP Owner's own
             # identical override above.
             _M.NETWORK_INTEGRATIONS: _L.NONE,
+            _M.TRAFFIC_FLOWS: _L.NONE,
+            # Venue traffic is for the venue owner only (see organization-owner).
+            _M.VENUE_TRAFFIC: _L.NONE,
+            # IPDR: Owner/Admin only (law-enforcement data).
+            _M.IPDR: _L.NONE,
+            _M.DEVICE_LOGS: _L.NONE,
         },
     ),
     SystemRoleDefinition(
@@ -1125,6 +1194,11 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
             # NETWORK_INTEGRATIONS is GLOBAL-only -- see MSP Owner's own
             # identical override above.
             _M.NETWORK_INTEGRATIONS: _L.NONE,
+            _M.TRAFFIC_FLOWS: _L.NONE,
+            # VENUE_TRAFFIC is NOT overridden here: this role's FULL default
+            # gives the venue owner the one action it has (read). It is the
+            # only customer role that holds it.
+            _M.DEVICE_LOGS: _L.NONE,
         },
     ),
     SystemRoleDefinition(
@@ -1161,6 +1235,10 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
             # NETWORK_INTEGRATIONS is GLOBAL-only -- see MSP Owner's own
             # identical override above.
             _M.NETWORK_INTEGRATIONS: _L.NONE,
+            _M.TRAFFIC_FLOWS: _L.NONE,
+            # Venue traffic is for the venue owner only (see organization-owner).
+            _M.VENUE_TRAFFIC: _L.NONE,
+            _M.DEVICE_LOGS: _L.NONE,
         },
     ),
     SystemRoleDefinition(
@@ -1170,6 +1248,8 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
         scope_type=ScopeType.LOCATION,
         default_level=_L.NONE,
         overrides={
+            # NetLogs: this site's device log lines, read-only.
+            _M.NETWORK_LOGS: _L.READ,
             # ORGANIZATION-only module; never at a location.
             _M.MARKETING_PROVIDERS: _L.NONE,
             _M.ROUTERS: _L.FULL,
@@ -1228,6 +1308,10 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
             # additive. See RETIRED_NON_GLOBAL_MODULES below, which is
             # what actually revokes the rows this line used to create.
             _M.NETWORK_INTEGRATIONS: _L.NONE,
+            _M.TRAFFIC_FLOWS: _L.NONE,
+            # Venue traffic is for the venue owner only (see organization-owner).
+            _M.VENUE_TRAFFIC: _L.NONE,
+            _M.DEVICE_LOGS: _L.NONE,
             _M.POLICY: _L.OPERATE,
             _M.MONITORING: _L.FULL,
             _M.ALERTS: _L.OPERATE,
@@ -1254,6 +1338,8 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
         scope_type=ScopeType.LOCATION,
         default_level=_L.NONE,
         overrides={
+            # NetLogs: this site's device log lines, read-only.
+            _M.NETWORK_LOGS: _L.READ,
             # ORGANIZATION-only module; never at a location.
             _M.MARKETING_PROVIDERS: _L.NONE,
             # The posture surface itself.
@@ -1303,6 +1389,10 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
             _M.QUOTATIONS: _L.NONE,
             _M.CHANNEL_PARTNERS: _L.NONE,
             _M.NETWORK_INTEGRATIONS: _L.NONE,
+            _M.TRAFFIC_FLOWS: _L.NONE,
+            # Venue traffic is for the venue owner only (see organization-owner).
+            _M.VENUE_TRAFFIC: _L.NONE,
+            _M.DEVICE_LOGS: _L.NONE,
         },
     ),
     SystemRoleDefinition(
@@ -1317,6 +1407,8 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
         scope_type=ScopeType.LOCATION,
         default_level=_L.NONE,
         overrides={
+            # NetLogs: this site's device log lines, read-only.
+            _M.NETWORK_LOGS: _L.READ,
             # ORGANIZATION-only module; never at a location.
             _M.MARKETING_PROVIDERS: _L.NONE,
             _M.ROUTERS: _L.OPERATE,
@@ -1345,6 +1437,10 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
             # _L.OPERATE for the same "this location's own network
             # controller" reason, retired for the same product decision.
             _M.NETWORK_INTEGRATIONS: _L.NONE,
+            _M.TRAFFIC_FLOWS: _L.NONE,
+            # Venue traffic is for the venue owner only (see organization-owner).
+            _M.VENUE_TRAFFIC: _L.NONE,
+            _M.DEVICE_LOGS: _L.NONE,
             # Day-to-day network operations plainly includes knowing
             # whether THIS location's own internet uplink is up (ISP) and
             # what hardware is registered on its network (MONITORED_
@@ -1407,6 +1503,8 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
         scope_type=ScopeType.LOCATION,
         default_level=_L.NONE,
         overrides={
+            # NetLogs: this site's device log lines, read-only.
+            _M.NETWORK_LOGS: _L.READ,
             # ORGANIZATION-only module; never at a location.
             _M.MARKETING_PROVIDERS: _L.NONE,
             _M.LOCATIONS: _L.OPERATE,
@@ -1507,6 +1605,12 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
             # base_url, its Omada id and its site/SSID mapping to anyone
             # with tenant-wide "read-only visibility".
             _M.NETWORK_INTEGRATIONS: _L.NONE,
+            _M.TRAFFIC_FLOWS: _L.NONE,
+            # Venue traffic is for the venue owner only (see organization-owner).
+            _M.VENUE_TRAFFIC: _L.NONE,
+            # IPDR: Owner/Admin only (law-enforcement data).
+            _M.IPDR: _L.NONE,
+            _M.DEVICE_LOGS: _L.NONE,
         },
     ),
     SystemRoleDefinition(
@@ -1541,6 +1645,12 @@ SYSTEM_ROLES: tuple[SystemRoleDefinition, ...] = (
             # is the audit log (_L.FULL above), which records every
             # controller action without exposing the controller.
             _M.NETWORK_INTEGRATIONS: _L.NONE,
+            _M.TRAFFIC_FLOWS: _L.NONE,
+            # Venue traffic is for the venue owner only (see organization-owner).
+            _M.VENUE_TRAFFIC: _L.NONE,
+            # IPDR: Owner/Admin only (law-enforcement data).
+            _M.IPDR: _L.NONE,
+            _M.DEVICE_LOGS: _L.NONE,
         },
     ),
     SystemRoleDefinition(

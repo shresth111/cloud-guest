@@ -17,7 +17,7 @@ response.
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -30,6 +30,8 @@ __all__ = [
     "OtpVerifyResponse",
     "OtpRequestAdminResponse",
     "OtpRequestListResponse",
+    "OtpSmsDailyLocationConsumption",
+    "OtpSmsDailyLocationConsumptionResponse",
 ]
 
 
@@ -136,6 +138,10 @@ class OtpRequestAdminResponse(BaseModel):
     location_id: str | None
     created_at: datetime
     updated_at: datetime
+    # What the provider call did. Not carrier delivery: no receipt is received.
+    provider_outcome: str | None = None
+    provider_name: str | None = None
+    provider_response_ms: int | None = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -148,3 +154,23 @@ class OtpRequestListResponse(BaseModel):
     total_pages: int
     has_next: bool
     has_previous: bool
+
+
+class OtpSmsDailyLocationConsumption(BaseModel):
+    """Actual SMS OTP requests created for one location on one local day.
+
+    This is deliberately a request-volume metric, not a provider-delivery
+    metric: an ``otp_requests`` row proves a code was requested, but the
+    configured SMS provider may not expose carrier delivery receipts.
+    """
+
+    usage_date: date
+    location_id: str
+    location_name: str
+    sms_otp_requests: int
+
+
+class OtpSmsDailyLocationConsumptionResponse(BaseModel):
+    start_date: date
+    end_date: date
+    items: list[OtpSmsDailyLocationConsumption]

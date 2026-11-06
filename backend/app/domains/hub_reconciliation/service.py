@@ -256,6 +256,15 @@ class HubReconciliationService:
                 # job with a heuristic.
                 drift.append(entry.public_key)
                 continue
+            if entry.status is FleetPeerStatus.KNOWN_ORPHAN:
+                # A superseded peer the hub could not be told to drop. The
+                # ledger still attributes it to its router, so without this
+                # skip every orphan "rebinds" that router's NAS to its dead
+                # address, the live peer rebinds it back, and each push
+                # restarts FreeRADIUS for the whole fleet -- every pass.
+                # (Prod 2026-10-03: four peers for one router flapped its
+                # binding between .35 and .37 every five minutes.)
+                continue
             if entry.router_id is None or entry.tunnel_ip_address is None:
                 continue
             if entry.status is FleetPeerStatus.TRACKED_KEY_MISMATCH:

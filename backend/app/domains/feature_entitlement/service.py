@@ -106,6 +106,19 @@ FEATURE_META: dict[PlanFeatureKey, tuple[str, str, str]] = {
         "Send campaigns through the venue's own SMS, WhatsApp or email account",
         "marketing",
     ),
+    # "Traffic Lens" is the product name; ``traffic_flow`` stays the key.
+    PlanFeatureKey.TRAFFIC_FLOW: (
+        "Traffic Lens",
+        "Venue traffic by service, device and outside address (last 7 days)",
+        "network",
+    ),
+    PlanFeatureKey.TRAFFIC_FLOW_RECORDS: (
+        "Traffic Lens: flow records",
+        "Per-flow table for the venue: which device address reached which "
+        "outside address, with ports and NAT (last 7 days). Needs Traffic "
+        "Lens. Unlock only after the venue's guest notice covers it",
+        "network",
+    ),
 }
 
 
@@ -151,6 +164,8 @@ class FeatureEntitlementService:
                     # turns it on.
                     PlanFeatureKey.GUEST_MARKETING,
                     PlanFeatureKey.GUEST_MARKETING_BYO,
+                    PlanFeatureKey.TRAFFIC_FLOW,
+                    PlanFeatureKey.TRAFFIC_FLOW_RECORDS,
                 ),
                 tier_options=[tier.value for tier in SupportTier] if is_tier else [],
                 default_tier_value=SupportTier.BASIC.value if is_tier else None,

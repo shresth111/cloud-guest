@@ -49,7 +49,7 @@ from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Index, String, text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
-from app.database.base import BaseModel
+from app.database.base import Base, BaseModel, UUIDMixin
 
 # The natural key of an ``AnalyticsSnapshot`` row -- the tuple that
 # identifies "one rollup", as opposed to "one *write* of that rollup".
@@ -384,10 +384,82 @@ class ScheduledReport(BaseModel):
         )
 
 
+class PortalImpression(UUIDMixin, Base):
+    """One captive-portal page load: the "portal opened" stage of the
+    customer dashboard's login funnel (``venue_insights.get_login_funnel``).
+
+    Written by ``portal_impressions.record_portal_impression``, off the
+    guest's request path, when the portal runtime's first call
+    (``GET /captive-portal/resolve``) says it is a real guest load. The
+    dashboard's Portal Preview hits the same endpoint and does not say so,
+    so it is never counted.
+
+    Deliberately lean -- not ``BaseModel``: no soft delete (rows are only
+    ever removed by the retention sweep), no audit or version columns (no
+    platform user writes one, nothing updates one). This is the highest-
+    volume write a venue produces and every extra column and index is paid
+    on each guest's page load.
+
+    **No personal data.** No MAC, phone, IP or user agent. A device is only
+    ever ``client_mac_hash``: a keyed hash (``portal_device_key``) salted per
+    organization, used to collapse one device's reloads into one impression
+    and to count distinct devices. It cannot be joined to ``guest_devices``
+    without the application secret, and the same phone at two organizations
+    hashes differently.
+
+    Not a CERT-In connection log (no subscriber identity, no address); kept
+    ``PORTAL_IMPRESSION_RETENTION_DAYS`` by the retention sweep.
+    """
+
+    __tablename__ = "portal_impressions"
+
+    organization_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("organizations.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    location_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("locations.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    router_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("routers.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    occurred_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    client_mac_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+    __table_args__ = (
+        # The funnel's read: one venue, one window.
+        Index(
+            "ix_portal_impressions_org_location_occurred_at",
+            "organization_id",
+            "location_id",
+            "occurred_at",
+        ),
+        # The dedupe probe on every write: has this device opened this
+        # venue's portal in the last few minutes?
+        Index(
+            "ix_portal_impressions_location_device_occurred_at",
+            "location_id",
+            "client_mac_hash",
+            "occurred_at",
+            postgresql_where=text("client_mac_hash IS NOT NULL"),
+        ),
+        # The retention sweep's range delete.
+        Index("ix_portal_impressions_occurred_at", "occurred_at"),
+    )
+
+
 __all__ = [
     "SNAPSHOT_NATURAL_KEY_COLUMNS",
     "SNAPSHOT_NATURAL_KEY_INDEX_WHERE",
     "AnalyticsSnapshot",
+    "PortalImpression",
     "ReportTemplate",
     "ScheduledReport",
 ]

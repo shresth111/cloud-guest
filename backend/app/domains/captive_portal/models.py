@@ -410,6 +410,22 @@ class CaptivePortalConfig(BaseModel):
         Boolean, default=False, nullable=False
     )
 
+    # Name required at sign-in (OTP methods). Unlike the optional
+    # post-connect ask above, this one gates the network: a guest who
+    # verified a one-time code and has no name on file gets one "Your
+    # name" screen, and nothing opens the network for that session until
+    # the name is stored -- see
+    # ``app.domains.guest.service.GuestService.session_awaits_required_name``
+    # for every enforcement point.
+    #
+    # **Defaults TRUE** (owner decision, migration 0143), with a
+    # server_default so every creation path agrees. It implies
+    # ``collect_guest_name``; ``CaptivePortalService.update_config`` and
+    # ``create_config`` keep the pair consistent. A venue can switch it off.
+    require_guest_name: Mapped[bool] = mapped_column(
+        Boolean, default=True, server_default=text("true"), nullable=False
+    )
+
     # The post-connect "would you review us on Google" card. Defaults off:
     # it is greenfield, it has no value at all without ``review_url``
     # below, and switching a review request on for a venue that has not

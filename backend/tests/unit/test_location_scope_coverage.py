@@ -80,6 +80,29 @@ from app.domains.rbac.location_scope import CallerLocationScope
 # ---------------------------------------------------------------------------
 
 LOCATION_SCOPED: dict[str, str] = {
+    "traffic_flow": (
+        "Three location-bearing models (`TrafficFlowWindow`, "
+        "`TrafficFlowServiceBucket`, and routers via the export row), read "
+        "from two surfaces. The Master routes (`/platform/traffic-flow/...`) "
+        "are pinned to ScopeType.GLOBAL on the GLOBAL-only `traffic_flows` "
+        "module, which no location- or organization-scoped caller holds. The "
+        "customer routes (`/traffic-flow/locations/{location_id}/...`) read "
+        "one venue: `TrafficFlowCustomerService._own_location` loads the "
+        "venue named in the path, compares its organization with the "
+        "caller's (a foreign or missing venue is the same 404), runs "
+        "`enforce_entity_location` against the caller's grants, and every "
+        "read is then filtered on that loaded venue's id -- a `router_id` "
+        "query value only narrows within it. The confinement is taken at "
+        "construction and supplied by `get_traffic_flow_customer_service`. "
+        "The Destinations routes read a fourth model, "
+        "`TrafficFlowDestinationBucket`, the same way: the Master ones are "
+        "GLOBAL-pinned, and the customer ones go through "
+        "`CustomerDestinationService`, which calls that same "
+        "`own_location` check (via the same provider) before any read and "
+        "puts the caller's organization on every statement. "
+        "There is no by-id row route: windows and buckets are never "
+        "addressed individually."
+    ),
     "marketing": (
         "Guest Marketing. Two location-bearing models: MarketingCampaign "
         "(nullable location_id = org-wide) and GuestMarketingConsent "
@@ -284,6 +307,27 @@ LOCATION_SCOPED: dict[str, str] = {
 PENDING: dict[str, str] = {}
 
 EXEMPT: dict[str, str] = {
+    "ipdr": (
+        "IPDR. `ipdr_day_files.location_id` says which venue an archived day "
+        "belongs to. Both routes pin `ipdr.read` / `ipdr.export` to "
+        "ScopeType.ORGANIZATION, a module whose narrowest scope is "
+        "ORGANIZATION and which every LOCATION role holds at NONE, so a "
+        "location-confined caller cannot reach them. There is no by-id route; "
+        "`location_id`/`router_id` are query filters validated against the "
+        "caller's organization (404 otherwise). If a location-level grant is "
+        "ever allowed, it moves to PENDING."
+    ),
+    "device_logs": (
+        "Device Logs. `device_log_events.location_id` is attribution "
+        "(which venue a syslog line came from), and every read route is "
+        "Master-only: `device_logs.read` / `device_logs.manage` pinned to "
+        "ScopeType.GLOBAL, a module whose narrowest scope is GLOBAL and which "
+        "every location/organization role holds at NONE. A location-confined "
+        "caller cannot reach any of these routes, so there is no "
+        "cross-site path to confine. The ingest route takes no location at "
+        "all (attribution is derived from the tunnel IP). If a customer-"
+        "facing read is ever added, it moves to PENDING."
+    ),
     "otp": (
         "Exempt from *this* class, not from scrutiny. `OtpRequest` carries a "
         "location, but the domain has **no by-id route at all** -- only "
@@ -615,6 +659,12 @@ _GUEST_FACING_UNCONFINED: dict[tuple[str, str], str] = {
         "dependency resolves them to unconfined rather than 401ing them out of the "
         "portal."
     ),
+    ("POST", "/api/v1/guest/sign-in-name"): (
+        "A guest acting on their own just-verified OTP session, during login -- "
+        "the same shape as `/guest/profile` above. They hold no roles, so there "
+        "is no confinement to derive; the anonymous-tolerant dependency resolves "
+        "them to unconfined rather than 401ing them out of the portal."
+    ),
     ("POST", "/api/v1/guest/review-link-opened"): (
         "A guest tapping the review card on their own connected session -- the same "
         "shape as `/guest/profile` above, and unauthenticated for the same reason: "
@@ -624,6 +674,14 @@ _GUEST_FACING_UNCONFINED: dict[tuple[str, str], str] = {
         "nothing, so being unconfined here widens nothing: the worst a caller can do "
         "with a session id they do not own is mark someone else's review card as "
         "already tapped, which suppresses a nudge and grants no access."
+    ),
+    ("POST", "/api/v1/guest/review-prompt-shown"): (
+        "A guest on their own connected session, as `/portal/review` renders -- the "
+        "same shape as `/guest/review-link-opened` above, unauthenticated for the "
+        "same reason. It stamps one timestamp on the session the caller already "
+        "holds and reads nothing: the worst a caller can do with a session id they "
+        "do not own is start that guest's 30-day cooldown early, which suppresses "
+        "a review page and grants no access."
     ),
     ("POST", "/api/v1/guest/set-password"): (
         "A guest acting on their own session, before or during login. They hold no "
@@ -659,6 +717,15 @@ _GUEST_FACING_UNCONFINED: dict[tuple[str, str], str] = {
         "that device ended within LAST_ENDED_SESSION_WINDOW_MINUTES, which is "
         "strictly less than `/session/active` already discloses for a live one."
     ),
+    ("GET", "/api/v1/guest/session/trusted-device"): (
+        "Trusted Devices at an Aruba Instant On venue, asked by the portal after "
+        "`/guest/session/active` answers no, unauthenticated for the same reason: "
+        "the device has no session and no roles yet, so there is no confinement to "
+        "derive. It creates nothing and returns only `mac:<the MAC sent>` or null; "
+        "the device is admitted solely by RADIUS Authorize on the MAC the AP "
+        "reports. The most it discloses is whether a MAC is trusted at the "
+        "router's venue, less than `/session/active` discloses for a live session."
+    ),
     ("POST", "/api/v1/guest/session/disconnect"): (
         "A guest acting on their own session, before or during login. They hold no "
         "roles, so there is no confinement to derive; the anonymous-tolerant "
@@ -676,6 +743,22 @@ _GUEST_FACING_UNCONFINED: dict[tuple[str, str], str] = {
         "-- the router itself is the caller. It has no RBAC grants and therefore no "
         "location confinement, and it must never 401: this is the path every guest's "
         "traffic authorises through."
+    ),
+    ("POST", "/api/v1/radius/aruba-shared/authorize"): (
+        "The shared Aruba Instant On listener (UDP 1912/1913). Authenticated by the "
+        "platform-wide Aruba shared secret (constant-time, `resolve_shared_nas`), "
+        "then bound to one ACTIVE aruba_instant_on NAS by the packet's "
+        "NAS-Identifier AND its AP MAC. Same reasoning as `/radius/authorize`: the "
+        "AP is the caller, it has no RBAC grants, and a refusal is an Access-Reject "
+        "(or a logged 401 for accounting), never a user-session 401."
+    ),
+    ("POST", "/api/v1/radius/aruba-shared/accounting"): (
+        "The shared Aruba Instant On listener (UDP 1912/1913). Authenticated by the "
+        "platform-wide Aruba shared secret (constant-time, `resolve_shared_nas`), "
+        "then bound to one ACTIVE aruba_instant_on NAS by the packet's "
+        "NAS-Identifier AND its AP MAC. Same reasoning as `/radius/authorize`: the "
+        "AP is the caller, it has no RBAC grants, and a refusal is an Access-Reject "
+        "(or a logged 401 for accounting), never a user-session 401."
     ),
     ("GET", "/api/v1/agent/authorized-macs"): (
         "Authenticated by the router agent's own credential (`CurrentAgent`), not by a "

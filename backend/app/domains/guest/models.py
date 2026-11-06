@@ -127,7 +127,7 @@ from sqlalchemy import (
     UniqueConstraint,
     text,
 )
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database.base import BaseModel
@@ -485,6 +485,57 @@ class GuestSession(BaseModel):
     disconnect_enforced: Mapped[bool | None] = mapped_column(
         Boolean, nullable=True, default=None
     )
+    # The "Rate us on Google" page (``/portal/review``), per session and so
+    # per location. ``guests.review_link_opened_at`` is per organization,
+    # which is wrong for a chain: a guest who reviewed branch A was never
+    # asked at branch B. ``GuestService.review_prompt_due`` reads these two
+    # columns for "asked at this location recently" and "ever tapped here",
+    # and ``GET /captive-portal/review-stats`` counts them.
+    #
+    # Like the guest-level column, ``review_link_opened_at`` records that a
+    # link was *opened*, never that a review was written.
+    review_prompt_shown_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    review_link_opened_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    #: When the network itself first reported this session's device as let
+    #: through -- not when this platform *asked* it to. Set once, first
+    #: report wins (``GuestRepository.mark_internet_confirmed``), and only
+    #: from a reading that originates on the NAS or controller:
+    #:
+    #: * a RADIUS Accounting-Start / Interim-Update for the session (any NAS
+    #:   that sends accounting: MikroTik hotspot logins, Omada RADIUS portal
+    #:   mode, Aruba Instant On);
+    #: * the sign-in gate push's own read of the MikroTik (the MAC is an
+    #:   ``/ip hotspot active`` session, its host reads ``bypassed``, or the
+    #:   router already holds a ``bypassed`` binding for it);
+    #: * an Omada Open-API client read reporting ``authStatus`` authorized.
+    #:
+    #: NULL means "no such report", never "no internet": a guest admitted
+    #: only by the router's own authorized-MAC poll, or at a venue whose
+    #: vendor reports nothing back, stays NULL however well it works.
+    #: ``0 bytes`` is not used either way -- bypassed guests never produce
+    #: accounting, so it would mislabel working sessions.
+    internet_confirmed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    #: Which of the readings above set ``internet_confirmed_at`` -- one of
+    #: ``constants.InternetConfirmationSource``. For debugging a venue's
+    #: funnel, not for display.
+    internet_confirmed_source: Mapped[str | None] = mapped_column(
+        String(40), nullable=True
+    )
+    #: Aruba Instant On only: the access point (canonical MAC from the front
+    #: of ``Called-Station-Id``) and SSID this session was last reported
+    #: from. Written ONLY by the shared Aruba RADIUS listener
+    #: (``/radius/aruba-shared/accounting``), updated on every Start /
+    #: Interim / Stop so a roaming guest reads as the last AP. NULL on every
+    #: MikroTik and Omada session, and on Aruba sessions accounted before
+    #: this column existed.
+    ap_mac: Mapped[str | None] = mapped_column(String(17), nullable=True)
+    ap_ssid: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
     __table_args__ = (
         Index("ix_guest_sessions_guest_id", "guest_id"),
@@ -495,6 +546,29 @@ class GuestSession(BaseModel):
         Index("ix_guest_sessions_voucher_id", "voucher_id"),
         Index("ix_guest_sessions_status", "status"),
         Index("ix_guest_sessions_started_at", "started_at"),
+        Index(
+            "ix_guest_sessions_review_activity",
+            "location_id",
+            "guest_id",
+            postgresql_where=text(
+                "review_prompt_shown_at IS NOT NULL "
+                "OR review_link_opened_at IS NOT NULL"
+            ),
+        ),
+        # The login funnel's "internet confirmed" stage: one venue, one
+        # window, only the rows that have a confirmation at all.
+        Index(
+            "ix_guest_sessions_internet_confirmed",
+            "location_id",
+            "internet_confirmed_at",
+            postgresql_where=text("internet_confirmed_at IS NOT NULL"),
+        ),
+        Index(
+            "ix_guest_sessions_router_ap_mac",
+            "router_id",
+            "ap_mac",
+            postgresql_where=text("ap_mac IS NOT NULL"),
+        ),
     )
 
     def __repr__(self) -> str:
@@ -816,10 +890,19 @@ class RadiusNasClient(BaseModel):
     # two differing is a queryable, retryable condition, so a failed
     # re-push converges on the next pass instead of needing a human to
     # notice a log line.
-    hub_client_synced_ip: Mapped[str | None] = mapped_column(
-        String(45), nullable=True
-    )
+    hub_client_synced_ip: Mapped[str | None] = mapped_column(String(45), nullable=True)
     hub_client_synced_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    #: Shared Aruba listener only (P1-E): when this NAS last sent an
+    #: Access-Request / an Accounting-Request that resolved to it. Throttled
+    #: writes (at most one per ``NAS_ACTIVITY_WRITE_INTERVAL``). NULL on every
+    #: per-venue NAS (MikroTik, Omada, address-keyed Aruba). An idle AP sends
+    #: nothing, so an old value means "no guest activity", not "down".
+    last_request_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    last_accounting_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
 
@@ -913,6 +996,63 @@ class RadiusNasCodeCounter(BaseModel):
         )
 
 
+class LocationSsidTier(BaseModel):
+    """Speed tiers by WiFi network: one guest SSID of a location, the tier it
+    stands for, and whether joining it needs an entitlement. See
+    ``app.domains.guest.ssid_tiers`` for the decision.
+
+    ``organization_id`` is copied from the location on write (never from a
+    request body) so every read carries the tenant in its WHERE clause.
+    ``policy_id`` optionally links an Access Tier (a BANDWIDTH policy of the
+    same organization): a guest mapped into that tier may join.
+    ``voucher_plan_ids`` (JSON list of voucher plan ids, empty = any voucher)
+    narrows which voucher passes entitle. ``download_mbps``/``upload_mbps``
+    are the per-guest cap Instant On applies to EVERY guest on the SSID
+    (integer Mbps, ``None`` = no cap)."""
+
+    __tablename__ = "location_ssid_tiers"
+
+    organization_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("organizations.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    location_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("locations.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    ssid: Mapped[str] = mapped_column(String(32), nullable=False)
+    tier_name: Mapped[str] = mapped_column(String(100), nullable=False)
+    requires_entitlement: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=text("false"), nullable=False
+    )
+    policy_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("policies.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    voucher_plan_ids: Mapped[list] = mapped_column(
+        JSONB, default=list, server_default=text("'[]'::jsonb"), nullable=False
+    )
+    download_mbps: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    upload_mbps: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    sort_order: Mapped[int] = mapped_column(
+        Integer, default=0, server_default=text("0"), nullable=False
+    )
+
+    __table_args__ = (
+        Index("ix_location_ssid_tiers_organization_id", "organization_id"),
+        Index("ix_location_ssid_tiers_location_id", "location_id"),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<LocationSsidTier(id={self.id}, location_id={self.location_id}, "
+            f"ssid={self.ssid!r})>"
+        )
+
+
 __all__ = [
     "Guest",
     "GuestDevice",
@@ -921,4 +1061,5 @@ __all__ = [
     "GuestConsent",
     "RadiusNasClient",
     "RadiusNasCodeCounter",
+    "LocationSsidTier",
 ]

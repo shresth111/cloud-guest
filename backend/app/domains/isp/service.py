@@ -83,6 +83,9 @@ from .constants import (
     SPEED_TEST_MIN_INTERVAL_SECONDS,
     SPEED_TEST_TIMEOUT_SECONDS,
     UNHEALTHY_SINCE_LOOKBACK_LIMIT,
+    UPSTREAM_PROBE_PING_COUNT,
+    UPSTREAM_PROBE_ROUTE_COMMENT_PREFIX,
+    UPSTREAM_PROBE_TARGETS,
     HealthStatus,
     HealthStatusSource,
     IspConnectionMode,
@@ -114,6 +117,7 @@ from .exceptions import (
     IspDeviceOperationError,
     IspDeviceRouteMismatchError,
     IspError,
+    IspFailoverNotApplicableError,
     IspFailoverTargetUnreachableError,
     IspHealthCheckTargetUnavailableError,
     IspLinkDisabledError,
@@ -246,6 +250,9 @@ class HealthCheckSweepSummary:
     # runtime one. Those need completely different responses, and telling
     # them apart took a code read rather than a glance at the number.
     misconfigured: int = 0
+    # Links whose router could not be reached or could not answer: nothing
+    # was measured. Counted apart from ``checked`` and from ``errors``.
+    no_reading: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -327,8 +334,11 @@ class IspService:
         device_adapter_resolver=get_isp_health_adapter,
         redis: _RedisProtocol | None = None,
         caller_location_scope: LocationScope = None,
+        upstream_probe_enabled: bool = False,
     ) -> None:
         self.repository = repository
+        # Settings.isp_upstream_probe_enabled. See _measure_beyond_first_hop.
+        self.upstream_probe_enabled = upstream_probe_enabled
         self.router_lookup = router_lookup
         self.audit_writer = audit_writer
         self._get_device_adapter = device_adapter_resolver
@@ -1048,6 +1058,88 @@ class IspService:
         return outcome
 
     async def ping_link(self, link: IspLink) -> PingResult:
+        """One reading of this link: its first hop, then, when enabled and the
+        first hop answered, the internet beyond it."""
+        result = await self._ping_first_hop(link)
+        if not self.upstream_probe_enabled or result.received <= 0:
+            return result
+        return await self._measure_beyond_first_hop(link, result)
+
+    async def _measure_beyond_first_hop(
+        self, link: IspLink, first_hop: PingResult
+    ) -> PingResult:
+        """Turns a good first-hop reading into a failed one when the ISP behind
+        that hop is passing nothing. A modem answers from the venue during an
+        ISP outage, so the first hop alone reads healthy throughout.
+
+        On a multi-WAN router each probe address needs a /32 route, or the ping
+        would leave by whichever line is preferred and measure that one. One
+        enabled link has nowhere else to go and needs no write.
+
+        Any failure of the probe itself keeps the first-hop reading: not being
+        able to run this check is no evidence against the line.
+        """
+        siblings = await self.repository.list_links_for_router(link.router_id)
+        enabled = sorted(
+            (sibling for sibling in siblings if sibling.is_enabled),
+            key=lambda sibling: (sibling.priority, str(sibling.id)),
+        )
+        position = next(
+            (i for i, sibling in enumerate(enabled) if sibling.id == link.id), None
+        )
+        if position is None or position >= len(UPSTREAM_PROBE_TARGETS):
+            return first_hop
+        targets = UPSTREAM_PROBE_TARGETS[position]
+
+        router = await self.router_lookup.get_router(link.router_id)
+        credentials = self._resolve_device_credentials(router)
+        adapter = self._get_device_adapter(router.vendor)
+        try:
+            if len(enabled) > 1:
+                interface = link.routing_interface or link.interface
+                routes = await adapter.read_default_routes(credentials)
+                gateways = {
+                    route.gateway
+                    for route in routes
+                    if interface and route.interface == interface and route.gateway
+                }
+                if len(gateways) != 1:
+                    return first_hop
+                gateway = next(iter(gateways))
+                for target in targets:
+                    await adapter.ensure_host_route(
+                        credentials,
+                        dst_address=target,
+                        gateway=gateway,
+                        comment=f"{UPSTREAM_PROBE_ROUTE_COMMENT_PREFIX}{target}",
+                    )
+            for target in targets:
+                probe = await adapter.ping(
+                    credentials,
+                    target_ip=target,
+                    count=UPSTREAM_PROBE_PING_COUNT,
+                    timeout_seconds=ISP_PING_TIMEOUT_SECONDS,
+                )
+                if probe.received > 0:
+                    return first_hop
+        except (IspDeviceConnectionError, IspDeviceOperationError) as exc:
+            logger.warning(
+                "isp_upstream_probe_unavailable",
+                extra={"isp_link_id": str(link.id), "error": str(exc)},
+            )
+            return first_hop
+        logger.warning(
+            "isp_upstream_probe_failed",
+            extra={"isp_link_id": str(link.id), "targets": list(targets)},
+        )
+        return PingResult(
+            sent=first_hop.sent,
+            received=0,
+            packet_loss_percentage=100.0,
+            avg_rtt_ms=None,
+        )
+
+    async def _ping_first_hop(self, link: IspLink) -> PingResult:
         """Resolves this link's own real health-check target and executes
         it -- the resolution strategy itself is driven entirely by the
         link's own ``connection_mode`` (never anything hardcoded to a
@@ -1108,7 +1200,7 @@ class IspService:
             )
 
         if link.connection_mode == IspConnectionMode.DHCP.value:
-            target_ip = await adapter.get_active_default_gateway(credentials)
+            target_ip = await self._resolve_dhcp_target(link, credentials, adapter)
             if not target_ip:
                 raise IspHealthCheckTargetUnavailableError(
                     link.id,
@@ -1124,6 +1216,93 @@ class IspService:
             count=ISP_PING_COUNT,
             timeout_seconds=ISP_PING_TIMEOUT_SECONDS,
         )
+
+    async def _resolve_dhcp_target(
+        self,
+        link: IspLink,
+        credentials: IspCredentials,
+        adapter: BaseIspHealthAdapter,
+    ) -> str | None:
+        """The gateway a DHCP link's health is measured against.
+
+        One enabled link: the router's usable default gateway, as before.
+
+        Two or more: that answer is router-wide, so it would be the same
+        address for every link. With one line dead, ``check-gateway`` hands
+        the "usable" slot to the survivor and the dead line gets measured
+        through the live one's gateway -- it reads healthy, and no failover
+        is ever triggered. So each link reads the route on its own interface.
+
+        Deliberately no ``route.active`` test. RouterOS marks only the
+        preferred route active, so a healthy backup at a higher distance is
+        inactive too; the ping below is what measures the line.
+
+        A link that cannot be matched to exactly one gateway raises
+        ``IspDeviceOperationError``, which the sweep records as "no reading".
+        It is not recorded as down, because a mismatched interface name would
+        otherwise move a working venue onto its backup.
+        """
+        siblings = await self.repository.list_links_for_router(link.router_id)
+        if sum(1 for sibling in siblings if sibling.is_enabled) < 2:
+            return await adapter.get_active_default_gateway(credentials)
+
+        interface = link.routing_interface or link.interface
+        routes = await adapter.read_default_routes(credentials)
+        gateways = {
+            route.gateway
+            for route in routes
+            if interface and route.interface == interface and route.gateway
+        }
+        if len(gateways) != 1:
+            raise IspDeviceOperationError(
+                "resolve_link_gateway",
+                f"{len(gateways)} default-route gateways on interface "
+                f"'{interface}' for a multi-WAN DHCP link",
+            )
+        return gateways.pop()
+
+    async def record_no_reading(self, link: IspLink) -> IspLink:
+        """Records that this tick produced no measurement of the line --
+        the router could not be reached, or could not answer.
+
+        That says nothing about the ISP, so the link goes to ``UNKNOWN``
+        rather than ``UNHEALTHY``, and the failure streak neither advances
+        nor resets. No ``IspHealthCheck`` row is written: uptime is computed
+        as "not unhealthy", so an unmeasured row would count as uptime.
+
+        The traffic baseline is cleared along with the rates. Keeping it
+        would let the next good tick divide a long gap's bytes by one
+        interval, and keeping the rates would show a frozen Mbps figure. A
+        manual override stands until a real reading replaces it.
+        """
+        current = await self.repository.get_link_for_update(link.id) or link
+        if current.health_status_source == HealthStatusSource.MANUAL.value:
+            return current
+        return await self.repository.update_link(
+            current,
+            {
+                "health_status": HealthStatus.UNKNOWN.value,
+                "health_status_source": HealthStatusSource.AUTOMATED.value,
+                "latency_ms": None,
+                "packet_loss_percentage": None,
+                "last_checked_at": datetime.now(UTC),
+                "last_rx_bytes": None,
+                "last_tx_bytes": None,
+                "current_download_mbps": None,
+                "current_upload_mbps": None,
+            },
+        )
+
+    async def wan_routing_modes_for(
+        self, links: list[IspLink]
+    ) -> dict[uuid.UUID, str | None]:
+        """Each link's router's ``wan_routing_mode``, one read per distinct
+        router. The caller has already scoped ``links`` to the tenant."""
+        modes: dict[uuid.UUID, str | None] = {}
+        for router_id in {link.router_id for link in links}:
+            router = await self.router_lookup.get_router(router_id)
+            modes[router_id] = router.wan_routing_mode
+        return modes
 
     async def sample_link_traffic(self, link: IspLink) -> TrafficCounters | None:
         """Real, best-effort traffic-load sample for the "how much
@@ -1422,6 +1601,10 @@ class IspService:
                     actor_user_id=None,
                     reason="consecutive_health_check_failures",
                 )
+            except IspFailoverNotApplicableError:
+                # Load balance: the router's own crossover routes move this
+                # line's traffic. Expected every tick, so not a warning.
+                return link
             except IspError as exc:
                 # Two honest outcomes, both logged and never raised back at
                 # the caller of a routine health check:
@@ -1568,6 +1751,13 @@ class IspService:
         router = await self.router_lookup.get_router(
             router_id, requesting_organization_id=requesting_organization_id
         )
+        # A distance swap only reorders the plain main-table routes. Under
+        # load balance guest traffic follows PCC marks into the to_wanN
+        # tables, so the swap would not move it, yet the database would
+        # record a failover. Failback stays allowed: it is what restores a
+        # router an earlier failover already swapped.
+        if router.wan_routing_mode == WanRoutingMode.LOAD_BALANCE.value:
+            raise IspFailoverNotApplicableError(router_id)
         moved = await self._push_preferred_uplink(target, router=router)
 
         if already_failed_over:
@@ -1920,29 +2110,17 @@ class IspService:
         -- once about the failover having worked and once about which
         uplink is live.
 
-        Two signals, both read from the device, neither of which is "the
-        route exists":
-
-        * RouterOS's own ``active`` flag on the target's default route.
-          It goes false the instant that route's ``check-gateway=ping``
-          probe fails, so it distinguishes a configured uplink from a
-          working one. ``disabled`` is checked separately because an
-          administratively-disabled route is a human decision, not a
-          fault, and deserves its own message.
-        * a real ``/tool/ping`` from the router to that route's own next
-          hop. This is the part ``active`` alone cannot give: a route can
-          be freshly added and not yet probed.
+        The check is a real ``/tool/ping`` from the router to the target route's
+        own next hop. ``disabled`` is checked first because an administratively-disabled
+        route is a human decision, not a fault, and deserves its own message.
 
         **What this does not prove**, stated plainly because the whole
         point of this method is not to repeat the mistake it exists to
         prevent: that the ISP beyond that next hop is passing traffic, and
         that a guest on the LAN can reach the internet through it. A
-        first-hop ICMP reply is the strongest evidence obtainable from the
-        router without sourcing a probe from the guest subnet out of this
-        specific uplink, which RouterOS cannot be asked to do while a
-        different route is still preferred. ``active=true``, "the route
-        exists" and "the address is still there" all pass on a router
-        forwarding zero packets.
+        first-hop ICMP reply says only that the modem answers. With
+        ``isp_upstream_probe_enabled`` the sweep has already measured beyond it,
+        and a line failing that check is not offered as a target.
         """
         route = next(route for route in routes if route.interface == interface)
         if route.disabled:
@@ -1950,12 +2128,11 @@ class IspService:
                 link.id,
                 "its default route is administratively disabled on the router",
             )
-        if not route.active:
-            raise IspFailoverTargetUnreachableError(
-                link.id,
-                "RouterOS does not currently consider its default route "
-                "active -- the route's own check-gateway probe is failing",
-            )
+        # No test of `route.active`. RouterOS flags only the preferred route
+        # active, so a working route at a higher distance is not active either
+        # (measured on 7.16.2, CHR), and this method only runs for a target
+        # that is not yet preferred. Testing it refused every failback onto a
+        # recovered primary. The ping below is what measures the line.
         if not route.gateway:
             raise IspFailoverTargetUnreachableError(
                 link.id,
@@ -2075,6 +2252,7 @@ async def run_health_check_sweep(
     audit_writer: AuditLogWriter | None = None,
     device_adapter_resolver=get_isp_health_adapter,
     redis: _RedisProtocol | None = None,
+    upstream_probe_enabled: bool = False,
 ) -> HealthCheckSweepSummary:
     """The platform-wide health-check sweep ``tasks.run_isp_health_check_sweep``
     (Celery Beat) drives -- pulled out to module scope for the identical
@@ -2094,6 +2272,7 @@ async def run_health_check_sweep(
         audit_writer=audit_writer,
         device_adapter_resolver=device_adapter_resolver,
         redis=redis,
+        upstream_probe_enabled=upstream_probe_enabled,
     )
     links = await repository.list_enabled_links_for_sweep()
     checked = 0
@@ -2102,6 +2281,7 @@ async def run_health_check_sweep(
     skipped = 0
     errors = 0
     misconfigured = 0
+    no_reading = 0
     for link in links:
         # Only a STATIC-mode link with no manually-entered gateway has
         # nothing to check at all -- skipped before even trying, exactly
@@ -2122,23 +2302,20 @@ async def run_health_check_sweep(
         try:
             try:
                 ping_result = await service.ping_link(link)
-            except (
-                IspDeviceConnectionError,
-                IspDeviceOperationError,
-                IspHealthCheckTargetUnavailableError,
-            ) as exc:
-                # A router that has gone genuinely unreachable (the exact
-                # case this sweep exists to catch -- confirmed live: a WAN
-                # uplink pulled on the one real test router left this
-                # link's `last_checked_at`/`health_status` frozen at its
-                # last successful check *forever*, since this branch used
-                # to just log-and-skip like the missing-credentials/
-                # unsupported-vendor config-error case below, never
-                # reaching `record_health_check_result` at all -- a link
-                # whose router is completely gone looked identical to one
-                # checked seconds ago and genuinely healthy) is real
-                # information about this link's own health, not a reason
-                # to skip recording anything. Synthesize the worst-case
+            except (IspDeviceConnectionError, IspDeviceOperationError) as exc:
+                # No answer from the router is not a statement about its ISP
+                # -- see IspService.record_no_reading. "Site offline" is the
+                # rule that reports the router itself.
+                logger.warning(
+                    "isp_health_check_no_reading",
+                    extra={"isp_link_id": str(link.id), "error": str(exc)},
+                )
+                await service.record_no_reading(link)
+                no_reading += 1
+                continue
+            except IspHealthCheckTargetUnavailableError as exc:
+                # The router answered and has no usable default route for
+                # this link: real information about the line. Synthesize the worst-case
                 # `PingResult` `classify_health_status` already treats as
                 # `UNHEALTHY` (see its own docstring: a missing reading is
                 # never silently "fine") and let it flow through the exact
@@ -2227,6 +2404,7 @@ async def run_health_check_sweep(
                 "links": len(links),
                 "skipped": skipped,
                 "misconfigured": misconfigured,
+                "no_reading": no_reading,
                 "errors": errors,
             },
         )
@@ -2237,6 +2415,7 @@ async def run_health_check_sweep(
         skipped=skipped,
         errors=errors,
         misconfigured=misconfigured,
+        no_reading=no_reading,
     )
 
 

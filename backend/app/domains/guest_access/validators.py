@@ -117,17 +117,19 @@ def canonicalize_rule_identifier(identifier: str) -> str:
     covers why guessing is worse than refusing.
 
     Email addresses are returned exactly as ``normalize_identifier`` left
-    them (stripped, case preserved). Case-folding them would be a separate,
-    unrelated behaviour change to a column ``Guest.identifier`` compares
-    case-sensitively everywhere else.
+    them: stripped and lower-cased, the same spelling every guest login
+    path now stores (see that function's docstring). Rules written before
+    that change may still hold mixed case; ``identifier_match_terms``
+    marks emails ``casefold`` so the read path compares ``lower()`` and
+    still matches them.
 
-    Deliberately *not* pushed down into
+    The phone-formatting removal is deliberately *not* pushed down into
     ``app.domains.guest.validators.normalize_identifier``: that function is
     also the RADIUS ``authorize``/Accounting-Stop username normalizer
     (``GuestService._find_active_session_for_identifier``) and the guest
-    identity key for every login path. Changing what it returns changes
-    who a live session belongs to, fleet-wide, which is not a change that
-    belongs in a fix to one back-office form.
+    identity key for every login path. Changing what it returns for a
+    phone number changes who a live session belongs to, fleet-wide, which
+    is not a change that belongs in a fix to one back-office form.
     """
     stripped = normalize_identifier(identifier)
     if "@" in stripped:
@@ -183,6 +185,10 @@ class IdentifierMatchTerms:
 
     exact: tuple[str, ...]
     prefix_patterns: tuple[str, ...]
+    #: True for an email address: ``exact`` holds the lower-cased spelling
+    #: and the stored value must be compared as ``lower(identifier)``, so a
+    #: row written as typed before emails were case-folded still matches.
+    casefold: bool = False
 
 
 def identifier_match_terms(identifier: str) -> IdentifierMatchTerms:
@@ -215,9 +221,14 @@ def identifier_match_terms(identifier: str) -> IdentifierMatchTerms:
 
     Non-phone identifiers (emails, anything unparseable) come back as a
     single exact term: this function never widens anything it cannot
-    prove is a phone number.
+    prove is a phone number. Emails additionally carry ``casefold=True``:
+    the term is lower-case and callers compare it to ``lower(stored)``.
     """
     candidate = canonicalize_rule_identifier(identifier)
+    if "@" in candidate:
+        return IdentifierMatchTerms(
+            exact=(candidate,), prefix_patterns=(), casefold=True
+        )
     digits = candidate[1:] if candidate.startswith("+") else candidate
     if not _DIGITS_RE.match(digits) or len(digits) < MIN_NATIONAL_DIGITS:
         return IdentifierMatchTerms(exact=(candidate,), prefix_patterns=())
@@ -252,6 +263,8 @@ def identifiers_match(stored: str, incoming: str) -> bool:
     consumes, which is what keeps the mirror honest.
     """
     terms = identifier_match_terms(incoming)
+    if terms.casefold:
+        return stored.lower() in terms.exact
     if stored in terms.exact:
         return True
     return any(_like_matches(pattern, stored) for pattern in terms.prefix_patterns)

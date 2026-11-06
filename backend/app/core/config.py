@@ -1,5 +1,7 @@
+import uuid
 from functools import lru_cache
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from email_validator import EmailNotValidError, validate_email
 from pydantic import Field, PostgresDsn, RedisDsn, SecretStr, field_validator
@@ -379,12 +381,412 @@ class Settings(BaseSettings):
             "Override via CLOUDGUEST_HUB_RADIUS_PUBLIC_ADDRESS."
         ),
     )
+    hub_radius_aruba_shared_agent_url: str = Field(
+        default="",
+        description=(
+            "Absolute URL of the hub agent's shared-Aruba-listener endpoint "
+            "(radius_agent.py `POST /radius/shared-client`). Empty means this "
+            "deployment has no shared Aruba listener: the Master panel shows "
+            "that as a gap and rotation is refused. Same agent secret as "
+            "hub_radius_agent_url. Override via "
+            "CLOUDGUEST_HUB_RADIUS_ARUBA_SHARED_AGENT_URL."
+        ),
+    )
+    aruba_shared_radius_auth_port: int = Field(
+        default=1912,
+        description="UDP port of the shared Aruba listener's auth side, as "
+        "typed into Instant On's RADIUS profile.",
+    )
+    aruba_shared_radius_acct_port: int = Field(
+        default=1913,
+        description="UDP port of the shared Aruba listener's accounting side.",
+    )
     hub_radius_agent_secret: str = Field(
         default="",
         description=(
             "Shared secret sent as the X-Agent-Secret header to "
             "hub_radius_agent_url. See hub_wg_agent_secret -- same rotation "
             "and fail-closed rules."
+        ),
+    )
+    instant_on_ssid_tier_push_enabled: bool = Field(
+        default=False,
+        description=(
+            "Speed tiers by WiFi network: allow POST /locations/{id}/ssid-tiers"
+            "/instant-on-sync (Master only) to write each mapped SSID's "
+            "per-client speed cap to Aruba Instant On through the cloud-control "
+            "client. OFF by default; the cloud-control gates "
+            "(CLOUDGUEST_INSTANT_ON_CLOUD_CONTROL_*) must ALSO be on for the "
+            "venue. While off, the endpoint returns the manual Instant On steps."
+        ),
+    )
+    radius_bandwidth_attribute_router_ids: str = Field(
+        default="",
+        description=(
+            "Comma-separated router UUIDs of NAS-only access points (Aruba "
+            "Instant On) whose RADIUS Access-Accept should carry "
+            "WISPr-Bandwidth-Max-Down/-Up (vendor 14122, bits/s) from the "
+            "guest's resolved BANDWIDTH policy. An EXPERIMENT GATE, not a "
+            "feature flag: no Aruba documentation says Instant On honours "
+            "these attributes, so they are only sent to the routers named "
+            "here while a hardware measurement decides. Empty (the default) "
+            "sends nothing to anyone. Ignored for every non-NAS-only router, "
+            "so MikroTik and Omada replies are unaffected whatever it holds. "
+            "Deliberately an environment setting and not a routers.settings "
+            "key: routers.settings is writable by a venue owner through "
+            "PUT /routers/{id}. A plain comma-separated string rather than "
+            "list[str] for the reason platform_alert_emails gives; validated "
+            "at startup so a typo stops the process instead of silently "
+            "matching nothing. Override via "
+            "CLOUDGUEST_RADIUS_BANDWIDTH_ATTRIBUTE_ROUTER_IDS."
+        ),
+    )
+
+    isp_upstream_probe_enabled: bool = Field(
+        default=False,
+        description=(
+            "ISP health: also ping public addresses beyond each line's first "
+            "hop, so an ISP outage behind a live modem reads as down. True "
+            "WRITES to MikroTik routers: the health sweep adds comment-tagged "
+            "/32 routes (cloudguest-isp-probe-*) on every router with two or "
+            "more enabled ISP links. False (the default) sends no probe and "
+            "writes nothing."
+        ),
+    )
+    aruba_hybrid_speed_gateway_enabled: bool = Field(
+        default=False,
+        description=(
+            "Aruba AP + MikroTik gateway hybrid: when true, a guest "
+            "authorized by a NAS-only access point (Aruba Instant On) at a "
+            "location whose Master-linked speed gateway is a Wyfy-managed "
+            "MikroTik gets a per-guest /queue simple on that MikroTik, keyed "
+            "on the guest's IP (RADIUS Framed-IP-Address, else the portal's "
+            "recorded IP), and loses it again when the session ends. False "
+            "(the default) means no queue is written or removed anywhere, "
+            "whatever links exist. MikroTik-only and Omada venues are never "
+            "touched by it. See app.domains.queue_management.speed_gateway. "
+            "Override via CLOUDGUEST_ARUBA_HYBRID_SPEED_GATEWAY_ENABLED."
+        ),
+    )
+
+    @field_validator("radius_bandwidth_attribute_router_ids")
+    @classmethod
+    def _normalize_radius_bandwidth_attribute_router_ids(cls, value: str) -> str:
+        """Lower-cased canonical UUIDs, de-duplicated, order-preserving --
+        naming the offending token on a typo."""
+        ids: list[str] = []
+        for token in (value or "").split(","):
+            candidate = token.strip()
+            if not candidate:
+                continue
+            try:
+                normalized = str(uuid.UUID(candidate))
+            except ValueError as exc:
+                raise ValueError(
+                    "radius_bandwidth_attribute_router_ids: "
+                    f"{candidate!r} is not a UUID"
+                ) from exc
+            if normalized not in ids:
+                ids.append(normalized)
+        return ",".join(ids)
+
+    @property
+    def radius_bandwidth_attribute_router_id_set(self) -> frozenset[uuid.UUID]:
+        """``radius_bandwidth_attribute_router_ids`` parsed, for
+        ``RadiusService``'s constructor."""
+        return frozenset(
+            uuid.UUID(token)
+            for token in self.radius_bandwidth_attribute_router_ids.split(",")
+            if token
+        )
+    # ------------------------------------------------------------------
+    # Traffic flow (NetFlow v9 / IPFIX) -- app.domains.traffic_flow.
+    # Design: ~/wyfy-ops/netflow/DESIGN.md. Off by default, so a deploy
+    # changes nothing anywhere. Which routers export is NOT a setting: it is
+    # the per-router switch in router_traffic_flow_export, set from the
+    # Master console.
+    # ------------------------------------------------------------------
+    traffic_flow_enabled: bool = Field(
+        default=False,
+        description=(
+            "Master switch for MikroTik /ip traffic-flow export (IPFIX over "
+            "the WireGuard tunnel to the hub's nfacctd) and for ingesting the "
+            "hub's 5-minute flow windows. False (the default): the generator "
+            "renders no traffic-flow section, the Master apply endpoint "
+            "refuses, and the pull sweep returns without a network call. "
+            "Override via CLOUDGUEST_TRAFFIC_FLOW_ENABLED."
+        ),
+    )
+    traffic_flow_collector_port: int = Field(
+        default=2055,
+        ge=1,
+        le=65535,
+        description=(
+            "UDP port nfacctd listens on at the hub's TUNNEL address (the "
+            "collector address itself is derived from the router's WireGuard "
+            "server, never configured by hand). Override via "
+            "CLOUDGUEST_TRAFFIC_FLOW_COLLECTOR_PORT."
+        ),
+    )
+    traffic_flow_agent_url: str = Field(
+        default="",
+        description=(
+            "Base URL of ops/hub-agents/flow_agent.py on the hub's PRIVATE "
+            "address, e.g. http://<hub-private-ip>:9094 . Empty = not deployed: "
+            "the overview says so instead of showing an empty table. Override "
+            "via CLOUDGUEST_TRAFFIC_FLOW_AGENT_URL."
+        ),
+    )
+    traffic_flow_agent_secret: str = Field(
+        default="",
+        description=(
+            "X-Agent-Secret for traffic_flow_agent_url; must equal "
+            "FLOW_AGENT_SECRET in the hub's /etc/wyfy/hub-agents.env. Empty "
+            "fails closed (the agent rejects it too). Override via "
+            "CLOUDGUEST_TRAFFIC_FLOW_AGENT_SECRET."
+        ),
+    )
+    traffic_flow_records_enabled: bool = Field(
+        default=False,
+        description=(
+            "Second switch, on top of traffic_flow_enabled: store per-flow "
+            "records (source and destination address and port, protocol, NAT "
+            "translation, bytes, packets) for routers whose export is on, "
+            "for the Master console's flow table. False (the default): no "
+            "flow record is written anywhere; the aggregate tables are not "
+            "affected. A row puts a device beside the address it reached, so "
+            "this is an owner decision per environment and needs the legal "
+            "review in the flow-visibility research notes before a real "
+            "venue. Override via CLOUDGUEST_TRAFFIC_FLOW_RECORDS_ENABLED."
+        ),
+    )
+    traffic_flow_record_retention_days: int = Field(
+        default=7,
+        ge=1,
+        le=7,
+        description=(
+            "Days a flow record is kept before the pull sweep deletes it, "
+            "and the oldest a flow search may reach. Operations data: never "
+            "to be described as a CERT-In or legal log. Override via "
+            "CLOUDGUEST_TRAFFIC_FLOW_RECORD_RETENTION_DAYS."
+        ),
+    )
+    traffic_flow_record_daily_cap: int = Field(
+        default=100_000,
+        ge=0,
+        description=(
+            "Flow records stored per router per UTC day. When a router "
+            "reaches it, flow records stop for that router until the next "
+            "day (rollups continue), the moment is stored, and every flow "
+            "search says 'records incomplete since ...'. Counts rows as "
+            "STORED, i.e. after merging and after internal records are left "
+            "out. About 307 bytes a row with indexes (measured), so the "
+            "default is at most 31 MB per router per day and 215 MB at 7 days. "
+            "0 stores nothing. Override via "
+            "CLOUDGUEST_TRAFFIC_FLOW_RECORD_DAILY_CAP."
+        ),
+    )
+    traffic_flow_platform_addresses: str = Field(
+        default="",
+        description=(
+            "NORMALLY EMPTY: an override. "
+            "Comma-separated IP addresses of the platform's WireGuard hub, in "
+            "ADDITION to the wireguard_servers.endpoint_host values. A "
+            "router's own traffic to the hub (its management tunnel) is "
+            "platform overhead and is kept out of every venue's traffic "
+            "figures; it is recognised by address and port, never by port "
+            "alone. A hub stored as a hostname is resolved by the pull sweep "
+            "and kept up to date (Master /status shows the age), so this is "
+            "needed only when the hub is reached through an address its name "
+            "does not resolve to. A value left here does NOT follow a change "
+            "of the hub's address. Empty (the default) uses the table and "
+            "the resolved names. Override via "
+            "CLOUDGUEST_TRAFFIC_FLOW_PLATFORM_ADDRESSES."
+        ),
+    )
+    traffic_flow_record_store_internal: bool = Field(
+        default=False,
+        description=(
+            "Also store flow records whose two ends are both inside the venue "
+            "(a device asking the router's own DNS, router chatter). False "
+            "(the default): they are counted and reported as not stored. "
+            "Measured on one small venue they were 38% of all records, none "
+            "of them traffic to the outside. Override via "
+            "CLOUDGUEST_TRAFFIC_FLOW_RECORD_STORE_INTERNAL."
+        ),
+    )
+    traffic_flow_record_merge_ports: bool = Field(
+        default=True,
+        description=(
+            "Within one 5-minute window, merge flow records that differ only "
+            "in the venue-side (ephemeral) port into one row with summed "
+            "bytes, packets and flows; that port is then not kept. Records "
+            "identical in every address and port are always merged. False: "
+            "only identical ones are. Measured on one small venue, 3,183 of "
+            "5,183 records in a window were one- or two-packet answers from "
+            "62 outside addresses to ever-changing local ports. Override via "
+            "CLOUDGUEST_TRAFFIC_FLOW_RECORD_MERGE_PORTS."
+        ),
+    )
+    traffic_flow_ipfix_nat_events: bool = Field(
+        default=False,
+        description=(
+            "Also export IPFIX NAT events (nat-events=yes plus nat-dst-*, "
+            "template 260) from routers whose traffic-flow export is on, for "
+            "the IPDR's Translated IP/Port. False (the default): the IPFIX "
+            "field set is unchanged. Unmeasured on the RouterOS 7 fleet: "
+            "turn on for a lab router first (~/wyfy-ops/ipdr/NAT-RESEARCH.md "
+            "section 6). Changing it re-templates every exporter. Override "
+            "via CLOUDGUEST_TRAFFIC_FLOW_IPFIX_NAT_EVENTS."
+        ),
+    )
+    ipdr_enabled: bool = Field(
+        default=False,
+        description=(
+            "Run the nightly IPDR builder (closed IST days within flow-record "
+            "retention -> one archived day file per location). The IPDR list "
+            "and export read whatever exists either way. Override via "
+            "CLOUDGUEST_IPDR_ENABLED."
+        ),
+    )
+    ipdr_archive_bucket: str = Field(
+        default="",
+        description=(
+            "S3 bucket for IPDR day files (the 2-year Object-Locked netlogs "
+            "archive). Empty: day files go to ipdr_local_dir. Credentials are "
+            "the instance role's (boto3 default chain), never the MinIO keys. "
+            "Override via CLOUDGUEST_IPDR_ARCHIVE_BUCKET."
+        ),
+    )
+    ipdr_archive_region: str = Field(
+        default="ap-south-1",
+        description="Region of ipdr_archive_bucket. CLOUDGUEST_IPDR_ARCHIVE_REGION.",
+    )
+    ipdr_archive_prefix: str = Field(
+        default="ipdr/",
+        description=(
+            "Key prefix of IPDR day files; the IAM policy and the lifecycle "
+            "rule are written for ipdr/. CLOUDGUEST_IPDR_ARCHIVE_PREFIX."
+        ),
+    )
+    ipdr_local_dir: str = Field(
+        default="var/ipdr",
+        description=(
+            "Directory for IPDR day files when ipdr_archive_bucket is empty "
+            "(dev/staging). CLOUDGUEST_IPDR_LOCAL_DIR."
+        ),
+    )
+    ipdr_session_grace_seconds: int = Field(
+        default=120,
+        ge=0,
+        le=3600,
+        description=(
+            "A flow up to this long after a guest session's end still belongs "
+            "to that session (accounting lag). "
+            "CLOUDGUEST_IPDR_SESSION_GRACE_SECONDS."
+        ),
+    )
+    traffic_flow_geo_data_dir: str = Field(
+        default="",
+        description=(
+            "Directory holding the DB-IP Lite country and ASN files "
+            "(dbip-country-lite.mmdb, dbip-asn-lite.mmdb) for Traffic Lens "
+            "Geo Location. Empty = <backend>/data/geo, where "
+            "scripts/fetch_geo_data.py puts them at image build. Missing "
+            "files are not an error: ingest writes no country rows and the "
+            "API answers geo_available=false. Override via "
+            "CLOUDGUEST_TRAFFIC_FLOW_GEO_DATA_DIR."
+        ),
+    )
+    traffic_flow_threat_data_dir: str = Field(
+        default="",
+        description=(
+            "Directory holding the Spamhaus DROP files (drop_v4.json, "
+            "drop_v6.json) the Traffic Lens 'known-bad destinations' finding "
+            "matches against. Empty = <backend>/data/threat, where "
+            "scripts/fetch_threat_data.py puts them at image build. Missing, "
+            "unreadable or out-of-date files are not an error: the finding "
+            "answers could_not_check, never clear. Override via "
+            "CLOUDGUEST_TRAFFIC_FLOW_THREAT_DATA_DIR."
+        ),
+    )
+
+    # -- Device Logs (syslog) -- see app.domains.device_logs ---------------
+    device_logs_enabled: bool = Field(
+        default=False,
+        description=(
+            "Device Logs master switch: the collector's ingest endpoint "
+            "accepts batches, the Master log viewer shows data, and Master "
+            "may write/remove remote logging on a MikroTik over the API. "
+            "False (the default) means the ingest endpoint answers 404, the "
+            "viewer reports the feature as switched off, and no router is "
+            "ever written. Override via CLOUDGUEST_DEVICE_LOGS_ENABLED."
+        ),
+    )
+    device_logs_ingest_secret: str = Field(
+        default="",
+        description=(
+            "Shared secret the syslog collector (Vector) sends as the "
+            "X-Device-Logs-Secret header. Empty means the ingest endpoint "
+            "refuses every batch even with device_logs_enabled on -- fail "
+            "closed, never 'no secret configured, so anyone may post'. "
+            "Override via CLOUDGUEST_DEVICE_LOGS_INGEST_SECRET."
+        ),
+    )
+    device_logs_remote_host: str = Field(
+        default="",
+        description=(
+            "Address routers send syslog to. Empty (the default) means the "
+            "hub's own tunnel address, derived per router from its WireGuard "
+            "server's tunnel_network_cidr -- the only address a router's "
+            "/32 allowed-address lets into the tunnel. Override via "
+            "CLOUDGUEST_DEVICE_LOGS_REMOTE_HOST."
+        ),
+    )
+    device_logs_remote_port: int = Field(
+        default=514,
+        ge=1,
+        le=65535,
+        description=(
+            "UDP port on the hub routers send syslog to. The hub DNATs it to "
+            "the environment's collector, so staging uses its own port "
+            "(5140) on the shared hub. Override via "
+            "CLOUDGUEST_DEVICE_LOGS_REMOTE_PORT."
+        ),
+    )
+    device_logs_firewall_logging_enabled: bool = Field(
+        default=False,
+        description=(
+            "Platform switch for firewall logging into NetLogs: rate-limited "
+            "action=log rows (log-prefix WYFY-FW) directly above Wyfy's own "
+            "forward-chain drop rows, on routers a Master turned it on for. "
+            "Needs device_logs_enabled too. False (the default) means no "
+            "router gets those rows, and a router that has them loses them "
+            "on its next firewall or remote-logging write. Override via "
+            "CLOUDGUEST_DEVICE_LOGS_FIREWALL_LOGGING_ENABLED."
+        ),
+    )
+    device_logs_retention_months: int = Field(
+        default=24,
+        ge=1,
+        le=120,
+        description=(
+            "How many whole months of device_log_events (one monthly "
+            "partition each) the nightly partition-maintenance task keeps. "
+            "A partition whose entire range is older than this many months "
+            "before the current month is dropped. Override via "
+            "CLOUDGUEST_DEVICE_LOGS_RETENTION_MONTHS."
+        ),
+    )
+    device_logs_partitions_ahead: int = Field(
+        default=3,
+        ge=1,
+        le=24,
+        description=(
+            "How many future monthly partitions of device_log_events the "
+            "maintenance task keeps created ahead of time, so ingest never "
+            "lands in the DEFAULT partition while beat is healthy. Override "
+            "via CLOUDGUEST_DEVICE_LOGS_PARTITIONS_AHEAD."
         ),
     )
     # ------------------------------------------------------------------
@@ -464,9 +866,9 @@ class Settings(BaseSettings):
         default="2c",
         description=(
             'Platform-wide default SNMP protocol version ("1" or '
-            '"2c" -- see wyfy_device_gateway.snmp_poller\'s own module '
-            "docstring for why SNMPv3 is out of scope), used when a "
-            "router has no per-router Router.snmp_version override."
+            '"2c"), used when a router has no per-router '
+            "Router.snmp_version override. SNMPv3 is per-router only "
+            "(it needs per-router USM credentials)."
         ),
     )
     snmp_default_port: int = Field(
@@ -477,6 +879,22 @@ class Settings(BaseSettings):
             "Platform-wide default SNMP agent UDP port (161 is the real "
             "IANA-assigned SNMP port), used when a router has no "
             "per-router Router.snmp_port override."
+        ),
+    )
+    snmp_poller_source_addresses: str = Field(
+        default="172.31.38.118/32",
+        description=(
+            "Comma-separated CIDRs the platform's SNMP poller sends from, as "
+            "the ROUTER sees them -- written into the RouterOS "
+            "'/snmp community addresses=' of the read-only community the "
+            "platform installs (app.domains.router.snmp). The worker reaches "
+            "routers over the VPC route 10.20.0.0/24 -> hub ENI -> wg0 with "
+            "no NAT (the router's hub peer allowed-address carries "
+            "172.31.0.0/16 for exactly this), so the source is the worker "
+            "host's VPC address: prod wyfy-app-server 172.31.38.118 as of "
+            "2026-10-06. Staging (172.31.45.127) must override this via "
+            "CLOUDGUEST_SNMP_POLLER_SOURCE_ADDRESSES. Never empty: RouterOS "
+            "reads an empty addresses= as 'any address'."
         ),
     )
     snmp_poll_timeout_seconds: int = Field(
@@ -1868,6 +2286,117 @@ class Settings(BaseSettings):
     # ------------------------------------------------------------------
     # Slack: Master-console onboarding status posts
     # ------------------------------------------------------------------
+    # Opening the hotspot gate at sign-in (app.domains.guest.hotspot_gate).
+    #
+    # After a successful login at a platform-managed MikroTik, a worker
+    # task adds the same `/ip hotspot ip-binding type=bypassed
+    # comment=cloudguest-authmac` row the router's own one-minute
+    # authorized-MAC poll would add, so the guest is not left without
+    # internet until that poll comes round.
+    #
+    # OFF BY DEFAULT, and that is a statement about evidence, not about the
+    # code: this is a device write on every login, and at the time it was
+    # written it had run against a fake RouterOS API only. Merging it
+    # changes nothing on any router until one of these is set:
+    #
+    #   CLOUDGUEST_GUEST_HOTSPOT_GATE_PUSH_ROUTER_IDS=<uuid>[,<uuid>...]
+    #       only these routers -- the way to watch it on one device first;
+    #   CLOUDGUEST_GUEST_HOTSPOT_GATE_PUSH_ENABLED=true
+    #       every platform-managed MikroTik.
+    #
+    # With neither, nothing is enqueued, which is exactly the behaviour
+    # before this existed (the router's poll opens the gate within a
+    # minute).
+    #
+    # `delay_seconds` is deliberate, not slack. The portal opens the gate
+    # itself where it can: straight after login the guest's browser posts
+    # to the router's own hotspot login URL, and RouterOS asks RADIUS. A
+    # binding that lands BEFORE that post turns the device into a bypassed
+    # host, and a bypassed host's post is no longer answered by the hotspot
+    # at all; one that lands AFTER a successful post is skipped, because
+    # the MAC is then a live hotspot session. The delay lets the browser go
+    # first. Zero is allowed and means "immediately". It is counted from
+    # the latest request that asked for the push for that session (sign-in,
+    # then the name screen where a venue has one), not from the first.
+    #
+    # The same two switches cover the push for a device an admin has just
+    # marked Trusted; that one has no browser to wait for and no delay.
+    guest_hotspot_gate_push_enabled: bool = False
+    guest_hotspot_gate_push_router_ids: str = ""
+    guest_hotspot_gate_push_delay_seconds: float = Field(default=3.0, ge=0, le=30)
+
+    # Taking a session bypass back off the router
+    # (app.domains.guest.hotspot_binding_reconcile).
+    #
+    # The other half of the above. The router's own authorized-MAC script
+    # is meant to remove its `cloudguest-authmac` binding once a MAC is no
+    # longer listed, and on every router provisioned before that pass was
+    # repaired it never does -- so a disconnected guest, a blocked guest
+    # and a deleted Trusted Device all stay online until somebody removes
+    # the row by hand. With this on, a worker removes those rows over the
+    # RouterOS API: shortly after a session ends, a block or a Trusted
+    # Device change, and on a periodic sweep as the net. It runs on a
+    # router whose scheduler is disabled or missing too; that is where
+    # nothing else ever would.
+    #
+    # OFF BY DEFAULT for the same reason the push is: it removes rows on
+    # real routers, and at the time it was written it had run against a
+    # fake RouterOS API only. Merging it changes nothing until one of
+    # these is set:
+    #
+    #   CLOUDGUEST_GUEST_HOTSPOT_GATE_REMOVE_ROUTER_IDS=<uuid>[,<uuid>...]
+    #       only these routers;
+    #   CLOUDGUEST_GUEST_HOTSPOT_GATE_REMOVE_ENABLED=true
+    #       every platform-managed MikroTik.
+    #
+    # `delay_seconds`: how long after the event the event-driven run
+    #   starts. It has to be long enough for the request that ended the
+    #   session to have committed, and is also the window in which several
+    #   endings at one venue become one run.
+    # `max_per_run`: the most rows one run removes from one router. A
+    #   defect that made every guest look unlisted would otherwise empty a
+    #   venue in one pass; hitting the cap logs at ERROR and the rest wait
+    #   for the next run. Zero removes nothing (a dry run that still logs
+    #   what it would have judged stale).
+    # `drop_host`: after removing a binding, also remove the device's
+    #   `/ip hotspot host` row if it STILL reads bypassed. Whether RouterOS
+    #   drops that row by itself is not established on hardware; without
+    #   this, a router that does not would keep forwarding for the device
+    #   until the host times out. Set false to remove bindings only.
+    guest_hotspot_gate_remove_enabled: bool = False
+    guest_hotspot_gate_remove_router_ids: str = ""
+    guest_hotspot_gate_remove_delay_seconds: float = Field(default=5.0, ge=0, le=120)
+    guest_hotspot_gate_remove_max_per_run: int = Field(default=20, ge=0, le=500)
+    guest_hotspot_gate_remove_drop_host: bool = True
+
+    # Giving a queue to a live session that never got one
+    # (QueueManagementService.backfill_queues_for_unassigned_sessions).
+    #
+    # A login hands its speed-limit queue to a worker task. If the router
+    # does not answer, that task retries three times and gives up, and the
+    # guest then runs unlimited for the rest of the session: nothing came
+    # back for them, not even a policy publish. With this on, a periodic
+    # sweep (and each bandwidth-policy publish, for its own locations) puts
+    # such a session through the same assignment a login uses.
+    #
+    # OFF BY DEFAULT for the reason the two switches above are: it writes
+    # rows on real routers, on its own initiative, and at the time it was
+    # written it had run against a fake RouterOS API only. Its first run
+    # also acts on every session that is unassigned today, not just new
+    # ones. Merging it changes nothing until one of these is set:
+    #
+    #   CLOUDGUEST_GUEST_QUEUE_BACKFILL_ROUTER_IDS=<uuid>[,<uuid>...]
+    #       only these routers -- the way to watch it on one device first;
+    #   CLOUDGUEST_GUEST_QUEUE_BACKFILL_ENABLED=true
+    #       every router this platform logs in to. The allow-list only
+    #       matters while this is false.
+    #
+    # `max_per_run`: the most sessions one run tries to write a queue for.
+    #   Zero writes nothing.
+    guest_queue_backfill_enabled: bool = False
+    guest_queue_backfill_router_ids: str = ""
+    guest_queue_backfill_max_per_run: int = Field(default=25, ge=0, le=500)
+
     # One incoming-webhook URL, one internal ops channel. This is NOT a
     # per-tenant setting and deliberately has no database column and no
     # customer-facing UI: the messages describe Master/GLOBAL-scope
@@ -1916,6 +2445,58 @@ class Settings(BaseSettings):
             "sweep worker open indefinitely."
         ),
     )
+    # -- Sales-automation webhook (app.domains.notification.sales_webhook) --
+    #
+    # Demo-request / demo-booking lifecycle events POSTed to the sales
+    # team's workflow automation. OFF by default; inert unless all three of
+    # enabled/url/secret are set. URL and secret are credentials: never
+    # committed, never written to the database, never logged.
+    sales_webhook_enabled: bool = Field(
+        default=False,
+        description=(
+            "Master switch for the sales-automation webhook. False (the "
+            "default) writes no outbox rows and changes nothing."
+        ),
+    )
+    sales_webhook_url: str = Field(
+        default="",
+        description=(
+            "Endpoint demo_request.created / demo_booking.* events are "
+            "POSTed to. https:// required (http:// is accepted for "
+            "localhost/127.0.0.1 only, for local testing). Set via "
+            "CLOUDGUEST_SALES_WEBHOOK_URL -- never commit it."
+        ),
+    )
+    sales_webhook_secret: str = Field(
+        default="",
+        description=(
+            "Shared secret sent in the X-Wyfy-Webhook-Secret header on every "
+            "sales-automation webhook POST. Set via "
+            "CLOUDGUEST_SALES_WEBHOOK_SECRET -- never commit it."
+        ),
+    )
+    sales_webhook_timeout_seconds: float = Field(
+        default=10.0,
+        ge=1.0,
+        le=60.0,
+        description="Per-request timeout for one sales-automation webhook POST.",
+    )
+
+    @field_validator("sales_webhook_url")
+    @classmethod
+    def _validate_sales_webhook_url(cls, value: str) -> str:
+        url = (value or "").strip()
+        if not url or url.startswith("https://"):
+            return url
+        if url.startswith("http://"):
+            host = urlsplit(url).hostname or ""
+            if host in {"localhost", "127.0.0.1", "::1"}:
+                return url
+        raise ValueError(
+            "sales_webhook_url must start with https:// "
+            "(http:// is allowed for localhost only)"
+        )
+
     # -- Cloudflare Gateway DNS filtering (app.domains.dns_filtering) ------
     #
     # One platform-owned Cloudflare account; this platform is the operator
@@ -2250,6 +2831,152 @@ class Settings(BaseSettings):
         ),
     )
     instant_on_max_sites_per_run: int = Field(default=200, ge=1, le=5000)
+    # ------------------------------------------------------------------
+    # Aruba Instant On CLOUD CONTROL (writes through the unofficial portal
+    # API): block/unblock a guest device, "disconnect" = block + timed
+    # unblock, and the guest SSID's per-client speed cap. See
+    # app/domains/network_integration/instant_on_control.py and
+    # wyfy-ops/aruba-ap21/INSTANT_ON_CLOUD_CONTROL.md. OFF by default and
+    # gated twice: the global switch AND the router allowlist below.
+    # ------------------------------------------------------------------
+    instant_on_cloud_control_enabled: bool = Field(
+        default=False,
+        description=(
+            "Global switch for writes to Instant On. False (the default) "
+            "means no Instant On write is ever attempted, whatever the "
+            "allowlist holds, and NAS-only venues behave exactly as before "
+            "(no mid-session disconnect). Override via "
+            "CLOUDGUEST_INSTANT_ON_CLOUD_CONTROL_ENABLED."
+        ),
+    )
+    instant_on_network_total_write_enabled: bool = Field(
+        default=False,
+        description=(
+            "Lets a venue set a network-wide total speed on an Instant On guest "
+            "network, on top of the cloud-control gates. Off by default: this "
+            "write's body comes from a read of the portal, and no such write has "
+            "been sent yet. Override via "
+            "CLOUDGUEST_INSTANT_ON_NETWORK_TOTAL_WRITE_ENABLED."
+        ),
+    )
+    instant_on_cloud_control_router_ids: str = Field(
+        default="",
+        description=(
+            "Comma-separated router UUIDs (NAS-only Aruba Instant On fleet "
+            "rows) that may be written to. Environment-only for the reason "
+            "radius_bandwidth_attribute_router_ids gives. Override via "
+            "CLOUDGUEST_INSTANT_ON_CLOUD_CONTROL_ROUTER_IDS."
+        ),
+    )
+    instant_on_control_secret_arn: str = Field(
+        default="",
+        description=(
+            "ARN of the Secrets Manager secret ({\"username\", \"password\"}) "
+            "of the Instant On service account used for WRITES. It must be "
+            "invited to the venue's site with a management role that can "
+            "write (not Viewer). Kept separate from the poller's Viewer "
+            "account on purpose. Override via "
+            "CLOUDGUEST_INSTANT_ON_CONTROL_SECRET_ARN."
+        ),
+    )
+    instant_on_control_secret_arns_by_router: str = Field(
+        default="",
+        description=(
+            "Optional per-venue override: comma-separated "
+            "'<router uuid>=<secret arn>' pairs, so each venue can use its "
+            "own service account (own token row, own blast radius). A router "
+            "not named here uses instant_on_control_secret_arn. Override via "
+            "CLOUDGUEST_INSTANT_ON_CONTROL_SECRET_ARNS_BY_ROUTER."
+        ),
+    )
+    instant_on_disconnect_check_enabled: bool = Field(
+        default=True,
+        description=(
+            "After a timed Instant On disconnect, read clientSummary a few times "
+            "and log instant_on_disconnect_check. Read-only evidence; never "
+            "affects the block or the unblock."
+        ),
+    )
+    instant_on_disconnect_check_max_per_hour: int = Field(
+        default=6,
+        ge=0,
+        le=60,
+        description=(
+            "How many disconnects per Instant On site per hour get those reads "
+            "(four reads each)."
+        ),
+    )
+    instant_on_disconnect_hold_seconds: int = Field(
+        default=30,
+        ge=5,
+        le=600,
+        description=(
+            "How long a 'disconnect' keeps the device on Instant On's "
+            "blocked list before the timed unblock. Long enough for the AP "
+            "to drop the client, short enough that the guest's next attempt "
+            "lands on the portal (which then decides)."
+        ),
+    )
+
+    @field_validator("instant_on_cloud_control_router_ids")
+    @classmethod
+    def _normalize_instant_on_cloud_control_router_ids(cls, value: str) -> str:
+        ids: list[str] = []
+        for token in (value or "").split(","):
+            candidate = token.strip()
+            if not candidate:
+                continue
+            try:
+                normalized = str(uuid.UUID(candidate))
+            except ValueError as exc:
+                raise ValueError(
+                    "instant_on_cloud_control_router_ids: "
+                    f"{candidate!r} is not a UUID"
+                ) from exc
+            if normalized not in ids:
+                ids.append(normalized)
+        return ",".join(ids)
+
+    @field_validator("instant_on_control_secret_arns_by_router")
+    @classmethod
+    def _validate_instant_on_control_secret_arns_by_router(cls, value: str) -> str:
+        pairs: list[str] = []
+        for token in (value or "").split(","):
+            candidate = token.strip()
+            if not candidate:
+                continue
+            router, sep, arn = candidate.partition("=")
+            if not sep or not arn.strip().startswith("arn:"):
+                raise ValueError(
+                    "instant_on_control_secret_arns_by_router: each entry must "
+                    "be '<router uuid>=<secret arn>'"
+                )
+            try:
+                normalized = str(uuid.UUID(router.strip()))
+            except ValueError as exc:
+                raise ValueError(
+                    "instant_on_control_secret_arns_by_router: "
+                    f"{router.strip()!r} is not a UUID"
+                ) from exc
+            pairs.append(f"{normalized}={arn.strip()}")
+        return ",".join(pairs)
+
+    @property
+    def instant_on_cloud_control_router_id_set(self) -> frozenset[uuid.UUID]:
+        return frozenset(
+            uuid.UUID(token)
+            for token in self.instant_on_cloud_control_router_ids.split(",")
+            if token
+        )
+
+    def instant_on_control_secret_arn_for(self, router_id: uuid.UUID) -> str:
+        """The write account for this router: its own override, else the
+        default write account. Empty means not configured."""
+        for pair in self.instant_on_control_secret_arns_by_router.split(","):
+            router, _, arn = pair.partition("=")
+            if router and router == str(router_id):
+                return arn
+        return self.instant_on_control_secret_arn
     omada_allow_private_controller_urls: bool = Field(
         default=False,
         description=(

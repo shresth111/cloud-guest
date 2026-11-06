@@ -109,6 +109,24 @@ mirroring `device_adapters._burst_fields`'s own "all or nothing"
 convention -- no fake zero-value placeholders in the common
 "no burst, custom priority" case.
 
+**The attribute is the fallback, not a second limit.** RouterOS turns it
+into a dynamic `<hotspot-...>` simple queue that is placed first and keeps
+its login-time rate, so `rate_limit_reply_for_authorize` sends it only
+where it would be the guest's only limit: never while this platform's own
+`cloudguest-<assignment id>` row is on the router (assignment `ACTIVE` with
+a device queue id), the assignment's rate while its row is not on the
+router, and the bandwidth policy's rate for a session that has no
+assignment at all once it is older than
+`RADIUS_RATE_FALLBACK_MIN_SESSION_AGE_SECONDS`. One row per guest is what
+makes a changed rule reach a RADIUS-logged-in guest and a bypass-admitted
+one alike.
+
+**One per-guest row per address on the device.** A guest session's row is
+created with `supersede_name_prefix`: once it is on the router, every other
+static `cloudguest-<uuid>` row for exactly that address is removed in the
+same connection, so a row a failed removal left behind (an unlimited `0/0`
+one after *limit -> no limit -> limit*) cannot govern.
+
 ## 6. Time-based policies: `PENDING`/`ACTIVE` <-> `SUSPENDED`, and a real
 ## background sweep
 

@@ -53,6 +53,8 @@ from __future__ import annotations
 import dataclasses
 import logging
 import uuid
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from typing import Any, Protocol
 
@@ -244,6 +246,16 @@ class AuditLogWriter(Protocol):
     async def create_audit_log_entry(self, **fields: object) -> object: ...
 
 
+class FirewallWriteListener(Protocol):
+    """Told after every write of a router's ``chain=forward`` (success or
+    failure), while the router's lock is still held. Satisfied by
+    ``DeviceLogsService.after_firewall_write``, which re-places the
+    rate-limited ``WYFY-FW`` log rows above Wyfy's drops on routers that
+    have firewall logging on. Must not raise."""
+
+    async def after_firewall_write(self, router_id: uuid.UUID) -> None: ...
+
+
 class FirewallService:
     """Core Firewall Rule Management business logic."""
 
@@ -255,10 +267,12 @@ class FirewallService:
         audit_writer: AuditLogWriter | None = None,
         caller_location_scope: LocationScope = None,
         redis: Any | None = None,
+        write_listener: FirewallWriteListener | None = None,
     ) -> None:
         self.repository = repository
         self.router_lookup = router_lookup
         self.audit_writer = audit_writer
+        self._write_listener = write_listener
         # Backs the per-router forward-chain lock. Optional at the type level
         # only so unit tests can build the service without Redis (no lock is
         # taken then), exactly as NetworkDiagnosticsService does; the FastAPI
@@ -545,7 +559,7 @@ class FirewallService:
         adapter = get_firewall_adapter(router.vendor)
         # Taken after every precondition, so a 4xx that names the problem is
         # never masked by a 409; held through the failure-record commit.
-        async with self._router_lock(router.id):
+        async with self._router_write(router.id):
             known_ids = await self.repository.list_rule_ids_for_router(router.id)
 
             try:
@@ -636,7 +650,7 @@ class FirewallService:
         ensure_not_controller_managed(router, feature=_FEATURE_NAME)
         credentials = self._resolve_device_credentials(router)
         adapter = get_firewall_adapter(router.vendor)
-        async with self._router_lock(router.id):
+        async with self._router_write(router.id):
             result = await adapter.install_firewall_band(credentials)
 
         event = FirewallBandInstalled(router_id=router.id, created=result.created)
@@ -748,7 +762,7 @@ class FirewallService:
         router = await self._flood_router(router_id, requesting_organization_id)
         credentials = self._resolve_device_credentials(router)
         adapter = get_firewall_adapter(router.vendor)
-        async with self._router_lock(router.id):
+        async with self._router_write(router.id):
             if preset is FloodLimitPreset.OFF:
                 result = await adapter.remove_flood_limit(credentials)
             else:
@@ -838,7 +852,7 @@ class FirewallService:
         router = await self._flood_router(router_id, requesting_organization_id)
         credentials = self._resolve_device_credentials(router)
         adapter = get_firewall_adapter(router.vendor)
-        async with self._router_lock(router.id):
+        async with self._router_write(router.id):
             if enabled:
                 result = await adapter.apply_guest_isolation(credentials)
             else:
@@ -940,6 +954,20 @@ class FirewallService:
             busy_error=lambda: FirewallPushInProgressError(router_id),
         )
 
+    @asynccontextmanager
+    async def _router_write(self, router_id: uuid.UUID) -> AsyncIterator[None]:
+        """The router's lock around one write of its forward chain, then --
+        still under the lock, whether the write succeeded or not -- the
+        write listener, so rows that must sit next to ours (firewall
+        logging) are re-placed against what the chain now holds. The
+        listener never raises, so it cannot replace the write's outcome."""
+        async with self._router_lock(router_id):
+            try:
+                yield
+            finally:
+                if self._write_listener is not None:
+                    await self._write_listener.after_firewall_write(router_id)
+
     @staticmethod
     def _to_config(rule: FirewallRule) -> FirewallFilterRuleConfig:
         return FirewallFilterRuleConfig(
@@ -992,6 +1020,7 @@ class FirewallService:
 __all__ = [
     "RouterLookupProtocol",
     "AuditLogWriter",
+    "FirewallWriteListener",
     "FirewallBandState",
     "FirewallPushOutcome",
     "FloodLimitState",

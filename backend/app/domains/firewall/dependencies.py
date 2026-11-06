@@ -11,8 +11,11 @@ from fastapi import Depends
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import get_settings
 from app.database.redis import get_redis_client
 from app.database.session import get_db_session
+from app.domains.device_logs.repository import DeviceLogsRepository
+from app.domains.device_logs.service import DeviceLogsService
 from app.domains.rbac.dependencies import get_rbac_repository
 from app.domains.rbac.location_scope import CallerLocationScope, LocationScope
 from app.domains.rbac.repository import RBACRepositoryProtocol
@@ -37,6 +40,7 @@ def get_firewall_service(
     # The per-router forward-chain lock (app.common.router_firewall_lock) --
     # the same app.database.redis singleton every other Redis user here takes.
     redis: Redis = Depends(get_redis_client),
+    db: AsyncSession = Depends(get_db_session),
 ) -> FirewallService:
     return FirewallService(
         repository,
@@ -44,6 +48,11 @@ def get_firewall_service(
         audit_writer=audit_repository,
         caller_location_scope=caller_location_scope,
         redis=redis,
+        # Re-places firewall-logging rows (WYFY-FW) after every forward-chain
+        # write; a router without firewall logging costs one DB read.
+        write_listener=DeviceLogsService(
+            DeviceLogsRepository(db), get_settings(), redis=redis
+        ),
     )
 
 

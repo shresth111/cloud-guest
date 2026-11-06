@@ -121,13 +121,24 @@ def get_block_enforcer(
 
 def get_device_blocker(
     router_service: RouterService = Depends(get_router_service),
+    db: AsyncSession = Depends(get_db_session),
 ) -> DeviceBlockerProtocol:
     """Writes ``BLOCKLIST`` device rules to the venue's MikroTik routers as
     ``/ip hotspot ip-binding type=blocked`` (``device_blocking``). Composes
     the request's own ``RouterService`` -- the same graph the guest-rule
     enforcer above uses -- for the router list and the decrypted API
-    secret."""
-    return RouterDeviceBlocker(router_lookup=router_service)
+    secret.
+
+    An Aruba Instant On router in scope is not a RouterOS one: its leg is a
+    persistent Instant On MAC block through the cloud (read back), live only
+    when Instant On cloud control is switched on for it."""
+    from app.domains.network_integration.client_hooks import (
+        build_instant_on_device_blocker,
+    )
+
+    return RouterDeviceBlocker(
+        router_lookup=router_service, nas_only=build_instant_on_device_blocker(db)
+    )
 
 
 def get_guest_access_service(

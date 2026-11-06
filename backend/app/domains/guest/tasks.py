@@ -44,6 +44,7 @@ bridge, call the plain task function directly" contract
 
 from __future__ import annotations
 
+import time
 import uuid
 from datetime import UTC, datetime
 
@@ -63,32 +64,62 @@ from app.domains.organization.service import OrganizationService
 from app.domains.policy.repository import PolicyRepository
 from app.domains.policy.service import PolicyService
 from app.domains.queue_management.constants import QueueTargetType
+from app.domains.queue_management.exceptions import QueueTargetNotOnRouterError
 
 from .constants import (
     ASSIGN_GUEST_QUEUE_MAX_RETRIES,
     ASSIGN_GUEST_QUEUE_RETRY_BACKOFF_SECONDS,
+    ENDED_SESSION_TRUSTED_GATE_DELAY_SECONDS,
+    HOTSPOT_BINDING_RECONCILE_DEDUPE_KEY,
+    HOTSPOT_BINDING_RECONCILE_GRACE_SECONDS,
+    HOTSPOT_GATE_NOT_BEFORE_KEY,
+    OPEN_HOTSPOT_GATE_MAX_RETRIES,
+    OPEN_HOTSPOT_GATE_RETRY_BACKOFF_SECONDS,
     SESSION_PRESENCE_HOST_DEAD_AFTER_SECONDS,
+    SESSION_PRESENCE_READ_AT_REDIS_KEY,
+    SESSION_PRESENCE_READ_AT_TTL_SECONDS,
     SESSION_PRESENCE_SWEEP_LOCK_REDIS_KEY,
     SESSION_PRESENCE_SWEEP_LOCK_TTL_SECONDS,
     TASK_ASSIGN_GUEST_QUEUE,
+    TASK_ENFORCE_NAS_ONLY_USAGE_CUT,
+    TASK_OPEN_HOTSPOT_GATE,
+    TASK_OPEN_HOTSPOT_GATE_FOR_ENDED_SESSION_DEVICE,
+    TASK_OPEN_HOTSPOT_GATE_FOR_TRUSTED_DEVICE,
+    TASK_RECONCILE_HOTSPOT_BINDINGS,
+    TASK_RECONCILE_HOTSPOT_BINDINGS_FOR_SCOPE,
     TASK_RECONCILE_ROUTER_SESSION_PRESENCE,
     TASK_RUN_FUP_TIME_ACCRUAL_SWEEP,
+    TASK_RUN_HOTSPOT_BINDING_RECONCILE_SWEEP,
     TASK_RUN_OPEN_HOURS_ENFORCEMENT_SWEEP,
     TASK_RUN_QUOTA_RESET_SWEEP,
     TASK_RUN_SESSION_PRESENCE_SWEEP,
     TASK_RUN_SESSION_TIMEOUT_SWEEP,
     TASK_RUN_WHITELIST_ONLY_ENFORCEMENT_SWEEP,
+    TRUSTED_DEVICE_HOTSPOT_GATE_DELAY_SECONDS,
+    GuestSessionStatus,
 )
+from .hotspot_gate import OUTCOME_HELD, HotspotGateResult
 from .repository import GuestRepository
 from .service import (
+    _removals_reported,
+    aruba_access_tier_lookup,
     enforce_open_hours_online_guests,
     enforce_session_timeouts,
     enforce_whitelist_only_online_guests,
+    expire_nas_only_session_over_cap,
+    nas_only_connected_since_lookup,
+    nas_only_session_over_data_cap,
     reconcile_sessions_with_router_presence,
+    refresh_session_activity_from_router,
     run_fup_time_accrual,
     run_quota_reset,
 )
-from .validators import hotspot_is_serving, present_macs_from_hotspot_hosts
+from .validators import (
+    RouterActivityRead,
+    hotspot_is_serving,
+    last_heard_from_hotspot_hosts,
+    present_macs_from_hotspot_hosts,
+)
 
 logger = get_logger(__name__)
 
@@ -116,6 +147,31 @@ def _build_policy_service(session: AsyncSession) -> PolicyService:
     )
 
 
+def _build_router_lookup(session: AsyncSession):
+    """A real ``RouterService`` used only as a read-only ``get_router`` --
+    the Access Tier sweep lookup needs a session's router vendor and
+    nothing else. Imported inside the function, like
+    ``_build_queue_management_service``'s identical construction."""
+    from app.domains.router.repository import RouterRepository
+    from app.domains.router.service import RouterService
+
+    organization_service = OrganizationService(OrganizationRepository(session))
+    location_service = LocationService(
+        LocationRepository(session),
+        organization_service,
+        location_code_counter=LocationCodeCounterRepository(session),
+    )
+    # By keyword: the constructor is (repository, location_lookup,
+    # organization_lookup). The staging original passed these two the other
+    # way round -- harmless for `get_router`, which uses neither, but caught
+    # by test_task_service_wiring and wrong for anything else.
+    return RouterService(
+        RouterRepository(session),
+        location_lookup=location_service,
+        organization_lookup=organization_service,
+    )
+
+
 async def _run_session_timeout_sweep_async() -> int:
     """The actual async work behind ``run_session_timeout_sweep`` -- a
     fresh session per task run (never a session shared across separate task
@@ -129,6 +185,7 @@ async def _run_session_timeout_sweep_async() -> int:
                 repository,
                 _build_session_terminator(session, repository),
                 _build_activity_reporting_lookup(session),
+                _build_router_activity_read_lookup(session),
             )
             await session.commit()
             return len(expired)
@@ -172,6 +229,13 @@ async def _run_fup_time_accrual_sweep_async() -> dict[str, int]:
                 policy_service,
                 now=datetime.now(UTC),
                 terminator=_build_session_terminator(session, repository),
+                # Access Tier daily limits, Aruba Instant On only.
+                access_tier_lookup=aruba_access_tier_lookup(
+                    repository, _build_router_lookup(session), policy_service
+                ),
+                connected_since_lookup=nas_only_connected_since_lookup(
+                    repository, _build_router_lookup(session)
+                ),
             )
             await session.commit()
             return result
@@ -423,7 +487,7 @@ def _build_queue_management_service(session: AsyncSession):
         location_code_counter=LocationCodeCounterRepository(session),
     )
     router_service = RouterService(
-        RouterRepository(session), organization_service, location_service
+        RouterRepository(session), location_service, organization_service
     )
     return QueueManagementService(
         QueueManagementRepository(session),
@@ -467,6 +531,62 @@ def _build_activity_reporting_lookup(session: AsyncSession):
     return build_controller_activity_reporting_lookup(session)
 
 
+def _build_router_activity_read_lookup(session: AsyncSession):
+    """The per-guest half of the session-timeout sweep: has the presence
+    sweep been able to read this router's host table lately?
+
+    Satisfies ``service.RouterActivityReadProtocol``; see
+    ``validators.idle_verdict_is_evidenced`` for what the answer decides.
+
+    ``applies`` is the same test ``_load_presence_target`` applies before
+    it will dial a router -- RouterOS, with an address and stored API
+    credentials -- so the two cannot disagree about which routers are
+    read. A controller-managed or NAS-only row answers ``applies=False``
+    and its sessions are judged exactly as they were.
+
+    ``read_at`` is the stamp ``_record_presence_read`` leaves after each
+    successful read. A Redis that cannot be asked, or a value that is not a
+    number, is "no record of a read", never "read just now": this lookup
+    exists to stop an expiry that rests on a read nobody made, and an
+    unanswerable question must not become that evidence."""
+    from wyfy_device_gateway import DeviceVendor
+
+    from app.database.redis import create_redis_client
+    from app.domains.router.repository import RouterRepository
+
+    class _RouterActivityRead:
+        @staticmethod
+        async def router_activity_read(*, router_id: uuid.UUID) -> RouterActivityRead:
+            router = await RouterRepository(session).get_by_id(router_id)
+            if (
+                router is None
+                or router.vendor != DeviceVendor.MIKROTIK.value
+                or not (router.management_ip_address or router.public_ip_address)
+                or not router.api_username
+                or not router.api_credentials_encrypted
+            ):
+                return RouterActivityRead(applies=False, read_at=None)
+            key = SESSION_PRESENCE_READ_AT_REDIS_KEY.format(router_id=router_id)
+            read_at: datetime | None = None
+            try:
+                redis = create_redis_client()
+                try:
+                    raw = await redis.get(key)
+                finally:
+                    await redis.aclose()
+                if raw is not None:
+                    read_at = datetime.fromtimestamp(float(raw), UTC)
+            except Exception as exc:  # noqa: BLE001 -- see docstring
+                logger.warning(
+                    "guest_session_presence_read_stamp_unavailable",
+                    extra={"router_id": str(router_id), "error": str(exc)},
+                )
+                read_at = None
+            return RouterActivityRead(applies=True, read_at=read_at)
+
+    return _RouterActivityRead()
+
+
 def _build_session_terminator(session: AsyncSession, repository: GuestRepository):
     """Constructs a real ``LiveSessionTerminator`` -- the device half of a
     session end -- the way ``app.domains.guest_access.dependencies`` would
@@ -495,7 +615,7 @@ def _build_session_terminator(session: AsyncSession, repository: GuestRepository
         location_code_counter=LocationCodeCounterRepository(session),
     )
     router_service = RouterService(
-        RouterRepository(session), organization_service, location_service
+        RouterRepository(session), location_service, organization_service
     )
     from app.domains.network_integration.client_hooks import (
         build_controller_session_terminator,
@@ -523,6 +643,7 @@ async def _assign_guest_queue_async(
     session_id: str,
     device_target: str,
     guest_id: str | None,
+    device_mac: str | None = None,
 ) -> None:
     """The actual async work behind ``assign_guest_queue`` -- a fresh
     ``AsyncSession`` per task run, mirroring every other task in this
@@ -548,6 +669,7 @@ async def _assign_guest_queue_async(
                 target_id=uuid.UUID(session_id),
                 device_target=device_target,
                 guest_id=uuid.UUID(guest_id) if guest_id else None,
+                device_mac=device_mac,
             )
             await session.commit()
         except Exception:
@@ -569,6 +691,7 @@ def assign_guest_queue(
     session_id: str,
     device_target: str,
     guest_id: str | None = None,
+    device_mac: str | None = None,
 ) -> dict[str, object]:
     """Applies a guest session's policy-resolved bandwidth queue to the
     venue's router. Enqueued per login by
@@ -591,8 +714,19 @@ def assign_guest_queue(
                 session_id=session_id,
                 device_target=device_target,
                 guest_id=guest_id,
+                device_mac=device_mac,
             )
         )
+    except QueueTargetNotOnRouterError as exc:
+        # Not a failure a retry can fix thirty seconds from now, and not one
+        # to burn the retries on: the router is reachable and simply has no
+        # entry for this device yet. The session keeps no assignment and the
+        # periodic backfill assigns it once the device is on the network.
+        logger.warning(
+            "guest_task_assign_guest_queue_device_not_on_router",
+            extra={"session_id": session_id, "error": str(exc)},
+        )
+        return {"session_id": session_id, "assigned": False}
     except Exception as exc:
         logger.warning(
             "guest_task_assign_guest_queue_failed",
@@ -606,6 +740,644 @@ def assign_guest_queue(
         extra={"session_id": session_id},
     )
     return {"session_id": session_id}
+
+
+# ============================================================================
+# Opening the hotspot gate at sign-in -- see ``hotspot_gate``'s docstring
+# ============================================================================
+
+
+async def _hotspot_gate_hold_remaining(session_id: str) -> float:
+    """Seconds until this session's binding may be written -- ``0.0`` when
+    nothing asks it to wait.
+
+    ``enqueue_hotspot_gate_open`` records the instant; see
+    ``constants.HOTSPOT_GATE_NOT_BEFORE_KEY`` for why a countdown alone is
+    not enough. Read on a fresh client, closed inside this run's own event
+    loop, as ``_dispatch_session_presence_sweep_async`` does.
+
+    **Fails open.** A Redis that cannot be asked, or a value that is not a
+    number, is ``0.0``: the task then does exactly what it did before the
+    hold existed. Never more than the configured delay either, so a clock
+    that disagrees with the one that wrote the value cannot park a task."""
+    from app.core.config import get_settings
+    from app.database.redis import create_redis_client
+
+    delay = float(get_settings().guest_hotspot_gate_push_delay_seconds)
+    if delay <= 0:
+        return 0.0
+    try:
+        redis = create_redis_client()
+        try:
+            not_before = await redis.get(
+                HOTSPOT_GATE_NOT_BEFORE_KEY.format(session_id=session_id)
+            )
+        finally:
+            await redis.aclose()
+        if not_before is None:
+            return 0.0
+        remaining = float(not_before) - time.time()
+    except Exception as exc:  # noqa: BLE001 -- see docstring: fails open
+        logger.debug(
+            "guest_hotspot_gate_hold_unavailable",
+            extra={"session_id": session_id, "error": str(exc)},
+        )
+        return 0.0
+    return min(max(0.0, remaining), delay)
+
+
+async def _open_hotspot_gate_async(*, session_id: str, router_id: str):  # noqa: ANN202
+    """One attempt, on a fresh ``AsyncSession``. The only database write is
+    ``internet_confirmed_at`` when the router read says the device is
+    through (``_record_gate_internet_confirmation``); everything else is a
+    read, and the device write is the one on the router.
+
+    Unlike ``_assign_guest_queue_async`` this *does* re-read
+    ``guest_sessions``, deliberately: whether the session is still one the
+    router should let through is the whole question, and it has to be
+    answered at the moment of the write, not at the moment of the login.
+    The read-your-own-write race that creates (the request's commit may not
+    have landed) is handled by the caller as a retry."""
+    from app.domains.router.repository import RouterRepository
+    from app.domains.router.service import RouterService
+
+    from .hotspot_gate import open_hotspot_gate_for_session
+
+    # Before the database and before the router: a request after the one
+    # that started this task may have asked for more time.
+    hold_seconds = await _hotspot_gate_hold_remaining(session_id)
+    if hold_seconds > 0:
+        return HotspotGateResult(OUTCOME_HELD, hold_seconds=hold_seconds)
+
+    async with SessionLocal() as session:
+        organization_service = OrganizationService(OrganizationRepository(session))
+        location_service = LocationService(
+            LocationRepository(session),
+            organization_service,
+            location_code_counter=LocationCodeCounterRepository(session),
+        )
+        guest_repository = GuestRepository(session)
+        result = await open_hotspot_gate_for_session(
+            session_id=uuid.UUID(session_id),
+            router_id=uuid.UUID(router_id),
+            guest_repository=guest_repository,
+            access_decision_service=_build_access_decision_service(session),
+            captive_portal_service=_build_captive_portal_service(session),
+            router_lookup=RouterService(
+                RouterRepository(session), location_service, organization_service
+            ),
+        )
+        await _record_gate_internet_confirmation(
+            session, guest_repository, session_id=session_id, result=result
+        )
+        return result
+
+
+async def _record_gate_internet_confirmation(
+    db_session: AsyncSession,
+    guest_repository: GuestRepository,
+    *,
+    session_id: str,
+    result: HotspotGateResult,
+) -> None:
+    """The one database write this task makes: when the router read the
+    attempt took says the device is through (``hotspot_gate
+    .internet_confirmation_source``), stamp ``internet_confirmed_at`` --
+    first report wins. No extra device call; the reading is the one the
+    gate push already took. Never raises: the router write above is the
+    task's job and this must not turn its outcome into a retry."""
+    from .hotspot_gate import internet_confirmation_source
+
+    source = internet_confirmation_source(result)
+    if source is None:
+        return
+    try:
+        await guest_repository.mark_internet_confirmed(
+            uuid.UUID(session_id), at=datetime.now(UTC), source=source
+        )
+        await db_session.commit()
+    except Exception as exc:  # noqa: BLE001 -- see docstring: never raises
+        logger.warning(
+            "guest_task_open_hotspot_gate_confirm_failed",
+            extra={"session_id": session_id, "source": source, "error": str(exc)},
+        )
+
+
+@celery_app.task(
+    name=TASK_OPEN_HOTSPOT_GATE,
+    bind=True,
+    max_retries=OPEN_HOTSPOT_GATE_MAX_RETRIES,
+)
+def open_hotspot_gate(self, *, session_id: str, router_id: str) -> dict[str, object]:
+    """Adds a just-signed-in guest's hotspot bypass on the venue's router.
+    Enqueued per login by ``GuestService._open_hotspot_gate``; never
+    Beat-scheduled.
+
+    Never raises past its retries. A router that cannot be reached is
+    logged and given up on: the router's own one-minute poll adds the same
+    binding, so the worst outcome here is exactly what happened before this
+    task existed.
+
+    ``held`` -- started before the session's "not before" instant -- is
+    published again as a new task for that instant rather than retried: a
+    retry would spend one of the few attempts kept for a session that is
+    not visible yet and a router that does not answer, on a run that has
+    touched neither."""
+    extra: dict[str, object] = {
+        "session_id": session_id,
+        "router_id": router_id,
+        "attempt": self.request.retries + 1,
+    }
+    last_attempt = self.request.retries >= OPEN_HOTSPOT_GATE_MAX_RETRIES
+    try:
+        result = run_celery_task(
+            _open_hotspot_gate_async(session_id=session_id, router_id=router_id)
+        )
+    except Exception as exc:  # noqa: BLE001 -- see docstring: best-effort
+        logger.warning(
+            "guest_task_open_hotspot_gate_failed",
+            extra={**extra, "error": str(exc), "gave_up": last_attempt},
+        )
+        if last_attempt:
+            return {"session_id": session_id, "outcome": "device_error"}
+        raise self.retry(
+            exc=exc, countdown=OPEN_HOTSPOT_GATE_RETRY_BACKOFF_SECONDS
+        ) from exc
+    if result.outcome == OUTCOME_HELD:
+        try:
+            self.apply_async(
+                kwargs={"session_id": session_id, "router_id": router_id},
+                countdown=result.hold_seconds,
+            )
+        except Exception as exc:  # noqa: BLE001 -- see docstring: best-effort
+            logger.warning(
+                "guest_task_open_hotspot_gate_hold_reschedule_failed",
+                extra={**extra, "error": str(exc)},
+            )
+        logger.info(
+            "guest_task_open_hotspot_gate_completed",
+            extra={
+                **extra,
+                "outcome": result.outcome,
+                "wrote": False,
+                "hold_seconds": round(result.hold_seconds, 3),
+            },
+        )
+        return {"session_id": session_id, "outcome": result.outcome}
+    if result.retry and not last_attempt:
+        raise self.retry(countdown=OPEN_HOTSPOT_GATE_RETRY_BACKOFF_SECONDS)
+    logger.info(
+        "guest_task_open_hotspot_gate_completed",
+        extra={
+            **extra,
+            "outcome": result.outcome,
+            "wrote": result.wrote,
+            "host_state": result.host_state,
+            "existing_bindings": list(result.existing_bindings),
+        },
+    )
+    return {"session_id": session_id, "outcome": result.outcome}
+
+
+async def _open_trusted_device_gate_on_routers(
+    session: AsyncSession,
+    router_ids: list[uuid.UUID],
+    *,
+    entry_id: uuid.UUID,
+    mac_authorization_service: object,
+    router_lookup: object,
+    adapter: object | None = None,
+) -> dict[str, int]:
+    """One attempt at each router in turn, each isolated from the rest.
+    Only routers the sign-in push is switched on for are tried
+    (``hotspot_gate_push_applies`` -- the same two settings, so a router
+    that is not being pushed to at sign-in is not pushed to here either).
+
+    A router that does not answer is logged and counted, and not tried
+    again: its own poll adds the binding within the minute, and a retry of
+    the whole task would reconnect to every router that did answer.
+    ``not_listed`` counts routers where the entry was not among the active
+    ones -- the one thing the task does look at again."""
+    from app.core.config import get_settings
+
+    from .hotspot_gate import open_hotspot_gate_for_trusted_entry
+
+    settings = get_settings()
+    totals = {"routers": 0, "wrote": 0, "failed": 0, "not_listed": 0}
+    for router_id in router_ids:
+        if not hotspot_gate_push_applies(
+            router_id,
+            enabled=settings.guest_hotspot_gate_push_enabled,
+            router_ids=settings.guest_hotspot_gate_push_router_ids,
+        ):
+            continue
+        totals["routers"] += 1
+        extra: dict[str, object] = {
+            "entry_id": str(entry_id),
+            "router_id": str(router_id),
+        }
+        try:
+            result = await open_hotspot_gate_for_trusted_entry(
+                entry_id=entry_id,
+                router_id=router_id,
+                mac_authorization_service=mac_authorization_service,  # type: ignore[arg-type]
+                router_lookup=router_lookup,  # type: ignore[arg-type]
+                adapter=adapter,  # type: ignore[arg-type]
+            )
+        except Exception as exc:  # noqa: BLE001 -- per-router isolation
+            totals["failed"] += 1
+            logger.warning(
+                "guest_hotspot_gate_trusted_device_failed",
+                extra={**extra, "error": str(exc)},
+            )
+            # A failed statement leaves the transaction unusable for the
+            # next router; this run only reads, so there is nothing to lose.
+            await session.rollback()
+            continue
+        totals["wrote"] += int(result.wrote)
+        totals["not_listed"] += int(result.retry)
+        logger.info(
+            "guest_hotspot_gate_trusted_device_completed",
+            extra={
+                **extra,
+                "outcome": result.outcome,
+                "wrote": result.wrote,
+                "host_state": result.host_state,
+                "existing_bindings": list(result.existing_bindings),
+            },
+        )
+    return totals
+
+
+async def _open_hotspot_gate_for_trusted_device_async(
+    *, entry_id: str, organization_id: str, location_id: str | None
+) -> dict[str, int]:
+    """Read-only against this platform's database, like
+    ``_open_hotspot_gate_async``. The ``MacAuthorizationService`` is built
+    with a ``router_lookup`` for the reason
+    ``_build_hotspot_binding_reconcile_kwargs`` gives: without one,
+    ``list_active_entries_for_router`` answers "no trusted devices"."""
+    from app.domains.mac_authorization.repository import MacAuthorizationRepository
+    from app.domains.mac_authorization.service import MacAuthorizationService
+    from app.domains.router.repository import RouterRepository
+    from app.domains.router.service import RouterService
+
+    async with SessionLocal() as session:
+        organization_service = OrganizationService(OrganizationRepository(session))
+        location_service = LocationService(
+            LocationRepository(session),
+            organization_service,
+            location_code_counter=LocationCodeCounterRepository(session),
+        )
+        router_service = RouterService(
+            RouterRepository(session), location_service, organization_service
+        )
+        # The routers an entry scoped this way applies at -- the same query
+        # the removal uses for a deleted one. Agent-managed-only by
+        # construction; each is asked again, by the entry, before a write.
+        routers = await RouterRepository(session).list_routers_in_scope(
+            organization_id=uuid.UUID(organization_id),
+            location_id=uuid.UUID(location_id) if location_id else None,
+        )
+        return await _open_trusted_device_gate_on_routers(
+            session,
+            [router.id for router in routers],
+            entry_id=uuid.UUID(entry_id),
+            mac_authorization_service=MacAuthorizationService(
+                MacAuthorizationRepository(session), router_lookup=router_service
+            ),
+            router_lookup=router_service,
+        )
+
+
+@celery_app.task(
+    name=TASK_OPEN_HOTSPOT_GATE_FOR_TRUSTED_DEVICE,
+    bind=True,
+    max_retries=OPEN_HOTSPOT_GATE_MAX_RETRIES,
+)
+def open_hotspot_gate_for_trusted_device(
+    self, *, entry_id: str, organization_id: str, location_id: str | None = None
+) -> dict[str, object]:
+    """Adds a just-trusted device's hotspot bypass on every router its
+    entry applies at. Enqueued by ``hotspot_binding_events
+    .request_trusted_device_hotspot_gate_open``; never Beat-scheduled.
+
+    Retried only while the entry is not yet among a router's active ones
+    (the request that saved it may not have committed) or the run itself
+    failed before reaching a router. Never raises past its retries: the
+    routers' own one-minute poll adds the same binding."""
+    extra: dict[str, object] = {
+        "entry_id": entry_id,
+        "organization_id": organization_id,
+        "location_id": location_id,
+        "attempt": self.request.retries + 1,
+    }
+    last_attempt = self.request.retries >= OPEN_HOTSPOT_GATE_MAX_RETRIES
+    try:
+        totals = run_celery_task(
+            _open_hotspot_gate_for_trusted_device_async(
+                entry_id=entry_id,
+                organization_id=organization_id,
+                location_id=location_id,
+            )
+        )
+    except Exception as exc:  # noqa: BLE001 -- see docstring: best-effort
+        logger.warning(
+            "guest_task_open_hotspot_gate_for_trusted_device_failed",
+            extra={**extra, "error": str(exc), "gave_up": last_attempt},
+        )
+        if last_attempt:
+            return {"entry_id": entry_id, "outcome": "error"}
+        raise self.retry(
+            exc=exc, countdown=OPEN_HOTSPOT_GATE_RETRY_BACKOFF_SECONDS
+        ) from exc
+    if totals["not_listed"] and not last_attempt:
+        raise self.retry(countdown=OPEN_HOTSPOT_GATE_RETRY_BACKOFF_SECONDS)
+    logger.info(
+        "guest_task_open_hotspot_gate_for_trusted_device_completed",
+        extra={**extra, **totals},
+    )
+    return {"entry_id": entry_id, **totals}
+
+
+async def _open_hotspot_gate_for_ended_session_device_async(
+    *, session_id: str, router_id: str
+) -> dict[str, object]:
+    """Read-only against this platform's database. Finds the Trusted Device
+    entry for the ended session's device, if there is one, and puts it
+    through the same per-router write a just-trusted device gets."""
+    from app.domains.mac_authorization.repository import MacAuthorizationRepository
+    from app.domains.mac_authorization.service import MacAuthorizationService
+    from app.domains.router.repository import RouterRepository
+    from app.domains.router.service import RouterService
+
+    from .hotspot_gate import trusted_entry_for_session_device
+
+    async with SessionLocal() as session:
+        organization_service = OrganizationService(OrganizationRepository(session))
+        location_service = LocationService(
+            LocationRepository(session),
+            organization_service,
+            location_code_counter=LocationCodeCounterRepository(session),
+        )
+        router_service = RouterService(
+            RouterRepository(session), location_service, organization_service
+        )
+        mac_authorization_service = MacAuthorizationService(
+            MacAuthorizationRepository(session), router_lookup=router_service
+        )
+        entry_id = await trusted_entry_for_session_device(
+            session_id=uuid.UUID(session_id),
+            router_id=uuid.UUID(router_id),
+            guest_repository=GuestRepository(session),
+            mac_authorization_service=mac_authorization_service,
+        )
+        if entry_id is None:
+            return {"outcome": "not_trusted"}
+        totals = await _open_trusted_device_gate_on_routers(
+            session,
+            [uuid.UUID(router_id)],
+            entry_id=entry_id,
+            mac_authorization_service=mac_authorization_service,
+            router_lookup=router_service,
+        )
+        return {"entry_id": str(entry_id), **totals}
+
+
+@celery_app.task(name=TASK_OPEN_HOTSPOT_GATE_FOR_ENDED_SESSION_DEVICE)
+def open_hotspot_gate_for_ended_session_device(
+    *, session_id: str, router_id: str
+) -> dict[str, object]:
+    """Adds a Trusted Device's hotspot bypass once the session it was
+    signed in with has ended. Enqueued by ``hotspot_binding_events
+    .request_trusted_device_hotspot_gate_open_for_ended_session``; never
+    Beat-scheduled, never retried and never raises: the router's own
+    one-minute poll adds the same binding."""
+    extra: dict[str, object] = {"session_id": session_id, "router_id": router_id}
+    try:
+        result = run_celery_task(
+            _open_hotspot_gate_for_ended_session_device_async(
+                session_id=session_id, router_id=router_id
+            )
+        )
+    except Exception as exc:  # noqa: BLE001 -- see docstring: best-effort
+        logger.warning(
+            "guest_task_open_hotspot_gate_for_ended_session_device_failed",
+            extra={**extra, "error": str(exc)},
+        )
+        return {"session_id": session_id, "outcome": "error"}
+    logger.info(
+        "guest_task_open_hotspot_gate_for_ended_session_device_completed",
+        extra={**extra, **result},
+    )
+    return {"session_id": session_id, **result}
+
+
+# ============================================================================
+# Taking a session bypass back off the router -- see
+# ``hotspot_binding_reconcile``'s docstring
+# ============================================================================
+
+
+def _build_hotspot_binding_reconcile_kwargs(session: AsyncSession) -> dict[str, object]:
+    """Everything ``reconcile_hotspot_bindings_for_router`` reads this
+    platform's database through, on one ``AsyncSession``.
+
+    **The ``MacAuthorizationService`` here is given a ``router_lookup``, and
+    it has to be.** ``list_active_entries_for_router`` returns an empty list
+    when none is wired (``_build_mac_authorization_service`` above builds
+    it that way, correctly, for a sweep that only calls
+    ``is_mac_authorized``). An empty list is not an error -- it is the
+    answer "this venue has no Trusted Devices" -- so a reconciler built
+    with that service would read every trusted device as unlisted and take
+    its bypass away. The router's script tags a trusted device's binding
+    with the same ``cloudguest-authmac`` comment as a guest's, so nothing
+    downstream could tell the difference. Pinned by
+    ``tests/unit/test_hotspot_binding_reconcile``."""
+    from app.domains.mac_authorization.repository import MacAuthorizationRepository
+    from app.domains.mac_authorization.service import MacAuthorizationService
+    from app.domains.router.repository import RouterRepository
+    from app.domains.router.service import RouterService
+
+    organization_service = OrganizationService(OrganizationRepository(session))
+    location_service = LocationService(
+        LocationRepository(session),
+        organization_service,
+        location_code_counter=LocationCodeCounterRepository(session),
+    )
+    router_service = RouterService(
+        RouterRepository(session), location_service, organization_service
+    )
+    return {
+        "guest_repository": GuestRepository(session),
+        "mac_authorization_service": MacAuthorizationService(
+            MacAuthorizationRepository(session), router_lookup=router_service
+        ),
+        "access_decision_service": _build_access_decision_service(session),
+        "captive_portal_service": _build_captive_portal_service(session),
+        "router_lookup": router_service,
+        # A second list read inside one session must not be answered from
+        # what the first one loaded.
+        "refresh": session.expire_all,
+    }
+
+
+def hotspot_gate_remove_applies(router_id: uuid.UUID, settings: object) -> bool:
+    """Whether the removal is switched on for ``router_id`` -- the same
+    two-setting rule as the push (``hotspot_gate_push_applies``), on its own
+    pair of settings so the two can be turned on independently."""
+    return hotspot_gate_push_applies(
+        router_id,
+        enabled=bool(settings.guest_hotspot_gate_remove_enabled),  # type: ignore[attr-defined]
+        router_ids=str(settings.guest_hotspot_gate_remove_router_ids or ""),  # type: ignore[attr-defined]
+    )
+
+
+def _hotspot_gate_remove_is_on_anywhere(settings: object) -> bool:
+    return bool(settings.guest_hotspot_gate_remove_enabled) or bool(  # type: ignore[attr-defined]
+        str(settings.guest_hotspot_gate_remove_router_ids or "").strip()  # type: ignore[attr-defined]
+    )
+
+
+async def _reconcile_hotspot_bindings_for_routers(
+    session: AsyncSession, router_ids: list[uuid.UUID], *, trigger: str
+) -> dict[str, int]:
+    """Runs the reconciliation for each router in turn, one after another,
+    each isolated from the rest.
+
+    A router that cannot be reached, or whose run fails for any other
+    reason, is logged and left for the next run; it is attempted exactly
+    once here, because each attempt costs a full connect timeout. Nothing
+    one router does can stop the next from being tried."""
+    from app.core.config import get_settings
+
+    from .hotspot_binding_reconcile import reconcile_hotspot_bindings_for_router
+
+    settings = get_settings()
+    totals = {"routers": 0, "removed": 0, "failed": 0, "deferred": 0}
+    kwargs = _build_hotspot_binding_reconcile_kwargs(session)
+    for router_id in router_ids:
+        if not hotspot_gate_remove_applies(router_id, settings):
+            continue
+        totals["routers"] += 1
+        extra: dict[str, object] = {"router_id": str(router_id), "trigger": trigger}
+        try:
+            result = await reconcile_hotspot_bindings_for_router(
+                router_id=router_id,
+                max_removals=settings.guest_hotspot_gate_remove_max_per_run,
+                grace_seconds=HOTSPOT_BINDING_RECONCILE_GRACE_SECONDS,
+                drop_bypassed_host=settings.guest_hotspot_gate_remove_drop_host,
+                **kwargs,  # type: ignore[arg-type]
+            )
+        except Exception as exc:  # noqa: BLE001 -- per-router isolation
+            totals["failed"] += 1
+            logger.warning(
+                "guest_hotspot_binding_reconcile_failed",
+                extra={**extra, "error": str(exc)},
+            )
+            # A failed statement leaves the transaction unusable for the
+            # next router; this run only reads, so there is nothing to lose.
+            await session.rollback()
+            continue
+        totals["removed"] += result.removed
+        totals["deferred"] += result.deferred
+        log = logger.info if (result.removed or result.stale) else logger.debug
+        log(
+            "guest_hotspot_binding_reconcile_completed",
+            extra={**extra, **result.as_log_extra()},
+        )
+    return totals
+
+
+async def _reconcile_hotspot_bindings_async(*, router_id: str) -> dict[str, int]:
+    async with SessionLocal() as session:
+        return await _reconcile_hotspot_bindings_for_routers(
+            session, [uuid.UUID(router_id)], trigger="event"
+        )
+
+
+@celery_app.task(name=TASK_RECONCILE_HOTSPOT_BINDINGS)
+def reconcile_hotspot_bindings(*, router_id: str) -> dict[str, int]:
+    """One router, shortly after something that may have taken a MAC off
+    its authorized list. Enqueued by
+    ``hotspot_binding_events.request_hotspot_binding_reconcile``.
+
+    Not retried. A router that does not answer is picked up by
+    ``run_hotspot_binding_reconcile_sweep`` within its interval, which is
+    exactly what a retry would be."""
+    return run_celery_task(_reconcile_hotspot_bindings_async(router_id=router_id))
+
+
+async def _reconcile_hotspot_bindings_for_scope_async(
+    *, organization_id: str, location_id: str | None
+) -> dict[str, int]:
+    from app.domains.router.repository import RouterRepository
+
+    async with SessionLocal() as session:
+        # ``list_routers_in_scope`` is agent-managed-only by construction.
+        routers = await RouterRepository(session).list_routers_in_scope(
+            organization_id=uuid.UUID(organization_id),
+            location_id=uuid.UUID(location_id) if location_id else None,
+        )
+        return await _reconcile_hotspot_bindings_for_routers(
+            session, [router.id for router in routers], trigger="scope"
+        )
+
+
+@celery_app.task(name=TASK_RECONCILE_HOTSPOT_BINDINGS_FOR_SCOPE)
+def reconcile_hotspot_bindings_for_scope(
+    *, organization_id: str, location_id: str | None = None
+) -> dict[str, int]:
+    """Every router a Trusted Device entry applies at -- the organization's,
+    or one location's -- after that entry was deleted, disabled or changed.
+    Enqueued by
+    ``hotspot_binding_events.request_hotspot_binding_reconcile_for_scope``."""
+    return run_celery_task(
+        _reconcile_hotspot_bindings_for_scope_async(
+            organization_id=organization_id, location_id=location_id
+        )
+    )
+
+
+async def _run_hotspot_binding_reconcile_sweep_async() -> dict[str, int]:
+    from sqlalchemy import select
+
+    from app.core.config import get_settings
+    from app.domains.router.fleet_scope import agent_managed_only
+    from app.domains.router.models import Router
+
+    settings = get_settings()
+    if not _hotspot_gate_remove_is_on_anywhere(settings):
+        return {"routers": 0, "removed": 0, "failed": 0, "deferred": 0}
+    async with SessionLocal() as session:
+        # Agent-managed rows with API credentials on file: the only routers
+        # a RouterOS API write can reach. ``hotspot_gate_remove_applies``
+        # then narrows to the ones the removal is switched on for.
+        statement = agent_managed_only(
+            select(Router.id)
+            .where(
+                Router.is_deleted.is_(False),
+                Router.api_credentials_encrypted.is_not(None),
+            )
+            .order_by(Router.created_at.asc())
+        )
+        router_ids = list((await session.execute(statement)).scalars().all())
+        return await _reconcile_hotspot_bindings_for_routers(
+            session, router_ids, trigger="sweep"
+        )
+
+
+@celery_app.task(name=TASK_RUN_HOTSPOT_BINDING_RECONCILE_SWEEP)
+def run_hotspot_binding_reconcile_sweep() -> dict[str, int]:
+    """Beat-scheduled (see ``app.core.celery_app``'s ``beat_schedule`` --
+    every ``constants.HOTSPOT_BINDING_RECONCILE_SWEEP_INTERVAL_SECONDS``).
+    The net under the event-driven runs; returns at once, without a
+    database read, while the removal is switched off everywhere."""
+    result = run_celery_task(_run_hotspot_binding_reconcile_sweep_async())
+    logger.info(
+        "guest_task_run_hotspot_binding_reconcile_sweep_completed", extra=result
+    )
+    return result
 
 
 # ============================================================================
@@ -667,15 +1439,44 @@ async def _load_presence_target(router_id: uuid.UUID):  # noqa: ANN202
     return router, creds
 
 
+async def _record_presence_read(router_id: uuid.UUID, read_at: datetime) -> None:
+    """Leaves the stamp the timeout sweep reads through
+    ``_build_router_activity_read_lookup``: this router's host table was
+    read successfully at ``read_at``.
+
+    Best-effort. A stamp that could not be written reads to the timeout
+    sweep as "no record of a read", which only makes it decline to expire a
+    bypass-admitted guest for inactivity -- the safe direction -- so a Redis
+    blip must not fail a reconcile that has already committed."""
+    from app.database.redis import create_redis_client
+
+    try:
+        redis = create_redis_client()
+        try:
+            await redis.set(
+                SESSION_PRESENCE_READ_AT_REDIS_KEY.format(router_id=router_id),
+                str(read_at.timestamp()),
+                ex=SESSION_PRESENCE_READ_AT_TTL_SECONDS,
+            )
+        finally:
+            await redis.aclose()
+    except Exception as exc:  # noqa: BLE001 -- see docstring
+        logger.warning(
+            "guest_session_presence_read_stamp_failed",
+            extra={"router_id": str(router_id), "error": str(exc)},
+        )
+
+
 async def _reconcile_router_session_presence_async(
     router_id: uuid.UUID,
     *,
     reader_factory=_default_presence_reader_factory,  # noqa: ANN001
     now: datetime | None = None,
 ) -> dict[str, object]:
-    """One router: read its hotspot host table, then close every ``ACTIVE``
-    session whose device is not in it (``service
-    .reconcile_sessions_with_router_presence``).
+    """One router: read its hotspot host table, credit every ``ACTIVE``
+    session whose device it has heard from (``service
+    .refresh_session_activity_from_router``), then close every one whose
+    device is not in it (``service.reconcile_sessions_with_router_presence``).
 
     **Every way this can fail changes nothing.** An unreachable router, a
     section RouterOS refused, no stored credentials, or a router with no
@@ -710,14 +1511,28 @@ async def _reconcile_router_session_presence_async(
         )
         return {"router_id": str(router_id), "closed": 0, "skipped": "no_hotspot"}
 
+    # Taken as the read returns: ``idle-time`` is a duration, so the moment
+    # it is measured back from is this platform's clock, not the router's.
+    read_at = now or datetime.now(UTC)
+    host_rows = capture.sections.get("hotspot_hosts", [])
     present_macs = present_macs_from_hotspot_hosts(
-        capture.sections.get("hotspot_hosts", []),
+        host_rows, dead_after_seconds=SESSION_PRESENCE_HOST_DEAD_AFTER_SECONDS
+    )
+    last_heard = last_heard_from_hotspot_hosts(
+        host_rows,
+        read_at=read_at,
         dead_after_seconds=SESSION_PRESENCE_HOST_DEAD_AFTER_SECONDS,
     )
     async with SessionLocal() as session:
         try:
+            repository = GuestRepository(session)
+            # Before the reconcile, so a device just credited with activity
+            # is inside the reconcile's own grace window.
+            refreshed = await refresh_session_activity_from_router(
+                repository, router_id=router_id, last_heard=last_heard, now=read_at
+            )
             closed = await reconcile_sessions_with_router_presence(
-                GuestRepository(session),
+                repository,
                 router_id=router_id,
                 present_macs=present_macs,
                 now=now,
@@ -726,7 +1541,13 @@ async def _reconcile_router_session_presence_async(
         except Exception:
             await session.rollback()
             raise
-    return {"router_id": str(router_id), "closed": len(closed), "skipped": None}
+    await _record_presence_read(router_id, read_at)
+    return {
+        "router_id": str(router_id),
+        "closed": len(closed),
+        "refreshed": len(refreshed),
+        "skipped": None,
+    }
 
 
 @celery_app.task(name=TASK_RECONCILE_ROUTER_SESSION_PRESENCE)
@@ -800,6 +1621,7 @@ async def enqueue_guest_queue_assignment(
     session_id: uuid.UUID,
     device_target: str,
     guest_id: uuid.UUID | None,
+    device_mac: str | None = None,
 ) -> None:
     """The dispatcher ``GuestService`` is wired with -- publishes the task
     and returns, so the guest's login response no longer waits on a router.
@@ -824,6 +1646,7 @@ async def enqueue_guest_queue_assignment(
             session_id=str(session_id),
             device_target=device_target,
             guest_id=str(guest_id) if guest_id else None,
+            device_mac=device_mac,
         )
 
     try:
@@ -835,6 +1658,353 @@ async def enqueue_guest_queue_assignment(
         )
 
 
+def hotspot_gate_push_applies(
+    router_id: uuid.UUID, *, enabled: bool, router_ids: str
+) -> bool:
+    """Whether the sign-in push is switched on for ``router_id``: either for
+    every router (``enabled``), or for this one by name in the
+    comma-separated ``router_ids`` allow-list. An entry that is not a UUID
+    matches nothing -- it never widens the list."""
+    if enabled:
+        return True
+    wanted = {part.strip().lower() for part in (router_ids or "").split(",")}
+    return str(router_id).lower() in wanted
+
+
+async def enqueue_hotspot_gate_open(
+    *, router_id: uuid.UUID, session_id: uuid.UUID
+) -> None:
+    """The dispatcher ``GuestService`` is wired with for the hotspot gate --
+    publishes ``open_hotspot_gate`` and returns.
+
+    Published with a countdown (``guest_hotspot_gate_push_delay_seconds``;
+    see that setting for why the browser is given the first go), and not at
+    all unless the push is switched on for this router (off by default --
+    see ``hotspot_gate_push_applies`` and the settings' own note).
+
+    The same delay is first recorded as the session's "not before" instant
+    (``constants.HOTSPOT_GATE_NOT_BEFORE_KEY``), so that a task an earlier
+    request published for this session waits for this request's delay too.
+    If Redis cannot be told, the task is published all the same and runs on
+    its countdown alone, as it did before the instant existed.
+
+    Same two properties as ``enqueue_guest_queue_assignment``: the broker
+    publish runs in a thread so the event loop is never blocked on it, and
+    it never raises -- a broker hiccup must not fail a login."""
+    from asyncio import to_thread
+
+    from app.core.config import get_settings
+
+    settings = get_settings()
+    if not hotspot_gate_push_applies(
+        router_id,
+        enabled=settings.guest_hotspot_gate_push_enabled,
+        router_ids=settings.guest_hotspot_gate_push_router_ids,
+    ):
+        return
+    delay = float(settings.guest_hotspot_gate_push_delay_seconds)
+    if delay > 0:
+        try:
+            from app.database.redis import redis_client
+
+            await redis_client.set(
+                HOTSPOT_GATE_NOT_BEFORE_KEY.format(session_id=session_id),
+                repr(time.time() + delay),
+                ex=int(delay) + 1,
+            )
+        except Exception as exc:  # noqa: BLE001 -- see docstring: publish anyway
+            logger.debug(
+                "guest_hotspot_gate_hold_unavailable",
+                extra={"session_id": str(session_id), "error": str(exc)},
+            )
+
+    def _publish() -> None:
+        open_hotspot_gate.apply_async(
+            kwargs={"session_id": str(session_id), "router_id": str(router_id)},
+            countdown=settings.guest_hotspot_gate_push_delay_seconds,
+        )
+
+    try:
+        await to_thread(_publish)
+    except Exception as exc:  # noqa: BLE001 -- see docstring: never raises
+        logger.warning(
+            "guest_hotspot_gate_enqueue_failed",
+            extra={"session_id": str(session_id), "error": str(exc)},
+        )
+
+
+#: How long the accounting request will wait to publish the cut. Well under what
+#: rlm_rest allows the request as a whole.
+NAS_ONLY_USAGE_CUT_PUBLISH_TIMEOUT_SECONDS = 1.0
+
+
+async def enqueue_nas_only_usage_cut(
+    *, router_id: uuid.UUID | None, session_id: uuid.UUID, reason: str
+) -> None:
+    """The dispatcher ``GuestService`` is wired with for a NAS-only guest over
+    their data cap. Publishes nothing unless cloud control is open for this
+    router, and never raises: a broker hiccup must not cost the accounting
+    packet its acknowledgement, and the next interim still over the cap tries
+    again."""
+    from asyncio import to_thread, wait_for
+
+    from app.core.config import get_settings
+    from app.domains.network_integration.instant_on_control import (
+        cloud_control_allowed,
+    )
+
+    if not cloud_control_allowed(router_id, get_settings()):
+        return
+
+    def _publish() -> None:
+        enforce_nas_only_usage_cut.apply_async(
+            kwargs={"session_id": str(session_id), "reason": reason},
+            # Celery's default publish retries would outlast the request.
+            retry=False,
+        )
+
+    try:
+        await wait_for(
+            to_thread(_publish), timeout=NAS_ONLY_USAGE_CUT_PUBLISH_TIMEOUT_SECONDS
+        )
+    except Exception as exc:  # noqa: BLE001 -- see docstring: never raises
+        logger.warning(
+            "guest_nas_only_usage_cut_enqueue_failed",
+            extra={"session_id": str(session_id), "error": str(exc)},
+        )
+
+
+async def _enforce_nas_only_usage_cut_async(session_id: str, reason: str) -> str:
+    """Ask Instant On to take the device off, and expire the row only once it
+    has confirmed. Anything else leaves the session ACTIVE, as ``record_usage``
+    always has. This can run well after the packet that asked for it, so it first
+    checks the session is still ACTIVE (interims can publish more than once) and
+    still over a data cap (the owner may have raised the limit, or a period may
+    have reset). The block's redis client is per loop, so it is closed here."""
+    from app.domains.network_integration.instant_on_control import _close_loop_redis
+
+    try:
+        async with SessionLocal() as session:
+            try:
+                repository = GuestRepository(session)
+                row = await repository.get_session_by_id(uuid.UUID(session_id))
+                if row is None or row.status != GuestSessionStatus.ACTIVE.value:
+                    return "not_active"
+                guest = await repository.get_guest_by_id(row.guest_id)
+                if guest is None:
+                    return "no_guest"
+                now = datetime.now(UTC)
+                policy_service = _build_policy_service(session)
+                access_tier = await aruba_access_tier_lookup(
+                    repository, _build_router_lookup(session), policy_service
+                )(row.guest_id, row.organization_id, row.location_id)
+                if not await nas_only_session_over_data_cap(
+                    repository, policy_service, row, access_tier=access_tier, now=now
+                ):
+                    await session.commit()
+                    return "not_over_cap"
+                terminator = _build_session_terminator(session, repository)
+                try:
+                    outcome = await terminator.end_on_router(
+                        session=row,
+                        identifier=guest.identifier,
+                        organization_id=row.organization_id,
+                    )
+                except Exception as exc:  # noqa: BLE001 -- "could not" stays ACTIVE
+                    logger.info(
+                        "guest_nas_only_usage_cut_not_delivered",
+                        extra={"session_id": session_id, "error": str(exc)},
+                    )
+                    return "not_delivered"
+                removed = _removals_reported(outcome)
+                if removed is None or removed < 1:
+                    return "not_delivered"
+                await expire_nas_only_session_over_cap(
+                    repository, row, reason=reason, now=now
+                )
+                await session.commit()
+                return "ended"
+            except Exception:
+                await session.rollback()
+                raise
+    finally:
+        await _close_loop_redis()
+
+
+@celery_app.task(name=TASK_ENFORCE_NAS_ONLY_USAGE_CUT)
+def enforce_nas_only_usage_cut(*, session_id: str, reason: str) -> str:
+    return run_celery_task(_enforce_nas_only_usage_cut_async(session_id, reason))
+
+
+def _hotspot_gate_push_is_on_anywhere(settings: object) -> bool:
+    return bool(settings.guest_hotspot_gate_push_enabled) or bool(  # type: ignore[attr-defined]
+        str(settings.guest_hotspot_gate_push_router_ids or "").strip()  # type: ignore[attr-defined]
+    )
+
+
+async def enqueue_trusted_device_hotspot_gate_open(
+    *,
+    entry_id: uuid.UUID,
+    organization_id: uuid.UUID,
+    location_id: uuid.UUID | None,
+) -> None:
+    """Publishes ``open_hotspot_gate_for_trusted_device`` for one Trusted
+    Device entry and the scope it applies at, after
+    ``TRUSTED_DEVICE_HOTSPOT_GATE_DELAY_SECONDS``.
+
+    Which of the scope's routers the push is switched on for is decided in
+    the worker, router by router; here it is only checked that it is on
+    somewhere, so a deployment with it off publishes nothing. Never raises;
+    see ``hotspot_binding_events``."""
+    from asyncio import to_thread
+
+    from app.core.config import get_settings
+
+    settings = get_settings()
+    if not _hotspot_gate_push_is_on_anywhere(settings):
+        return
+
+    def _publish() -> None:
+        open_hotspot_gate_for_trusted_device.apply_async(
+            kwargs={
+                "entry_id": str(entry_id),
+                "organization_id": str(organization_id),
+                "location_id": str(location_id) if location_id else None,
+            },
+            countdown=TRUSTED_DEVICE_HOTSPOT_GATE_DELAY_SECONDS,
+        )
+
+    try:
+        await to_thread(_publish)
+    except Exception as exc:  # noqa: BLE001 -- see docstring: never raises
+        logger.warning(
+            "guest_hotspot_gate_trusted_device_enqueue_failed",
+            extra={"entry_id": str(entry_id), "error": str(exc)},
+        )
+
+
+async def enqueue_ended_session_trusted_gate_open(
+    *, session_id: uuid.UUID, router_id: uuid.UUID
+) -> None:
+    """Publishes ``open_hotspot_gate_for_ended_session_device`` after
+    ``ENDED_SESSION_TRUSTED_GATE_DELAY_SECONDS`` -- and not at all unless
+    the sign-in push is switched on for that router. Whether the device is
+    a Trusted Device at all is worked out in the worker. Never raises; see
+    ``hotspot_binding_events``."""
+    from asyncio import to_thread
+
+    from app.core.config import get_settings
+
+    settings = get_settings()
+    if not hotspot_gate_push_applies(
+        router_id,
+        enabled=settings.guest_hotspot_gate_push_enabled,
+        router_ids=settings.guest_hotspot_gate_push_router_ids,
+    ):
+        return
+
+    def _publish() -> None:
+        open_hotspot_gate_for_ended_session_device.apply_async(
+            kwargs={"session_id": str(session_id), "router_id": str(router_id)},
+            countdown=ENDED_SESSION_TRUSTED_GATE_DELAY_SECONDS,
+        )
+
+    try:
+        await to_thread(_publish)
+    except Exception as exc:  # noqa: BLE001 -- see docstring: never raises
+        logger.warning(
+            "guest_hotspot_gate_ended_session_enqueue_failed",
+            extra={"session_id": str(session_id), "error": str(exc)},
+        )
+
+
+async def enqueue_hotspot_binding_reconcile(*, router_id: uuid.UUID) -> None:
+    """Publishes ``reconcile_hotspot_bindings`` for one router, after
+    ``guest_hotspot_gate_remove_delay_seconds`` -- and not at all unless the
+    removal is switched on for that router.
+
+    The delay is what lets the request that ended the session commit before
+    the worker reads the authorized list. It is also a coalescing window:
+    a Redis ``SET NX`` with that lifetime means a second request about the
+    same router inside it publishes nothing, because the run already queued
+    reads the state as it is when it starts and so covers both. If Redis
+    cannot be asked, the task is published anyway -- a duplicate run finds
+    nothing to do; a dropped one would leave a guest online.
+
+    Never raises; see ``hotspot_binding_events``."""
+    from asyncio import to_thread
+
+    from app.core.config import get_settings
+
+    settings = get_settings()
+    if not hotspot_gate_remove_applies(router_id, settings):
+        return
+    delay = float(settings.guest_hotspot_gate_remove_delay_seconds)
+    try:
+        from app.database.redis import redis_client
+
+        first = await redis_client.set(
+            HOTSPOT_BINDING_RECONCILE_DEDUPE_KEY.format(router_id=router_id),
+            "1",
+            nx=True,
+            ex=max(1, int(delay)),
+        )
+        if not first:
+            return
+    except Exception as exc:  # noqa: BLE001 -- see docstring: publish anyway
+        logger.debug(
+            "guest_hotspot_binding_reconcile_dedupe_unavailable",
+            extra={"router_id": str(router_id), "error": str(exc)},
+        )
+
+    def _publish() -> None:
+        reconcile_hotspot_bindings.apply_async(
+            kwargs={"router_id": str(router_id)}, countdown=delay
+        )
+
+    try:
+        await to_thread(_publish)
+    except Exception as exc:  # noqa: BLE001 -- see docstring: never raises
+        logger.warning(
+            "guest_hotspot_binding_reconcile_enqueue_failed",
+            extra={"router_id": str(router_id), "error": str(exc)},
+        )
+
+
+async def enqueue_hotspot_binding_reconcile_for_scope(
+    *, organization_id: uuid.UUID, location_id: uuid.UUID | None
+) -> None:
+    """Publishes ``reconcile_hotspot_bindings_for_scope`` after the same
+    delay. Which of the scope's routers the removal is switched on for is
+    decided in the worker, router by router; here it is only checked that
+    it is on somewhere, so a deployment with it off publishes nothing.
+    Never raises."""
+    from asyncio import to_thread
+
+    from app.core.config import get_settings
+
+    settings = get_settings()
+    if not _hotspot_gate_remove_is_on_anywhere(settings):
+        return
+
+    def _publish() -> None:
+        reconcile_hotspot_bindings_for_scope.apply_async(
+            kwargs={
+                "organization_id": str(organization_id),
+                "location_id": str(location_id) if location_id else None,
+            },
+            countdown=float(settings.guest_hotspot_gate_remove_delay_seconds),
+        )
+
+    try:
+        await to_thread(_publish)
+    except Exception as exc:  # noqa: BLE001 -- see docstring: never raises
+        logger.warning(
+            "guest_hotspot_binding_reconcile_enqueue_failed",
+            extra={"organization_id": str(organization_id), "error": str(exc)},
+        )
+
+
 __all__ = [
     "run_session_timeout_sweep",
     "run_fup_time_accrual_sweep",
@@ -843,4 +2013,16 @@ __all__ = [
     "reconcile_router_session_presence",
     "assign_guest_queue",
     "enqueue_guest_queue_assignment",
+    "open_hotspot_gate",
+    "enqueue_hotspot_gate_open",
+    "open_hotspot_gate_for_trusted_device",
+    "open_hotspot_gate_for_ended_session_device",
+    "enqueue_trusted_device_hotspot_gate_open",
+    "enqueue_ended_session_trusted_gate_open",
+    "reconcile_hotspot_bindings",
+    "reconcile_hotspot_bindings_for_scope",
+    "run_hotspot_binding_reconcile_sweep",
+    "enqueue_hotspot_binding_reconcile",
+    "enqueue_hotspot_binding_reconcile_for_scope",
+    "hotspot_gate_remove_applies",
 ]

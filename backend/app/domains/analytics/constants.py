@@ -71,6 +71,12 @@ TASK_RUN_DAILY_AGGREGATION_FOR_ALL_ORGANIZATIONS = (
 TASK_RUN_DAILY_AGGREGATION_FOR_ORGANIZATION = (
     "app.domains.analytics.tasks.run_daily_aggregation_for_organization"
 )
+# Daily hard-delete of ``portal_impressions`` past their retention window --
+# see ``portal_impressions.purge_expired_impressions``. Not a CERT-In table.
+TASK_RUN_PORTAL_IMPRESSION_RETENTION_SWEEP = (
+    "app.domains.analytics.tasks.run_portal_impression_retention_sweep"
+)
+PORTAL_IMPRESSION_RETENTION_SWEEP_INTERVAL_SECONDS = 86_400.0
 
 
 # ============================================================================
@@ -270,6 +276,8 @@ AUDIT_ACTION_SCHEDULED_REPORT_UPDATED = "scheduled_report_updated"
 AUDIT_ACTION_SCHEDULED_REPORT_DELETED = "scheduled_report_deleted"
 
 __all__ = [
+    "PORTAL_IMPRESSION_RETENTION_SWEEP_INTERVAL_SECONDS",
+    "TASK_RUN_PORTAL_IMPRESSION_RETENTION_SWEEP",
     "AnalyticsSnapshotType",
     "AnalyticsGranularity",
     "DEFAULT_LIST_PAGE",

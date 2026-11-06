@@ -42,8 +42,10 @@ for why this is a service-layer check, not a database constraint.
 from __future__ import annotations
 
 import dataclasses
+import ipaddress
 import logging
 import uuid
+from collections.abc import Iterable
 from datetime import UTC, datetime
 from typing import Protocol
 
@@ -55,6 +57,7 @@ from app.domains.rbac.location_scope import (
 )
 from app.domains.router.device_domain_gate import ensure_not_controller_managed
 from app.domains.router.models import Router
+from app.domains.router.vendor_capabilities import is_agent_managed
 
 from .constants import (
     CAPTIVE_PORTAL_DHCP_OPTION_CODE,
@@ -70,6 +73,7 @@ from .device_adapters import (
     DhcpLeaseReading,
     DhcpOptionSnapshotReading,
     DhcpOptionSpec,
+    DhcpPoolReading,
     RogueDhcpInterfaceReading,
     get_dhcp_adapter,
 )
@@ -82,7 +86,13 @@ from .events import (
 from .exceptions import (
     CrossLocationDhcpPoolAccessError,
     CrossOrganizationDhcpPoolAccessError,
+    DhcpDeviceConnectionError,
+    DhcpDeviceOperationError,
     DhcpError,
+    DhcpLeaseConflictError,
+    DhcpLeaseNotFoundError,
+    DhcpLivePoolEditRefusedError,
+    DhcpLivePoolNotFoundError,
     DhcpMissingCredentialsError,
     DhcpOptionValueRequiredError,
     DhcpPoolMissingGatewayError,
@@ -102,6 +112,27 @@ from .validators import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class LeasePinOutcome:
+    """What :meth:`DhcpService.pin_device_leases` did for one MAC.
+
+    ``status`` is a code, never prose:
+
+    - ``pinned`` -- its dynamic lease was made static on ``ip_address``
+    - ``already_static`` -- the router already reserves ``ip_address`` for it
+    - ``no_lease`` -- this router holds no lease for it (offline, a static IP
+      set on the device itself, or served by another router)
+    - ``conflict`` -- the router refused (address reserved elsewhere, or the
+      lease moved between the read and the write); nothing was written
+    - ``failed`` -- the write itself failed; ``detail`` says why
+    """
+
+    mac_address: str
+    status: str
+    ip_address: str | None = None
+    detail: str | None = None
 
 
 def _event_extra(event: object) -> dict[str, object]:
@@ -665,7 +696,6 @@ class DhcpService:
             return configured
         return [pool.gateway_ip_address] if pool.gateway_ip_address else []
 
-
     # ========================================================================
     # Rogue-DHCP detection -- the reader, on a schedule
     # ========================================================================
@@ -1041,6 +1071,124 @@ class DhcpService:
         adapter = get_dhcp_adapter(router.vendor)
         return await adapter.read_dhcp_leases(credentials)
 
+    async def list_router_live_pools(
+        self,
+        router_id: uuid.UUID,
+        *,
+        requesting_organization_id: uuid.UUID | None = None,
+    ) -> list[DhcpPoolReading]:
+        """Every address pool on this router, read live over 8728.
+
+        The ``dhcp_pools`` table only holds ranges created through the
+        platform; the pool the setup script made exists on the device and
+        nowhere else, so the IP Addresses page showed nothing for most
+        routers. This is that page's "current on router" read. Read-only;
+        a failed read raises (502) rather than answering an empty list.
+        """
+        router = await self.router_lookup.get_router(
+            router_id, requesting_organization_id=requesting_organization_id
+        )
+        ensure_not_controller_managed(router, feature="IP Addresses")
+        credentials = self._resolve_device_credentials(router)
+        adapter = get_dhcp_adapter(router.vendor)
+        return await adapter.read_dhcp_pools(credentials)
+
+    async def update_router_live_pool(
+        self,
+        router_id: uuid.UUID,
+        pool_name: str,
+        *,
+        range_start: str,
+        range_end: str,
+        lease_time_seconds: int | None,
+        dns_servers: list[str] | None,
+        actor_user_id: uuid.UUID | None,
+        requesting_organization_id: uuid.UUID | None = None,
+    ) -> DhcpPoolReading:
+        """Edit the pool the router is handing out now -- the setup
+        script's own ``/ip pool``, which has no ``dhcp_pools`` row -- in
+        place, and read it back.
+
+        Refused before any write (422) when the new range leaves the pool's
+        network or covers the router's own address: either would need the
+        router's address on that interface changed, and the hotspot with
+        it, which this edit never touches. 404 when the router has no pool
+        of that name; 502 when the router cannot be reached or did not keep
+        the change. Audited as ``DHCP_POOL_UPDATED`` on the router.
+        """
+        router = await self.router_lookup.get_router(
+            router_id, requesting_organization_id=requesting_organization_id
+        )
+        ensure_not_controller_managed(router, feature="IP Addresses")
+        start, end = range_start.strip(), range_end.strip()
+        validate_address_range(start, end)
+        dns = [d.strip() for d in (dns_servers or []) if d.strip()]
+        for d in dns:
+            validate_ipv4_host("dns_server", d)
+        credentials = self._resolve_device_credentials(router)
+        adapter = get_dhcp_adapter(router.vendor)
+
+        current = next(
+            (
+                p
+                for p in await adapter.read_dhcp_pools(credentials)
+                if p.pool_name == pool_name
+            ),
+            None,
+        )
+        if current is None:
+            raise DhcpLivePoolNotFoundError(pool_name)
+        if current.network is None:
+            raise DhcpLivePoolEditRefusedError(
+                "This pool has no network settings on the router, so the "
+                "range can't be checked. Nothing was changed."
+            )
+        network = ipaddress.ip_network(current.network, strict=False)
+        start_ip, end_ip = ipaddress.ip_address(start), ipaddress.ip_address(end)
+        if start_ip not in network or end_ip not in network:
+            raise DhcpLivePoolEditRefusedError(
+                f"The range has to stay inside {current.network}. Moving it "
+                "to another network would change the router's own address "
+                "and the hotspot. Nothing was changed."
+            )
+        if start_ip in (network.network_address, network.broadcast_address) or (
+            end_ip == network.broadcast_address
+        ):
+            raise DhcpLivePoolEditRefusedError(
+                f"{start if start_ip == network.network_address else end} can't "
+                "be handed out to a device. Nothing was changed."
+            )
+        if current.gateway:
+            gateway = ipaddress.ip_address(current.gateway)
+            if start_ip <= gateway <= end_ip:
+                raise DhcpLivePoolEditRefusedError(
+                    f"The range includes the router's own address "
+                    f"{current.gateway}. Start it after that address. "
+                    "Nothing was changed."
+                )
+
+        updated = await adapter.update_dhcp_pool_in_place(
+            credentials,
+            pool_name=pool_name,
+            ranges=f"{start}-{end}",
+            lease_time=(
+                f"{lease_time_seconds}s" if lease_time_seconds is not None else None
+            ),
+            dns_servers=tuple(dns) if dns_servers is not None else None,
+        )
+        await self._audit(
+            actor_user_id,
+            AuditAction.DHCP_POOL_UPDATED,
+            entity_id=router_id,
+            organization_id=router.organization_id,
+            description=(
+                f"Router pool {pool_name} on router {router_id} set to "
+                f"{start}-{end}"
+            ),
+            entity_type="router",
+        )
+        return updated
+
     async def keep_lease_address(
         self,
         router_id: uuid.UUID,
@@ -1095,6 +1243,116 @@ class DhcpService:
                 entity_type="router",
             )
         return lease, changed
+
+    async def pin_device_leases(
+        self,
+        router: Router,
+        mac_addresses: Iterable[str],
+        *,
+        actor_user_id: uuid.UUID | None,
+    ) -> list[LeasePinOutcome]:
+        """Give each known device (an access point, a printer -- anything
+        registered as Monitored Hardware) a fixed address: every dynamic
+        lease this router holds for one of ``mac_addresses`` is made static
+        on the address it already has, so the device keeps that IP, bound
+        to its MAC, from then on.
+
+        One lease read per call, then one :meth:`keep_lease_address`-style
+        write per dynamic lease -- the same idempotent device write, so a
+        repeat call writes nothing. Never moves a device to a new address:
+        it only freezes the one the router already gave it.
+
+        ``router`` is an already-resolved row: both callers (registration,
+        which has just resolved it in the caller's own organization, and the
+        device-sync sweep, which is platform-side) have it in hand. A
+        controller-managed router has no RouterOS lease table and returns
+        an empty list. A failed lease *read* raises -- the caller decides
+        whether that is fatal; one MAC's failed *write* is reported in its
+        own outcome and never stops the rest.
+        """
+        wanted = sorted({normalize_lease_mac(m) for m in mac_addresses})
+        if not wanted or not is_agent_managed(router.vendor):
+            return []
+        credentials = self._resolve_device_credentials(router)
+        adapter = get_dhcp_adapter(router.vendor)
+        leases: dict[str, DhcpLeaseReading] = {}
+        for lease in await adapter.read_dhcp_leases(credentials):
+            try:
+                mac = normalize_lease_mac(lease.mac_address)
+            except DhcpError:
+                continue
+            # A static row wins over a dynamic one for the same MAC: the
+            # reservation is the answer.
+            if mac not in leases or not lease.dynamic:
+                leases[mac] = lease
+
+        outcomes: list[LeasePinOutcome] = []
+        for mac in wanted:
+            lease = leases.get(mac)
+            if lease is None or not lease.address or lease.disabled:
+                outcomes.append(LeasePinOutcome(mac_address=mac, status="no_lease"))
+                continue
+            if not lease.dynamic:
+                outcomes.append(
+                    LeasePinOutcome(
+                        mac_address=mac,
+                        status="already_static",
+                        ip_address=lease.address,
+                    )
+                )
+                continue
+            try:
+                kept, changed = await adapter.keep_dhcp_lease_address(
+                    credentials, mac_address=mac, address=lease.address
+                )
+            except DhcpLeaseNotFoundError:
+                outcomes.append(LeasePinOutcome(mac_address=mac, status="no_lease"))
+                continue
+            except DhcpLeaseConflictError as exc:
+                outcomes.append(
+                    LeasePinOutcome(
+                        mac_address=mac,
+                        status="conflict",
+                        ip_address=lease.address,
+                        detail=str(exc),
+                    )
+                )
+                continue
+            except (DhcpDeviceConnectionError, DhcpDeviceOperationError) as exc:
+                outcomes.append(
+                    LeasePinOutcome(
+                        mac_address=mac,
+                        status="failed",
+                        ip_address=lease.address,
+                        detail=str(exc),
+                    )
+                )
+                continue
+            address = kept.address or lease.address
+            outcomes.append(
+                LeasePinOutcome(
+                    mac_address=mac,
+                    status="pinned" if changed else "already_static",
+                    ip_address=address,
+                )
+            )
+            if changed:
+                logger.info(
+                    "dhcp_lease_pinned_for_hardware",
+                    extra={"router_id": str(router.id), "address": address},
+                )
+                await self._audit(
+                    actor_user_id,
+                    AuditAction.DHCP_LEASE_MADE_STATIC,
+                    entity_id=router.id,
+                    organization_id=router.organization_id,
+                    description=(
+                        f"DHCP lease for {mac} kept on {address} (made static) on "
+                        f"router {router.id} -- registered hardware"
+                    ),
+                    entity_type="router",
+                )
+        return outcomes
 
     def _resolve_device_credentials(self, router: Router) -> DhcpCredentials:
         """Raise rather than guess -- mirrors ``vlan``/``qos``."""
@@ -1161,5 +1419,6 @@ __all__ = [
     "AuditLogWriter",
     "CaptivePortalDhcpOptionConvergence",
     "DhcpService",
+    "LeasePinOutcome",
     "RogueDhcpDetectionSummary",
 ]

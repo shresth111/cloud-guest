@@ -59,7 +59,10 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from app.domains.router.exceptions import RouterNotFoundError
-from app.domains.router.vendor_capabilities import is_controller_managed
+from app.domains.router.vendor_capabilities import (
+    NAS_ONLY_VENDORS,
+    is_controller_managed,
+)
 
 from .constants import BlockEnforcementStatus
 from .device_adapters import GuestAccessCredentials, get_guest_access_adapter
@@ -114,6 +117,29 @@ class RouterBlockRecord(Protocol):
     mac_address: str
 
 
+class NasOnlyDeviceBlockerProtocol(Protocol):
+    """The Aruba Instant On leg: a persistent MAC block through Instant On's
+    cloud, read back (``network_integration.instant_on_control``). Each call
+    answers ``(status, error_message)`` with ``status`` one of ``enforced`` /
+    ``failed`` / ``unavailable`` (cloud control not switched on: nothing was
+    sent)."""
+
+    async def block(
+        self, *, router: DeviceBlockRouterRow, mac_address: str
+    ) -> tuple[str, str | None]: ...
+
+    async def release(
+        self, *, router: DeviceBlockRouterRow, mac_address: str
+    ) -> tuple[str, str | None]: ...
+
+
+#: Recorded on a device rule's Aruba row when Instant On cloud control is off.
+NAS_ONLY_DEVICE_BLOCK_UNAVAILABLE = (
+    "Not kept off the WiFi: Instant On cloud control isn't switched on for this "
+    "venue. The device is refused when it next signs in."
+)
+
+
 @dataclass(frozen=True, slots=True)
 class RouterDeviceBlockOutcome:
     """What one router did about one device rule.
@@ -157,9 +183,14 @@ class RouterDeviceBlocker:
         *,
         router_lookup: RouterScopeLookupProtocol,
         adapter_factory: object = None,
+        nas_only: NasOnlyDeviceBlockerProtocol | None = None,
     ) -> None:
         self.router_lookup = router_lookup
         self._adapter_factory = adapter_factory or get_guest_access_adapter
+        self._nas_only = nas_only
+
+    def _is_nas_only(self, router: DeviceBlockRouterRow) -> bool:
+        return self._nas_only is not None and router.vendor in NAS_ONLY_VENDORS
 
     def _credentials(
         self, router: DeviceBlockRouterRow
@@ -196,6 +227,11 @@ class RouterDeviceBlocker:
         marker = device_block_marker(rule_id)
         outcomes: list[RouterDeviceBlockOutcome] = []
         for router in routers:
+            if self._is_nas_only(router):
+                outcome = await self._block_nas_only(router, mac_address)
+                if outcome is not None:
+                    outcomes.append(outcome)
+                continue
             adapter = self._adapter_for(router)
             if adapter is None:
                 continue
@@ -209,6 +245,38 @@ class RouterDeviceBlocker:
             },
         )
         return outcomes
+
+    async def _block_nas_only(
+        self, router: DeviceBlockRouterRow, mac_address: str
+    ) -> RouterDeviceBlockOutcome | None:
+        """Aruba Instant On: one persistent Instant On block per venue site,
+        read back. Recorded against the Instant On router row so unblock /
+        expiry find it again. ``not_applicable`` (with the reason) when
+        cloud control is off -- the sign-in refusal still applies."""
+        assert self._nas_only is not None  # noqa: S101 -- guarded by caller
+        try:
+            status, error = await self._nas_only.block(
+                router=router, mac_address=mac_address
+            )
+        except Exception as exc:  # noqa: BLE001 -- recorded per router
+            status, error = "failed", str(exc)
+        if status == "unavailable":
+            return RouterDeviceBlockOutcome(
+                router_id=router.id,
+                location_id=router.location_id,
+                status=BlockEnforcementStatus.NOT_APPLICABLE.value,
+                error_message=NAS_ONLY_DEVICE_BLOCK_UNAVAILABLE,
+            )
+        return RouterDeviceBlockOutcome(
+            router_id=router.id,
+            location_id=router.location_id,
+            status=(
+                BlockEnforcementStatus.ENFORCED.value
+                if status == "enforced"
+                else BlockEnforcementStatus.FAILED.value
+            ),
+            error_message=None if status == "enforced" else error,
+        )
 
     async def _block_one(
         self,
@@ -300,6 +368,30 @@ class RouterDeviceBlocker:
                 released=True,
                 error_message="The router no longer exists here; nothing to remove.",
             )
+        if self._is_nas_only(router):
+            assert self._nas_only is not None  # noqa: S101
+            try:
+                status, error = await self._nas_only.release(
+                    router=router, mac_address=record.mac_address
+                )
+            except Exception as exc:  # noqa: BLE001 -- recorded on the row
+                return RouterDeviceReleaseOutcome(
+                    released=False, error_message=str(exc)
+                )
+            if status == "unavailable":
+                # Cloud control switched off since: nothing can reach the
+                # Instant On site from here. Left open, said plainly.
+                return RouterDeviceReleaseOutcome(
+                    released=False,
+                    error_message=(
+                        "Instant On cloud control is off, so the block on "
+                        "Instant On could not be removed from here."
+                    ),
+                )
+            return RouterDeviceReleaseOutcome(
+                released=status == "enforced",
+                error_message=None if status == "enforced" else error,
+            )
         adapter = self._adapter_for(router)
         if adapter is None:
             return RouterDeviceReleaseOutcome(
@@ -330,6 +422,8 @@ class RouterDeviceBlocker:
 
 __all__ = [
     "DEVICE_BLOCK_MARKER_PREFIX",
+    "NAS_ONLY_DEVICE_BLOCK_UNAVAILABLE",
+    "NasOnlyDeviceBlockerProtocol",
     "RouterDeviceBlockOutcome",
     "RouterDeviceBlocker",
     "RouterDeviceReleaseOutcome",

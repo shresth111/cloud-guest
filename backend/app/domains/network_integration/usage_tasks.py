@@ -80,10 +80,11 @@ per-venue.
 
 from __future__ import annotations
 
+import ipaddress
 import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Protocol
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -93,6 +94,7 @@ from app.core.celery_app import celery_app
 from app.core.logging import get_logger
 from app.database.redis import redis_client
 from app.database.session import SessionLocal
+from app.domains.guest.constants import InternetConfirmationSource
 from app.domains.guest.repository import GuestRepository
 from app.domains.guest.service import GuestService
 from app.domains.location.repository import (
@@ -120,6 +122,7 @@ logger = get_logger(__name__)
 __all__ = [
     "OmadaUsageSyncSummary",
     "apply_controller_usage",
+    "controller_authorized_session_ids",
     "run_omada_usage_sync_sweep",
     "sync_omada_session_usage",
 ]
@@ -145,6 +148,7 @@ class _ActiveSession(Protocol):
     bytes_uploaded: int
     bytes_downloaded: int
     started_at: datetime
+    ip_address: str | None
 
 
 class _Device(Protocol):
@@ -163,6 +167,8 @@ class OmadaUsageSyncSummary:
     sessions_updated: int = 0
     bytes_uploaded_applied: int = 0
     bytes_downloaded_applied: int = 0
+    session_ips_updated: int = 0
+    sessions_internet_confirmed: int = 0
 
 
 def _canonical_mac(raw: str | None) -> str | None:
@@ -225,6 +231,110 @@ async def _store_cursors(
         )
 
 
+def _session_by_mac(
+    active_sessions: Sequence[_ActiveSession],
+    devices_by_id: Mapping[uuid.UUID, _Device],
+) -> dict[str, _ActiveSession]:
+    """Active sessions keyed by their device's canonical MAC.
+
+    Deterministic session selection: a device that overran its session
+    timeout can briefly hold an ACTIVE stale row AND a fresh re-login row at
+    once (the login path does not reuse an overrun ACTIVE session, and
+    sessions are append-only). The controller's live client belongs to the
+    current connection, i.e. the most recently started session -- pick that
+    one, deterministically, instead of whichever the query happened to order
+    first.
+    """
+    session_by_mac: dict[str, _ActiveSession] = {}
+    for session in active_sessions:
+        if session.device_id is None:
+            continue
+        device = devices_by_id.get(session.device_id)
+        if device is None:
+            continue
+        canonical = _canonical_mac(device.mac_address)
+        if canonical is None:
+            continue
+        incumbent = session_by_mac.get(canonical)
+        if incumbent is None or session.started_at > incumbent.started_at:
+            session_by_mac[canonical] = session
+    return session_by_mac
+
+
+def controller_client_ip_updates(
+    *,
+    clients: Sequence[ProviderClient],
+    active_sessions: Sequence[_ActiveSession],
+    devices_by_id: Mapping[uuid.UUID, _Device],
+) -> dict[uuid.UUID, str]:
+    """The LAN address each matched active session should carry, where it
+    differs from what the session row holds.
+
+    ## Why the session row is wrong to begin with
+
+    A guest session's ``ip_address`` is set at sign-in from the address the
+    portal saw. With the controller off-site (our EC2-hosted Omada), that is
+    the venue's PUBLIC NAT address -- the controller reports the source of
+    the HTTP request it received, so every guest at the venue shows the same
+    one (measured 2026-09-11 and again 2026-10-16: ``103.84.202.219`` for
+    every guest while they were ``192.168.1.106`` / ``.123``). The
+    controller's own client list, which the AP fills, carries the real LAN
+    address; this reads it from there.
+
+    Pure: matching only, by the same MAC rule as the usage delta. A client
+    with no address, or one that is not an IP, changes nothing -- a missing
+    reading never blanks a recorded one.
+    """
+    session_by_mac = _session_by_mac(active_sessions, devices_by_id)
+    updates: dict[uuid.UUID, str] = {}
+    for client in clients:
+        canonical = _canonical_mac(client.mac)
+        if canonical is None:
+            continue
+        session = session_by_mac.get(canonical)
+        if session is None:
+            continue
+        try:
+            address = str(ipaddress.ip_address((client.ip_address or "").strip()))
+        except ValueError:
+            continue
+        if address != session.ip_address:
+            updates[session.id] = address
+    return updates
+
+
+def controller_authorized_session_ids(
+    *,
+    clients: Sequence[ProviderClient],
+    active_sessions: Sequence[_ActiveSession],
+    devices_by_id: Mapping[uuid.UUID, _Device],
+) -> list[uuid.UUID]:
+    """Matched active sessions whose controller client reads
+    ``is_authorized is True`` (Omada ``authStatus`` authorized) and that have
+    no ``internet_confirmed_at`` yet -- the "internet confirmed" funnel stage
+    for Open-API venues.
+
+    Only ``True`` counts. ``None`` is "the controller did not say" and
+    ``False`` is pending / connected-without-auth (see
+    ``ProviderClient.is_authorized``); traffic bytes are not used, because a
+    pre-auth client moves portal traffic too. Pure: matching by the same MAC
+    rule as the usage delta, no reads or writes."""
+    session_by_mac = _session_by_mac(active_sessions, devices_by_id)
+    confirmed: list[uuid.UUID] = []
+    for client in clients:
+        if client.is_authorized is not True:
+            continue
+        canonical = _canonical_mac(client.mac)
+        if canonical is None:
+            continue
+        session = session_by_mac.get(canonical)
+        if session is None or getattr(session, "internet_confirmed_at", None):
+            continue
+        if session.id not in confirmed:
+            confirmed.append(session.id)
+    return confirmed
+
+
 async def apply_controller_usage(
     *,
     clients: Sequence[ProviderClient],
@@ -265,26 +375,7 @@ async def apply_controller_usage(
     never runs backwards and a reset costs at most the unseen tail -- the safe
     direction to be wrong in for a cap meant to be enforced.
     """
-    # Deterministic session selection: a device that overran its session
-    # timeout can briefly hold an ACTIVE stale row AND a fresh re-login row at
-    # once (the login path does not reuse an overrun ACTIVE session, and
-    # sessions are append-only). The controller's live traffic belongs to the
-    # current connection, i.e. the most recently started session -- pick that
-    # one, deterministically, instead of whichever the query happened to order
-    # first.
-    session_by_mac: dict[str, _ActiveSession] = {}
-    for session in active_sessions:
-        if session.device_id is None:
-            continue
-        device = devices_by_id.get(session.device_id)
-        if device is None:
-            continue
-        canonical = _canonical_mac(device.mac_address)
-        if canonical is None:
-            continue
-        incumbent = session_by_mac.get(canonical)
-        if incumbent is None or session.started_at > incumbent.started_at:
-            session_by_mac[canonical] = session
+    session_by_mac = _session_by_mac(active_sessions, devices_by_id)
 
     sessions_updated = 0
     up_applied = 0
@@ -418,6 +509,37 @@ async def sync_omada_session_usage(
         # Persist cursors only after record_usage succeeded for this venue, so a
         # mid-venue failure re-baselines next tick rather than skipping usage.
         await _store_cursors(redis, new_cursors)
+
+        # The guest's LAN address, from the same controller read. See
+        # ``controller_client_ip_updates`` for why the row needs it.
+        ip_updates = controller_client_ip_updates(
+            clients=clients,
+            active_sessions=active_sessions,
+            devices_by_id=devices_by_id,
+        )
+        sessions_by_id = {s.id: s for s in active_sessions}
+        for session_id, address in ip_updates.items():
+            await guest_repository.update_session(
+                sessions_by_id[session_id], {"ip_address": address}
+            )
+        summary.session_ips_updated += len(ip_updates)
+
+        # "Internet confirmed" for the login funnel, off this same client
+        # read -- the controller's own authStatus, no extra call. The
+        # repository method is first-write-wins and never raises.
+        observed_at = datetime.now(UTC)
+        mark_confirmed = getattr(guest_repository, "mark_internet_confirmed", None)
+        for session_id in controller_authorized_session_ids(
+            clients=clients,
+            active_sessions=active_sessions,
+            devices_by_id=devices_by_id,
+        ):
+            if mark_confirmed is not None and await mark_confirmed(
+                session_id,
+                at=observed_at,
+                source=InternetConfirmationSource.OMADA_CLIENT_AUTHORIZED.value,
+            ):
+                summary.sessions_internet_confirmed += 1
         summary.integrations_synced += 1
         summary.sessions_updated += updated
         summary.bytes_uploaded_applied += up_applied
@@ -538,6 +660,7 @@ def run_omada_usage_sync_sweep() -> dict[str, int]:
         "sessions_updated": summary.sessions_updated,
         "bytes_uploaded_applied": summary.bytes_uploaded_applied,
         "bytes_downloaded_applied": summary.bytes_downloaded_applied,
+        "sessions_internet_confirmed": summary.sessions_internet_confirmed,
     }
     logger.info("omada_usage_sync_sweep_completed", extra=result)
     return result

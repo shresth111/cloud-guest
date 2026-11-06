@@ -48,7 +48,7 @@ from __future__ import annotations
 import dataclasses
 import logging
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -332,6 +332,13 @@ class PlanService:
 
     async def list_features(self, plan_id: uuid.UUID) -> list[PlanFeature]:
         return await self.repository.list_plan_features(plan_id)
+
+    async def list_features_for_plans(
+        self, plan_ids: Sequence[uuid.UUID]
+    ) -> dict[uuid.UUID, list[PlanFeature]]:
+        """Features for a page of plans in one query -- see
+        ``PlanRepository.list_plan_features_for_plans``."""
+        return await self.repository.list_plan_features_for_plans(plan_ids)
 
     async def list_plans(
         self,

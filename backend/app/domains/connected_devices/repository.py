@@ -18,9 +18,11 @@ to delegate to).
 from __future__ import annotations
 
 import uuid
+from collections.abc import Iterable
+from datetime import datetime
 from typing import Protocol
 
-from sqlalchemy import select
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.constants import DEFAULT_SORT_FIELD, SortOrder
@@ -30,7 +32,7 @@ from app.domains.monitored_hardware.models import MonitoredHardware
 from app.domains.router.fleet_scope import agent_managed_only
 from app.domains.router.models import Router
 
-from .models import ConnectedDevice
+from .models import ConnectedDevice, MonitoredDeviceEvent, MonitoredDeviceHealth
 
 
 class ConnectedDeviceRepositoryProtocol(Protocol):
@@ -79,6 +81,22 @@ class ConnectedDeviceRepositoryProtocol(Protocol):
     async def list_monitored_macs_for_router(
         self, router_id: uuid.UUID
     ) -> set[str]: ...
+
+    async def get_health_for_devices(
+        self, device_ids: Iterable[uuid.UUID]
+    ) -> dict[uuid.UUID, MonitoredDeviceHealth]: ...
+
+    async def save_health(
+        self, existing: MonitoredDeviceHealth | None, fields: dict[str, object]
+    ) -> MonitoredDeviceHealth: ...
+
+    async def add_device_event(self, **fields: object) -> MonitoredDeviceEvent: ...
+
+    async def count_link_flaps_since(
+        self, device_ids: Iterable[uuid.UUID], since: datetime
+    ) -> dict[uuid.UUID, int]: ...
+
+    async def prune_device_events(self, before: datetime) -> int: ...
 
 
 class ConnectedDeviceRepository:
@@ -253,6 +271,68 @@ class ConnectedDeviceRepository:
         )
         result = await self.session.execute(statement)
         return set(result.scalars().all())
+
+    # -- monitored-device health (written only by the liveness sweep) -----
+
+    async def get_health_for_devices(
+        self, device_ids: Iterable[uuid.UUID]
+    ) -> dict[uuid.UUID, MonitoredDeviceHealth]:
+        ids = list(device_ids)
+        if not ids:
+            return {}
+        result = await self.session.execute(
+            select(MonitoredDeviceHealth).where(
+                MonitoredDeviceHealth.connected_device_id.in_(ids)
+            )
+        )
+        return {row.connected_device_id: row for row in result.scalars().all()}
+
+    async def save_health(
+        self, existing: MonitoredDeviceHealth | None, fields: dict[str, object]
+    ) -> MonitoredDeviceHealth:
+        if existing is None:
+            row = MonitoredDeviceHealth(**fields)
+            self.session.add(row)
+        else:
+            row = existing
+            for key, value in fields.items():
+                setattr(row, key, value)
+        await self.session.flush()
+        return row
+
+    async def add_device_event(self, **fields: object) -> MonitoredDeviceEvent:
+        row = MonitoredDeviceEvent(**fields)
+        self.session.add(row)
+        await self.session.flush()
+        return row
+
+    async def count_link_flaps_since(
+        self, device_ids: Iterable[uuid.UUID], since: datetime
+    ) -> dict[uuid.UUID, int]:
+        ids = list(device_ids)
+        if not ids:
+            return {}
+        result = await self.session.execute(
+            select(
+                MonitoredDeviceEvent.connected_device_id,
+                func.coalesce(func.sum(MonitoredDeviceEvent.count), 0),
+            )
+            .where(
+                MonitoredDeviceEvent.connected_device_id.in_(ids),
+                MonitoredDeviceEvent.kind == "link_down",
+                MonitoredDeviceEvent.occurred_at >= since,
+            )
+            .group_by(MonitoredDeviceEvent.connected_device_id)
+        )
+        return {device_id: int(total) for device_id, total in result.all()}
+
+    async def prune_device_events(self, before: datetime) -> int:
+        result = await self.session.execute(
+            delete(MonitoredDeviceEvent).where(
+                MonitoredDeviceEvent.occurred_at < before
+            )
+        )
+        return int(result.rowcount or 0)
 
 
 __all__ = ["ConnectedDeviceRepositoryProtocol", "ConnectedDeviceRepository"]

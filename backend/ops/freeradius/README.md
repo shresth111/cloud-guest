@@ -56,6 +56,29 @@ git blame on this directory's own commit for the full incident writeup).
    already-resolved attributes. See `sites-default.snippets.conf` for the
    exact pattern.
 
+## Reply attribute names come from the stock dictionaries (2026-10-03)
+
+`rlm_rest` turns every top-level key of the `/radius/authorize` JSON into a
+reply attribute **by name**, and a name it cannot resolve is skipped with
+"Invalid vendor name in attribute name ...", silently. The vendor names the
+backend sends resolve only because FreeRADIUS's stock
+`/usr/share/freeradius/dictionary` already `$INCLUDE`s the vendor files --
+nothing in this repo adds a dictionary:
+
+| Key the backend sends | Dictionary | Sent to |
+|---|---|---|
+| `Mikrotik-Rate-Limit` | `dictionary.mikrotik` (14988) | MikroTik / Omada sessions with a queue |
+| `WISPr-Bandwidth-Max-Down` / `-Up` (bits/s) | `dictionary.wispr` (14122) | only NAS-only routers named in `CLOUDGUEST_RADIUS_BANDWIDTH_ATTRIBUTE_ROUTER_IDS` (an Aruba Instant On experiment, empty by default) |
+
+Checked: the `freeradius/freeradius-server:3.2.1` image (the staging hub's
+base) has `$INCLUDE dictionary.wispr` and `$INCLUDE dictionary.aruba`, and the
+prod hub has `dictionary.wispr` installed (`ls /usr/share/freeradius`,
+2026-10-02). In an offline 3.2.1 run with this repo's `rest.conf` and
+snippets, a mock backend reply carrying both WISPr keys came back on the
+Access-Accept as `WISPr-Bandwidth-Max-Down = 2048000` /
+`WISPr-Bandwidth-Max-Up = 512000`. Whether an Aruba Instant On AP *acts* on
+them is a separate question, still unmeasured on hardware.
+
 ## Dynamic NAS clients -- `clients.wyfy.conf` is generated, not hand-maintained
 
 A RADIUS shared secret must be known to FreeRADIUS *before* any

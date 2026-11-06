@@ -16,7 +16,7 @@ from __future__ import annotations
 import uuid
 from typing import Protocol
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import column, func, or_, select, table
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.constants import DEFAULT_SORT_FIELD, SortOrder
@@ -26,6 +26,13 @@ from app.domains.rbac.enums import ScopeType
 
 from .constants import PolicyAssignmentTargetType
 from .models import Policy, PolicyAssignment, PolicyVersion
+
+# A column-only handle on ``guests`` so the GUEST-target ownership check can
+# read a guest's organization without importing ``app.domains.guest`` (which
+# depends on ``policy``; importing it back would make an import cycle).
+_guests = table(
+    "guests", column("id"), column("organization_id"), column("is_deleted")
+)
 
 
 class PolicyRepositoryProtocol(Protocol):
@@ -100,7 +107,15 @@ class PolicyRepositoryProtocol(Protocol):
         target_type: str,
         target_id: uuid.UUID,
         exclude_policy_id: uuid.UUID | None = None,
+        organization_id: uuid.UUID | None = None,
     ) -> PolicyAssignment | None: ...
+
+    async def count_active_guest_members(
+        self, policy_ids: list[uuid.UUID]
+    ) -> dict[uuid.UUID, int]: ...
+    async def get_guest_organization_id(
+        self, guest_id: uuid.UUID
+    ) -> uuid.UUID | None: ...
 
 
 class PolicyRepository:
@@ -228,6 +243,11 @@ class PolicyRepository:
                 (PolicyAssignment.scope_type == ScopeType.LOCATION.value)
                 & (PolicyAssignment.scope_id == location_id)
             )
+        # ``MEMBERS`` is deliberately absent from every branch below: it
+        # records that a tier is offered at a scope and applies it to no
+        # one (see ``PolicyAssignmentTargetType.MEMBERS``). Only an
+        # enumerated target shape can be a candidate, so a row with any
+        # other ``target_type`` is never selected.
         target_conditions = [
             PolicyAssignment.target_type == PolicyAssignmentTargetType.NONE.value
         ]
@@ -270,6 +290,7 @@ class PolicyRepository:
         target_type: str,
         target_id: uuid.UUID,
         exclude_policy_id: uuid.UUID | None = None,
+        organization_id: uuid.UUID | None = None,
     ) -> PolicyAssignment | None:
         """The active, ``target_type``-targeted assignment naming
         ``target_id`` for any active/non-deleted policy of ``policy_type``
@@ -284,7 +305,14 @@ class PolicyRepository:
         one. ``exclude_policy_id``, when given, skips that one policy's own
         assignments -- lets a caller ask "is this guest mapped to any
         *other* policy of this type" in one query instead of fetching
-        every match and filtering client-side."""
+        every match and filtering client-side.
+
+        ``organization_id``, when given, only considers policies owned by
+        that organization: "one guest, one tier" is a rule *within* a
+        tenant. Platform-wide, one organization's row (legacy, or written
+        before target ownership was checked) could block another
+        organization from mapping its own guest, and the 409 leaked the
+        foreign policy/assignment ids."""
         stmt = (
             select(PolicyAssignment)
             .join(Policy, Policy.id == PolicyAssignment.policy_id)
@@ -301,8 +329,43 @@ class PolicyRepository:
         )
         if exclude_policy_id is not None:
             stmt = stmt.where(PolicyAssignment.policy_id != exclude_policy_id)
+        if organization_id is not None:
+            stmt = stmt.where(Policy.organization_id == organization_id)
         result = await self.session.execute(stmt)
         return result.scalars().first()
+
+    async def count_active_guest_members(
+        self, policy_ids: list[uuid.UUID]
+    ) -> dict[uuid.UUID, int]:
+        """Active ``GUEST`` assignments per policy -- the "Members" figure
+        beside an Access Tier. One grouped statement for a whole page of
+        policies; a policy with no members is simply absent from the
+        result."""
+        if not policy_ids:
+            return {}
+        stmt = (
+            select(PolicyAssignment.policy_id, func.count(PolicyAssignment.id))
+            .where(
+                PolicyAssignment.policy_id.in_(policy_ids),
+                PolicyAssignment.is_active.is_(True),
+                PolicyAssignment.is_deleted.is_(False),
+                PolicyAssignment.target_type == PolicyAssignmentTargetType.GUEST.value,
+            )
+            .group_by(PolicyAssignment.policy_id)
+        )
+        result = await self.session.execute(stmt)
+        return {row[0]: int(row[1]) for row in result.all()}
+    async def get_guest_organization_id(
+        self, guest_id: uuid.UUID
+    ) -> uuid.UUID | None:
+        """The organization that owns ``guest_id``, or ``None`` if there is
+        no such (non-deleted) guest. Backs ``PolicyService``'s
+        GUEST-target ownership check (``GuestLookupProtocol``)."""
+        stmt = select(_guests.c.organization_id).where(
+            _guests.c.id == guest_id, _guests.c.is_deleted.is_(False)
+        )
+        result = await self.session.execute(stmt)
+        return result.scalar_one_or_none()
 
 
 __all__ = ["PolicyRepositoryProtocol", "PolicyRepository"]

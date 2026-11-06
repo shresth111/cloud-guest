@@ -320,6 +320,13 @@ def wired(monkeypatch):  # noqa: ANN001, ANN201
     monkeypatch.setattr(tasks_module, "_load_presence_target", _fake_target)
     monkeypatch.setattr(tasks_module, "SessionLocal", lambda: db)
     monkeypatch.setattr(tasks_module, "GuestRepository", lambda _session: fx.repository)
+
+    async def _no_stamp(router_id, read_at):  # noqa: ANN001, ANN202
+        # The read stamp goes to Redis; these tests are about the database
+        # side. ``test_guest_bypassed_guest_activity`` covers the stamp.
+        return None
+
+    monkeypatch.setattr(tasks_module, "_record_presence_read", _no_stamp)
     return fx, db
 
 

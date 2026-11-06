@@ -106,8 +106,10 @@ from celery.schedules import crontab
 
 from app.core.config import get_settings
 from app.domains.analytics.constants import (
+    PORTAL_IMPRESSION_RETENTION_SWEEP_INTERVAL_SECONDS,
     SCHEDULED_REPORTS_CHECK_INTERVAL_SECONDS,
     TASK_RUN_DAILY_AGGREGATION_FOR_ALL_ORGANIZATIONS,
+    TASK_RUN_PORTAL_IMPRESSION_RETENTION_SWEEP,
     TASK_RUN_SCHEDULED_REPORTS,
 )
 from app.domains.billing.constants import (
@@ -131,6 +133,9 @@ from app.domains.connected_devices.constants import (
     TASK_RUN_MONITORED_HARDWARE_LIVENESS_SWEEP,
     TASK_SYNC_SINGLE_ROUTER_DEVICES,
 )
+from app.domains.device_logs.constants import (
+    TASK_DEVICE_LOGS_PARTITION_MAINTENANCE,
+)
 from app.domains.dhcp.constants import (
     ROGUE_DHCP_DETECTION_SWEEP_INTERVAL_SECONDS,
     TASK_CONVERGE_CAPTIVE_PORTAL_DHCP_OPTION_FOR_ROUTER,
@@ -144,11 +149,14 @@ from app.domains.dns_filtering.constants import (
 )
 from app.domains.guest.constants import (
     FUP_TIME_ACCRUAL_SWEEP_INTERVAL_SECONDS,
+    HOTSPOT_BINDING_RECONCILE_SWEEP_INTERVAL_SECONDS,
     OPEN_HOURS_ENFORCEMENT_SWEEP_INTERVAL_SECONDS,
     QUOTA_RESET_SWEEP_INTERVAL_SECONDS,
     SESSION_PRESENCE_SWEEP_INTERVAL_SECONDS,
     SESSION_TIMEOUT_SWEEP_INTERVAL_SECONDS,
+    TASK_RECONCILE_HOTSPOT_BINDINGS_FOR_SCOPE,
     TASK_RUN_FUP_TIME_ACCRUAL_SWEEP,
+    TASK_RUN_HOTSPOT_BINDING_RECONCILE_SWEEP,
     TASK_RUN_OPEN_HOURS_ENFORCEMENT_SWEEP,
     TASK_RUN_QUOTA_RESET_SWEEP,
     TASK_RUN_SESSION_PRESENCE_SWEEP,
@@ -166,6 +174,7 @@ from app.domains.hub_reconciliation.constants import (
     HUB_RECONCILIATION_SWEEP_INTERVAL_SECONDS,
     TASK_RUN_HUB_RECONCILIATION_SWEEP,
 )
+from app.domains.ipdr.constants import BEAT_IPDR_DAILY_BUILD, TASK_IPDR_DAILY_BUILD
 from app.domains.isp.constants import (
     ISP_HEALTH_CHECK_SWEEP_INTERVAL_SECONDS,
     TASK_RUN_ISP_HEALTH_CHECK_SWEEP,
@@ -215,7 +224,13 @@ from app.domains.provisioning_engine.constants import (
     TASK_RUN_ROUTER_SNMP_METRICS_POLL_SWEEP,
 )
 from app.domains.queue_management.constants import (
+    ARUBA_HYBRID_RECONCILE_INTERVAL_SECONDS,
+    BACKFILL_UNASSIGNED_SESSION_QUEUES_INTERVAL_SECONDS,
+    RELEASE_ENDED_SESSION_QUEUES_INTERVAL_SECONDS,
     SCHEDULE_SWEEP_INTERVAL_SECONDS,
+    TASK_BACKFILL_UNASSIGNED_SESSION_QUEUES,
+    TASK_RECONCILE_ARUBA_HYBRID_QUEUES,
+    TASK_RELEASE_ENDED_SESSION_QUEUES,
     TASK_SWEEP_SCHEDULE_TRANSITIONS,
 )
 from app.domains.router.constants import (
@@ -225,6 +240,10 @@ from app.domains.router.constants import (
     TASK_RUN_PROVISIONING_TOKEN_CLEANUP_SWEEP,
     TASK_RUN_ROUTER_REACHABILITY_SWEEP,
     TASK_RUN_STALE_HEARTBEAT_SWEEP,
+)
+from app.domains.traffic_flow.constants import (
+    TASK_RUN_TRAFFIC_FLOW_PULL_SWEEP,
+    TRAFFIC_FLOW_PULL_SWEEP_INTERVAL_SECONDS,
 )
 
 _settings = get_settings()
@@ -268,6 +287,8 @@ celery_app = Celery(
         "app.domains.billing.tasks",
         "app.domains.campaigns.tasks",
         "app.domains.connected_devices.tasks",
+        "app.domains.device_logs.tasks",
+        "app.domains.ipdr.tasks",
         "app.domains.dhcp.tasks",
         "app.domains.dns_filtering.tasks",
         "app.domains.guest.tasks",
@@ -280,10 +301,13 @@ celery_app = Celery(
         "app.domains.network_integration.tasks",
         "app.domains.network_integration.usage_tasks",
         "app.domains.network_integration.instant_on_tasks",
+        "app.domains.network_integration.instant_on_control",
+        "app.domains.network_integration.instant_on_disconnect_check",
         "app.domains.notification.tasks",
         "app.domains.provisioning_engine.tasks",
         "app.domains.queue_management.tasks",
         "app.domains.router.tasks",
+        "app.domains.traffic_flow.tasks",
     ],
 )
 
@@ -336,6 +360,21 @@ celery_app.conf.update(
         TASK_POLL_SINGLE_ROUTER_HEALTH: {"queue": DEVICE_IO_QUEUE_NAME},
         TASK_SYNC_SINGLE_ROUTER_DEVICES: {"queue": DEVICE_IO_QUEUE_NAME},
         TASK_RUN_ISP_HEALTH_CHECK_SWEEP: {"queue": DEVICE_IO_QUEUE_NAME},
+        # One sequential pass of real RouterOS API removes (one connection
+        # per ended session's row), so it belongs with the other device
+        # round trips rather than on the pure-DB default queue.
+        TASK_RELEASE_ENDED_SESSION_QUEUES: {"queue": DEVICE_IO_QUEUE_NAME},
+        # The same kind of pass in the other direction: one RouterOS API
+        # connection per session being given the queue its login could not
+        # write.
+        TASK_BACKFILL_UNASSIGNED_SESSION_QUEUES: {"queue": DEVICE_IO_QUEUE_NAME},
+        # The session-bypass reconciliation: one RouterOS API connection
+        # per router, sequentially, so the sweep and the scope fan-in belong
+        # with the other device round trips. The single-router, event-driven
+        # task is deliberately NOT routed here: it is what makes a dashboard
+        # disconnect prompt, and it must not queue behind a fleet poll.
+        TASK_RUN_HOTSPOT_BINDING_RECONCILE_SWEEP: {"queue": DEVICE_IO_QUEUE_NAME},
+        TASK_RECONCILE_HOTSPOT_BINDINGS_FOR_SCOPE: {"queue": DEVICE_IO_QUEUE_NAME},
         # Single sequential sweep issuing real SNMP UDP round trips per
         # router (like TASK_RUN_ISP_HEALTH_CHECK_SWEEP immediately above,
         # not yet fanned out -- see constants
@@ -479,6 +518,14 @@ celery_app.conf.update(
         "reports-run-scheduled": {
             "task": TASK_RUN_SCHEDULED_REPORTS,
             "schedule": SCHEDULED_REPORTS_CHECK_INTERVAL_SECONDS,
+        },
+        # Login funnel "portal opened" rows: hard-deleted after 92 days (the
+        # venue-insight endpoints' longest window), in bounded batches. In
+        # the app rather than the box's wyfy-retention.sh so it ships with
+        # the table. Pure DB, default queue.
+        "analytics-portal-impression-retention-sweep": {
+            "task": TASK_RUN_PORTAL_IMPRESSION_RETENTION_SWEEP,
+            "schedule": PORTAL_IMPRESSION_RETENTION_SWEEP_INTERVAL_SECONDS,
         },
         # BE-013 Part 2: Renewal Engine sweep -- hourly, not every 15
         # minutes like the analytics rolling tick above. See
@@ -695,6 +742,34 @@ celery_app.conf.update(
             "task": TASK_SWEEP_SCHEDULE_TRANSITIONS,
             "schedule": SCHEDULE_SWEEP_INTERVAL_SECONDS,
         },
+        # Takes an ended guest session's speed-limit row off its router --
+        # nothing else does. See QueueManagementService
+        # .release_queues_for_ended_sessions and constants
+        # .RELEASE_ENDED_SESSION_QUEUES_INTERVAL_SECONDS for the cadence.
+        "queue-management-release-ended-session-queues": {
+            "task": TASK_RELEASE_ENDED_SESSION_QUEUES,
+            "schedule": RELEASE_ENDED_SESSION_QUEUES_INTERVAL_SECONDS,
+        },
+        # Gives a queue to a live guest session whose login never got one
+        # onto the router (the router did not answer and the login's task
+        # ran out of retries) -- nothing else comes back for it. Does
+        # nothing unless switched on (see Settings
+        # .guest_queue_backfill_enabled / _router_ids). See
+        # QueueManagementService.backfill_queues_for_unassigned_sessions.
+        "queue-management-backfill-unassigned-session-queues": {
+            "task": TASK_BACKFILL_UNASSIGNED_SESSION_QUEUES,
+            "schedule": BACKFILL_UNASSIGNED_SESSION_QUEUES_INTERVAL_SECONDS,
+        },
+        # Takes a `cloudguest-authmac` hotspot bypass off a router once
+        # nothing lists its MAC -- the removal the router's own script was
+        # meant to do and, on every router provisioned before it was
+        # repaired, never has. Does nothing unless switched on (see
+        # Settings.guest_hotspot_gate_remove_enabled / _router_ids). See
+        # app.domains.guest.hotspot_binding_reconcile.
+        "guest-hotspot-binding-reconcile-sweep": {
+            "task": TASK_RUN_HOTSPOT_BINDING_RECONCILE_SWEEP,
+            "schedule": HOTSPOT_BINDING_RECONCILE_SWEEP_INTERVAL_SECONDS,
+        },
         # ISP Management domain: real RouterOS-backed health-check sweep --
         # every 10 minutes. See
         # app.domains.isp.service.run_health_check_sweep's own docstring
@@ -864,6 +939,24 @@ celery_app.conf.update(
             "task": TASK_RUN_DIAGNOSTIC_RUN_RETENTION_SWEEP,
             "schedule": DIAGNOSTIC_RUN_RETENTION_SWEEP_INTERVAL_SECONDS,
         },
+        # Device Logs: monthly partitions of device_log_events -- create
+        # the coming months ahead, drop the ones past
+        # Settings.device_logs_retention_months (24). Nightly at a fixed
+        # quiet hour (02:20 UTC = 07:50 IST) rather than an interval, so a
+        # redeploy never runs it mid-day. Pure DB, default queue. See
+        # app.domains.device_logs.partitions.
+        "device-logs-partition-maintenance": {
+            "task": TASK_DEVICE_LOGS_PARTITION_MAINTENANCE,
+            "schedule": crontab(hour=2, minute=20),
+        },
+        # IPDR: archive every closed IST day still inside flow-record
+        # retention (7 days) as one gzip NDJSON object per location, plus
+        # its Postgres index row. 19:40 UTC = 01:10 IST, after the IST day
+        # closes. No-op unless Settings.ipdr_enabled. See app.domains.ipdr.
+        BEAT_IPDR_DAILY_BUILD: {
+            "task": TASK_IPDR_DAILY_BUILD,
+            "schedule": crontab(hour=19, minute=40),
+        },
         # Network integrations: poll each enabled third-party controller
         # (TP-Link Omada today) for its sites/devices/clients. The
         # 60-second schedule here is the Beat *tick*, not the polling
@@ -907,6 +1000,13 @@ celery_app.conf.update(
             "task": TASK_RUN_INSTANT_ON_POLL_SWEEP,
             "schedule": INSTANT_ON_POLL_SWEEP_INTERVAL_SECONDS,
         },
+        # NetFlow/IPFIX: pull 5-minute windows from the hub's flow_agent.
+        # Returns without a network call unless
+        # CLOUDGUEST_TRAFFIC_FLOW_ENABLED is true (app.domains.traffic_flow).
+        "traffic-flow-pull-sweep": {
+            "task": TASK_RUN_TRAFFIC_FLOW_PULL_SWEEP,
+            "schedule": TRAFFIC_FLOW_PULL_SWEEP_INTERVAL_SECONDS,
+        },
         # Controller-side block release. The only scheduled thing standing
         # between a time-bound block and a permanently blocked customer
         # device: a rule's ``expires_at`` is evaluated lazily at read time,
@@ -925,6 +1025,15 @@ celery_app.conf.update(
         "guest-access-device-block-release-sweep": {
             "task": TASK_RUN_DEVICE_BLOCK_RELEASE_SWEEP,
             "schedule": DEVICE_BLOCK_RELEASE_SWEEP_INTERVAL_SECONDS,
+        },
+        # Aruba AP + MikroTik gateway hybrid: removes a per-guest gateway
+        # queue once its session has ended and the AP's own Session-Timeout
+        # has certainly fired, and retries a Stop-time removal that could not
+        # reach the gateway. Returns immediately unless
+        # CLOUDGUEST_ARUBA_HYBRID_SPEED_GATEWAY_ENABLED is true.
+        "aruba-hybrid-queue-reconcile-sweep": {
+            "task": TASK_RECONCILE_ARUBA_HYBRID_QUEUES,
+            "schedule": ARUBA_HYBRID_RECONCILE_INTERVAL_SECONDS,
         },
     },
 )
@@ -957,7 +1066,23 @@ def ping_celery_workers(
     return celery_app.control.inspect(timeout=timeout).ping()
 
 
-from celery.signals import worker_ready  # noqa: E402
+from celery.signals import (  # noqa: E402
+    after_setup_logger,
+    after_setup_task_logger,
+    worker_ready,
+)
+
+from app.core.logging import append_extras_to_handlers  # noqa: E402
+
+
+@after_setup_logger.connect
+@after_setup_task_logger.connect
+def _keep_structured_log_fields(logger=None, **_kwargs):  # noqa: ANN001
+    """Celery's handlers render ``%(message)s`` only, which dropped every
+    ``extra=`` field a task logged -- see
+    ``app.core.logging.ExtrasAppendingFormatter``."""
+    if logger is not None:
+        append_extras_to_handlers(logger)
 
 
 @worker_ready.connect

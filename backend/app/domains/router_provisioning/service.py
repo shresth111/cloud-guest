@@ -1802,9 +1802,10 @@ class RouterProvisioningService:
         poll that could not reach the device at all -- used by
         ``app.domains.provisioning_engine.service
         .run_router_health_poll_sweep`` when ``DeviceHealthResult.healthy``
-        is ``False``, and by that same module's
-        ``run_router_snmp_metrics_poll_sweep`` (``metrics_source="snmp"``)
-        on a real SNMP timeout/error. Deliberately **never** calls
+        is ``False``. (The SNMP sweep used to call this on a timeout too;
+        since 2026-10-06 it records that on ``Router.snmp_last_poll_*``
+        instead -- a silent SNMP agent is not an unhealthy device.)
+        Deliberately **never** calls
         ``RouterService.heartbeat`` (unlike ``record_health_snapshot``):
         that method unconditionally sets ``Router.status`` to ``ONLINE``
         and ``health_status`` to ``"healthy"`` -- calling it here would

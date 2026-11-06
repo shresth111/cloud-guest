@@ -33,11 +33,13 @@ from sqlalchemy import (
     or_,
     select,
     true,
+    update,
 )
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql.elements import ColumnElement
 
+from app.core.logging import get_logger
 from app.database.constants import DEFAULT_SORT_FIELD, SortOrder
 from app.database.repositories.generic import GenericRepository
 from app.database.utils.pagination import PageParams, PaginationMeta
@@ -63,6 +65,9 @@ from .models import (
     RadiusNasClient,
     RadiusNasCodeCounter,
 )
+from .validators import DevicePresenceObservation
+
+logger = get_logger(__name__)
 
 # ============================================================================
 # Analytics read-models (repository-layer return shapes -- service.py wraps
@@ -129,6 +134,25 @@ class DeviceSessionCount:
 class AuthMethodOutcomeCounts:
     total_attempts: int
     successful_attempts: int
+
+
+@dataclass(frozen=True, slots=True)
+class GuestSessionGroupRow:
+    """One guest's sessions at the filtered venue, aggregated -- see
+    ``GuestRepository.list_session_groups``. ``primary`` is the session the
+    venue Guests table shows for this guest: the newest ACTIVE one, else the
+    newest of any status."""
+
+    guest_id: uuid.UUID
+    session_count: int
+    active_session_count: int
+    device_count: int
+    first_started_at: datetime
+    last_started_at: datetime
+    bytes_downloaded_total: int
+    bytes_uploaded_total: int
+    primary: GuestSession
+    active_session_ids: tuple[uuid.UUID, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -201,7 +225,13 @@ def guest_identifier_clause(
     # branch predates `and_`/`or_` being imported here at all -- and a helper
     # that silently depends on it fails only where it is deployed, never
     # where it was written.
-    spelling = Guest.identifier.in_(terms.exact)
+    # An email compares ``lower(identifier)``: new rows are stored
+    # lower-cased (``normalize_identifier``), rows written before that are
+    # still in whatever case the guest typed, and both must resolve to the
+    # same person. Phones keep the plain ``IN`` so the unique
+    # ``(organization_id, identifier)`` index still serves them.
+    column = func.lower(Guest.identifier) if terms.casefold else Guest.identifier
+    spelling = column.in_(terms.exact)
     for pattern in terms.prefix_patterns:
         spelling = spelling | Guest.identifier.like(pattern)
     return (
@@ -281,7 +311,7 @@ class GuestRepositoryProtocol(Protocol):
 
     async def list_device_presence(
         self, *, router_mac_pairs: Sequence[tuple[uuid.UUID, str]]
-    ) -> dict[tuple[uuid.UUID, str], bool]: ...
+    ) -> dict[tuple[uuid.UUID, str], DevicePresenceObservation]: ...
 
     async def list_voucher_redemptions(
         self,
@@ -300,6 +330,18 @@ class GuestRepositoryProtocol(Protocol):
     async def update_session(
         self, session: GuestSession, data: dict[str, object]
     ) -> GuestSession: ...
+
+    async def has_blocking_review_activity(
+        self,
+        *,
+        guest_id: uuid.UUID,
+        location_id: uuid.UUID,
+        shown_since: datetime,
+    ) -> bool: ...
+
+    async def count_review_activity(
+        self, *, location_id: uuid.UUID, since: datetime
+    ) -> tuple[int, int]: ...
 
     async def list_sessions(
         self,
@@ -321,6 +363,18 @@ class GuestRepositoryProtocol(Protocol):
         page: int,
         page_size: int,
     ) -> tuple[list[GuestSession], PaginationMeta]: ...
+
+    async def list_session_groups(
+        self,
+        *,
+        organization_id: uuid.UUID | None,
+        location_id: uuid.UUID | Sequence[uuid.UUID] | None,
+        ap_mac: str | None,
+        active: bool | None,
+        search: str | None,
+        page: int,
+        page_size: int,
+    ) -> tuple[list[GuestSessionGroupRow], PaginationMeta]: ...
 
     async def list_sessions_for_guest(
         self, guest_id: uuid.UUID, *, limit: int | None = None
@@ -622,10 +676,11 @@ class GuestRepository:
         rewriting guest identifiers is a data decision, not a lookup one.
         Nothing here merges rows that are *already* split.
 
-        Emails are unaffected -- ``identifier_match_terms`` returns a single
-        exact term for anything it cannot prove is a phone number, and
-        ``canonicalize_rule_identifier`` returns email addresses exactly as
-        they arrive, case preserved.
+        Emails are matched case-insensitively -- ``identifier_match_terms``
+        returns the single lower-cased address with ``casefold=True`` and
+        the clause compares ``lower(identifier)``, so ``Guest@Gmail.com``
+        stored before emails were normalised is still the guest who now
+        signs in as ``guest@gmail.com``. See ``normalize_identifier``.
 
         ## The trade-off, named rather than discovered later
 
@@ -894,8 +949,8 @@ class GuestRepository:
 
     async def list_device_presence(
         self, *, router_mac_pairs: Sequence[tuple[uuid.UUID, str]]
-    ) -> dict[tuple[uuid.UUID, str], bool]:
-        """Whether the network is still seeing each ``(router, MAC)`` -- backs
+    ) -> dict[tuple[uuid.UUID, str], DevicePresenceObservation]:
+        """What the network last observed of each ``(router, MAC)`` -- backs
         ``GuestSessionResponse.device_online``.
 
         ## Why this reads another domain's table
@@ -917,7 +972,13 @@ class GuestRepository:
         -- the pair, not the MAC alone, because the same phone can be on two
         venues' networks and only one of them has seen it. A pair with no row
         is simply absent from the result, which the caller reads as "this
-        platform has no observation", never as ``False``."""
+        platform has no observation", never as ``False``.
+
+        The row's ``updated_at`` travels with the verdict because the sync
+        that writes it runs every 15 minutes: an ``is_active=False`` left
+        over from before a guest logged in is not an observation of that
+        login. ``validators.device_online_for_session`` is where the two are
+        weighed against a session."""
         if not router_mac_pairs:
             return {}
         router_ids = {router_id for router_id, _ in router_mac_pairs}
@@ -926,6 +987,7 @@ class GuestRepository:
             ConnectedDevice.router_id,
             ConnectedDevice.mac_address,
             ConnectedDevice.is_active,
+            ConnectedDevice.updated_at,
         ).where(
             ConnectedDevice.router_id.in_(router_ids),
             ConnectedDevice.mac_address.in_(mac_addresses),
@@ -933,8 +995,10 @@ class GuestRepository:
         )
         result = await self.session.execute(statement)
         return {
-            (router_id, mac_address): is_active
-            for router_id, mac_address, is_active in result.all()
+            (router_id, mac_address): DevicePresenceObservation(
+                is_active=is_active, observed_at=observed_at
+            )
+            for router_id, mac_address, is_active, observed_at in result.all()
         }
 
     async def list_voucher_redemptions(
@@ -1048,6 +1112,89 @@ class GuestRepository:
     ) -> GuestSession:
         return await self.sessions.update(session, data)
 
+    async def mark_internet_confirmed(
+        self, session_id: uuid.UUID, *, at: datetime, source: str
+    ) -> bool:
+        """Set ``internet_confirmed_at``/``_source`` if not already set.
+        First report wins; returns whether this call set it.
+
+        One conditional ``UPDATE`` (``WHERE internet_confirmed_at IS NULL``)
+        so concurrent reports for the same session -- an Accounting-Start and
+        the gate push landing together -- cannot overwrite each other. Run
+        inside a SAVEPOINT and never raises: a failure here must not poison
+        the caller's transaction (RADIUS accounting, the gate push, the
+        Omada usage sweep), whose own work matters more than this column.
+        ``version`` is left alone on purpose, so an ORM instance of the row
+        the caller already loaded stays writable (``updated_at`` is stamped
+        by the column's own ``onupdate``)."""
+        try:
+            async with self.session.begin_nested():
+                result = await self.session.execute(
+                    update(GuestSession)
+                    .where(
+                        GuestSession.id == session_id,
+                        GuestSession.internet_confirmed_at.is_(None),
+                    )
+                    .values(internet_confirmed_at=at, internet_confirmed_source=source)
+                    .execution_options(synchronize_session=False)
+                )
+            return bool(result.rowcount)
+        except Exception as exc:  # noqa: BLE001 -- see docstring: never raises
+            logger.warning(
+                "guest_internet_confirmed_write_failed",
+                extra={
+                    "session_id": str(session_id),
+                    "source": source,
+                    "error": str(exc),
+                },
+            )
+            return False
+
+    async def has_blocking_review_activity(
+        self,
+        *,
+        guest_id: uuid.UUID,
+        location_id: uuid.UUID,
+        shown_since: datetime,
+    ) -> bool:
+        """Whether this guest, at this location, ever opened the review
+        link or was shown the review page at or after ``shown_since``.
+        Either one means "do not ask again yet". Served by the partial
+        index ``ix_guest_sessions_review_activity``."""
+        statement = select(
+            exists().where(
+                GuestSession.guest_id == guest_id,
+                GuestSession.location_id == location_id,
+                GuestSession.is_deleted.is_(False),
+                or_(
+                    GuestSession.review_link_opened_at.is_not(None),
+                    GuestSession.review_prompt_shown_at >= shown_since,
+                ),
+            )
+        )
+        return bool((await self.session.execute(statement)).scalar_one())
+
+    async def count_review_activity(
+        self, *, location_id: uuid.UUID, since: datetime
+    ) -> tuple[int, int]:
+        """``(shown, opened)``: sessions at one location whose review page
+        was shown, and whose review link was opened, at or after ``since``.
+        Always filtered by a single ``location_id`` -- there is no
+        all-locations form of this query on purpose."""
+        statement = select(
+            func.count().filter(GuestSession.review_prompt_shown_at >= since),
+            func.count().filter(GuestSession.review_link_opened_at >= since),
+        ).where(
+            GuestSession.location_id == location_id,
+            GuestSession.is_deleted.is_(False),
+            or_(
+                GuestSession.review_prompt_shown_at >= since,
+                GuestSession.review_link_opened_at >= since,
+            ),
+        )
+        shown, opened = (await self.session.execute(statement)).one()
+        return int(shown or 0), int(opened or 0)
+
     async def list_sessions(
         self,
         *,
@@ -1118,6 +1265,170 @@ class GuestRepository:
         meta = PaginationMeta.from_total(params, total_items)
         return rows, meta
 
+    async def list_session_groups(
+        self,
+        *,
+        organization_id: uuid.UUID | None,
+        location_id: uuid.UUID | Sequence[uuid.UUID] | None,
+        ap_mac: str | None,
+        active: bool | None,
+        search: str | None,
+        page: int,
+        page_size: int,
+    ) -> tuple[list[GuestSessionGroupRow], PaginationMeta]:
+        """The venue Guests table, one row per GUEST, paginated by guest.
+
+        ``GenericRepository.paginate`` pages rows, and the rows here are
+        sessions -- so a guest who reconnected six times took six of a page's
+        slots and the table read as the same person over and over. This
+        groups in SQL (``GROUP BY guest_id``) so the page boundary falls
+        between people, ``total_items`` counts people, and the guests that
+        are on the network right now (any ACTIVE session) sort first, newest
+        visit first after that.
+
+        ``active`` narrows to guests with (``True``) or without (``False``)
+        an ACTIVE session. ``search`` matches the guest's identifier, display
+        name or email (case-insensitive substring). ``ap_mac`` (Aruba
+        Instant On) narrows the *sessions* first, exactly like
+        ``list_sessions`` does, so a guest appears under the access points
+        they actually used.
+
+        Three statements for the page: the grouped page itself, the primary
+        session of each guest on it (``row_number()`` per guest, ACTIVE
+        first), and the ids of their ACTIVE sessions. Never one per guest."""
+        conditions: list[ColumnElement[bool]] = [GuestSession.is_deleted.is_(False)]
+        if organization_id is not None:
+            conditions.append(GuestSession.organization_id == organization_id)
+        if location_id is not None:
+            conditions.append(
+                _location_condition(GuestSession.location_id, location_id)
+            )
+        if ap_mac is not None:
+            conditions.append(GuestSession.ap_mac == ap_mac)
+        if search:
+            pattern = f"%{search.strip()}%"
+            guest_match = select(Guest.id).where(
+                or_(
+                    Guest.identifier.ilike(pattern),
+                    Guest.display_name.ilike(pattern),
+                    Guest.email.ilike(pattern),
+                )
+            )
+            if organization_id is not None:
+                guest_match = guest_match.where(
+                    Guest.organization_id == organization_id
+                )
+            conditions.append(GuestSession.guest_id.in_(guest_match))
+
+        is_active = case(
+            (GuestSession.status == GuestSessionStatus.ACTIVE.value, 1), else_=0
+        )
+        active_count = func.coalesce(func.sum(is_active), 0)
+        grouped = (
+            select(
+                GuestSession.guest_id.label("guest_id"),
+                func.count(GuestSession.id).label("session_count"),
+                active_count.label("active_count"),
+                func.count(func.distinct(GuestSession.device_id)).label("device_count"),
+                func.min(GuestSession.started_at).label("first_started_at"),
+                func.max(GuestSession.started_at).label("last_started_at"),
+                func.coalesce(func.sum(GuestSession.bytes_downloaded), 0).label(
+                    "bytes_down"
+                ),
+                func.coalesce(func.sum(GuestSession.bytes_uploaded), 0).label(
+                    "bytes_up"
+                ),
+            )
+            .where(*conditions)
+            .group_by(GuestSession.guest_id)
+        )
+        if active is True:
+            grouped = grouped.having(active_count > 0)
+        elif active is False:
+            grouped = grouped.having(active_count == 0)
+        groups = grouped.subquery("guest_session_groups")
+
+        total_items = int(
+            (
+                await self.session.execute(select(func.count()).select_from(groups))
+            ).scalar_one()
+        )
+        page_statement = (
+            select(groups)
+            .order_by(
+                (groups.c.active_count > 0).desc(),
+                groups.c.last_started_at.desc(),
+                groups.c.guest_id,
+            )
+            .offset((page - 1) * page_size)
+            .limit(page_size)
+        )
+        page_rows = list((await self.session.execute(page_statement)).mappings().all())
+        params = PageParams(page=page, page_size=page_size)
+        meta = PaginationMeta.from_total(params, total_items)
+        if not page_rows:
+            return [], meta
+
+        guest_ids = [row["guest_id"] for row in page_rows]
+        ranked = (
+            select(
+                GuestSession.id.label("id"),
+                func.row_number()
+                .over(
+                    partition_by=GuestSession.guest_id,
+                    order_by=(
+                        (1 - is_active).asc(),
+                        GuestSession.started_at.desc(),
+                        GuestSession.id,
+                    ),
+                )
+                .label("rank"),
+            )
+            .where(*conditions, GuestSession.guest_id.in_(guest_ids))
+            .subquery("ranked_guest_sessions")
+        )
+        primary_statement = (
+            select(GuestSession)
+            .join(ranked, ranked.c.id == GuestSession.id)
+            .where(ranked.c.rank == 1)
+        )
+        primaries = {
+            session.guest_id: session
+            for session in (await self.session.execute(primary_statement))
+            .scalars()
+            .all()
+        }
+        active_statement = select(GuestSession.id, GuestSession.guest_id).where(
+            *conditions,
+            GuestSession.guest_id.in_(guest_ids),
+            GuestSession.status == GuestSessionStatus.ACTIVE.value,
+        ).order_by(GuestSession.started_at.desc(), GuestSession.id)
+        active_ids: dict[uuid.UUID, list[uuid.UUID]] = {}
+        active_rows = (await self.session.execute(active_statement)).all()
+        for session_id, guest_id in active_rows:
+            active_ids.setdefault(guest_id, []).append(session_id)
+
+        rows: list[GuestSessionGroupRow] = []
+        for row in page_rows:
+            primary = primaries.get(row["guest_id"])
+            if primary is None:  # deleted between the two reads
+                continue
+            rows.append(
+                GuestSessionGroupRow(
+                    guest_id=row["guest_id"],
+                    session_count=int(row["session_count"]),
+                    active_session_count=int(row["active_count"]),
+                    device_count=int(row["device_count"]),
+                    first_started_at=row["first_started_at"],
+                    last_started_at=row["last_started_at"],
+                    bytes_downloaded_total=int(row["bytes_down"]),
+                    bytes_uploaded_total=int(row["bytes_up"]),
+                    primary=primary,
+                    active_session_ids=tuple(active_ids.get(row["guest_id"], [])),
+                )
+            )
+        return rows, meta
+
     async def list_sessions_for_guest(
         self, guest_id: uuid.UUID, *, limit: int | None = None
     ) -> list[GuestSession]:
@@ -1180,14 +1491,11 @@ class GuestRepository:
         optionally excluding one device id -- the device currently logging
         in, so a reconnect/refresh of an already-online device never counts
         against itself."""
-        query = (
-            select(func.count(func.distinct(GuestSession.device_id)))
-            .where(
-                GuestSession.guest_id == guest_id,
-                GuestSession.status == GuestSessionStatus.ACTIVE.value,
-                GuestSession.device_id.is_not(None),
-                GuestSession.is_deleted.is_(False),
-            )
+        query = select(func.count(func.distinct(GuestSession.device_id))).where(
+            GuestSession.guest_id == guest_id,
+            GuestSession.status == GuestSessionStatus.ACTIVE.value,
+            GuestSession.device_id.is_not(None),
+            GuestSession.is_deleted.is_(False),
         )
         if exclude_device_id is not None:
             query = query.where(GuestSession.device_id != exclude_device_id)

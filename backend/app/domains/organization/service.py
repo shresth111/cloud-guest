@@ -124,8 +124,12 @@ class OrganizationService:
             raise OrganizationNotFoundError(organization_id)
         return organization
 
-    async def get_by_slug(self, slug: str) -> Organization:
-        organization = await self.repository.get_by_slug(_normalize_slug(slug))
+    async def get_by_slug(
+        self, slug: str, *, include_deleted: bool = False
+    ) -> Organization:
+        organization = await self.repository.get_by_slug(
+            _normalize_slug(slug), include_deleted=include_deleted
+        )
         if organization is None:
             raise OrganizationNotFoundError(slug)
         return organization
@@ -178,7 +182,12 @@ class OrganizationService:
         subscription_tier: str | None = None,
     ) -> Organization:
         normalized_slug = _normalize_slug(slug)
-        if await self.repository.get_by_slug(normalized_slug) is not None:
+        # uq_organizations_slug also covers soft-deleted rows, so they must
+        # count as taken here or the INSERT fails with a raw IntegrityError.
+        if (
+            await self.repository.get_by_slug(normalized_slug, include_deleted=True)
+            is not None
+        ):
             raise DuplicateSlugError(normalized_slug)
 
         if parent_organization_id is not None:
@@ -226,7 +235,9 @@ class OrganizationService:
 
         if update_data.get("slug") is not None:
             normalized = _normalize_slug(str(update_data["slug"]))
-            existing = await self.repository.get_by_slug(normalized)
+            existing = await self.repository.get_by_slug(
+                normalized, include_deleted=True
+            )
             if existing is not None and existing.id != organization.id:
                 raise DuplicateSlugError(normalized)
             update_data["slug"] = normalized

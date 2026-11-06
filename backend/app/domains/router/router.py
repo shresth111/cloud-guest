@@ -155,7 +155,8 @@ from .device_adapters import (
     reboot_device,
 )
 from .enums import RouterStatus
-from .exceptions import NasOnlySiteRefusedError
+from .exceptions import NasOnlySiteRefusedError, RouterNasOnlyOperationError
+from .instant_on_onboarding import onboard_instant_on_site
 from .models import Router
 from .schemas import (
     BootstrapScriptPreviewResponse,
@@ -171,6 +172,9 @@ from .schemas import (
     ProvisioningTokenResponse,
     RouterCreateRequest,
     RouterListResponse,
+    RouterLocalAdminApplyResponse,
+    RouterLocalAdminCheckResponse,
+    RouterLocalAdminSecretResponse,
     RouterManagementAccessRequest,
     RouterPlatformResponse,
     RouterResponse,
@@ -270,6 +274,7 @@ def _router_response(
         controller_state_reason=controller.reason,
         controller_last_contacted_at=controller.last_contacted_at,
         vendor_claim_is_contradicted=controller.vendor_claim_is_contradicted,
+        last_radius_at=controller.last_radius_at,
         created_at=router_device.created_at,
         updated_at=router_device.updated_at,
     )
@@ -287,6 +292,8 @@ def _router_platform_response(
     field by forgetting to pass something.
     """
     return RouterPlatformResponse(
+        local_admin_password_status=router_device.local_admin_password_status,
+        local_admin_password_verified_at=router_device.local_admin_password_verified_at,
         **(
             _router_response(router_device, controller).model_dump()
             # Undo the customer redaction: the back-reference from a
@@ -591,35 +598,24 @@ async def create_instant_on_site(
     (``PUT /platform/instant-on/routers/{router_id}/site``). Both writes share
     the request's session, so a failure in the second rolls back the first.
     """
-    if payload.instant_on_site_id:
-        in_use = await instant_on_service.site_in_use(payload.instant_on_site_id)
-        if in_use is not None:
-            raise NasOnlySiteRefusedError(
-                f"Instant On site {payload.instant_on_site_id} is already "
-                "mapped to another fleet device. One Instant On site is one "
-                "fleet row.",
-                reason="site_already_onboarded",
-                existing_router_id=in_use.router_id,
-            )
-    result = await router_service.create_nas_only_site(
+    # The site-id check, the row and the site mapping are one shared
+    # sequence (`instant_on_onboarding`), so this route and the Add Customer
+    # wizard's Aruba option (`POST /locations/provision`) cannot drift.
+    onboarded = await onboard_instant_on_site(
+        router_service=router_service,
+        instant_on_service=instant_on_service,
         actor_user_id=uuid.UUID(user.id),
         organization_id=payload.organization_id,
         location_id=payload.location_id,
         name=payload.name,
         serial_number=payload.serial_number,
         mac_address=payload.mac_address,
+        instant_on_site_id=payload.instant_on_site_id,
+        instant_on_site_name=payload.instant_on_site_name,
     )
-    created, synthetic_serial, synthetic_mac = result
-    if payload.instant_on_site_id:
-        await instant_on_service.configure_site(
-            router_id=created.id,
-            site_id=payload.instant_on_site_id,
-            site_name=payload.instant_on_site_name,
-            poll_enabled=False,
-            customer_visible=False,
-            router_lookup=router_service,
-            actor_user_id=uuid.UUID(user.id),
-        )
+    created = onboarded.router
+    synthetic_serial = onboarded.synthetic_serial_number
+    synthetic_mac = onboarded.synthetic_mac_address
     return build_response(
         success=True,
         message="Instant On site added",
@@ -884,6 +880,111 @@ async def get_device_connection(
             username=router_row.api_username,
             password=password,
         ).model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+_LOCAL_ADMIN_PERMISSION = Depends(
+    RequirePermission("routers.manage", scope=ScopeType.GLOBAL)
+)
+
+
+@router.post(
+    "/platform/routers/{router_id}/local-admin-password/check",
+    response_model=ApiResponse[RouterLocalAdminCheckResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[_LOCAL_ADMIN_PERMISSION],
+)
+async def check_router_local_admin_password(
+    request: Request,
+    router_id: uuid.UUID,
+    user: AuthUser = Depends(CurrentUser),
+    router_service: RouterService = Depends(get_router_service),
+):
+    """Reports the device's local login state without changing it. A POST
+    because it attempts logins on the device and writes an audit row."""
+    result = await router_service.check_local_admin_password(
+        actor_user_id=uuid.UUID(user.id), router_id=router_id
+    )
+    return build_response(
+        success=True,
+        message="Local admin login checked",
+        data=result.model_dump(),
+        request_id=_request_id(request),
+    )
+
+
+@router.post(
+    "/platform/routers/{router_id}/local-admin-password/issue",
+    response_model=ApiResponse[RouterLocalAdminSecretResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[_LOCAL_ADMIN_PERMISSION],
+)
+async def issue_router_local_admin_password(
+    request: Request,
+    router_id: uuid.UUID,
+    user: AuthUser = Depends(CurrentUser),
+    router_service: RouterService = Depends(get_router_service),
+):
+    """Returns the password the setup script should set, creating one the first
+    time. Generating a script again returns the same password."""
+    result = await router_service.issue_local_admin_password(
+        actor_user_id=uuid.UUID(user.id), router_id=router_id
+    )
+    return build_response(
+        success=True,
+        message="Local admin password issued",
+        data=result.model_dump(mode="json"),
+        request_id=_request_id(request),
+    )
+
+
+@router.post(
+    "/platform/routers/{router_id}/local-admin-password/apply",
+    response_model=ApiResponse[RouterLocalAdminApplyResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[_LOCAL_ADMIN_PERMISSION],
+)
+async def apply_router_local_admin_password(
+    request: Request,
+    router_id: uuid.UUID,
+    user: AuthUser = Depends(CurrentUser),
+    router_service: RouterService = Depends(get_router_service),
+):
+    """Makes the device match the stored password and proves it with a login.
+    Also the "verify" action: a device that already matches is not written to."""
+    result = await router_service.apply_local_admin_password(
+        actor_user_id=uuid.UUID(user.id), router_id=router_id
+    )
+    return build_response(
+        success=True,
+        message="Local admin password confirmed on the router",
+        data=result.model_dump(mode="json"),
+        request_id=_request_id(request),
+    )
+
+
+@router.post(
+    "/platform/routers/{router_id}/local-admin-password/reveal",
+    response_model=ApiResponse[RouterLocalAdminSecretResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[_LOCAL_ADMIN_PERMISSION],
+)
+async def reveal_router_local_admin_password(
+    request: Request,
+    router_id: uuid.UUID,
+    user: AuthUser = Depends(CurrentUser),
+    router_service: RouterService = Depends(get_router_service),
+):
+    """Hands one operator the plaintext, and records who. A POST so that no
+    cache or link preview can trigger it."""
+    result = await router_service.reveal_local_admin_password(
+        actor_user_id=uuid.UUID(user.id), router_id=router_id
+    )
+    return build_response(
+        success=True,
+        message="Local admin password revealed",
+        data=result.model_dump(mode="json"),
         request_id=_request_id(request),
     )
 
@@ -1221,6 +1322,8 @@ async def reboot_router(
     router_row = await router_service.get_router(
         router_id, requesting_organization_id=requesting_organization_id
     )
+    if is_nas_only(router_row):
+        raise RouterNasOnlyOperationError(router_row.id, "reboot")
     host = router_row.management_ip_address or router_row.public_ip_address
     password = router_service.get_decrypted_api_secret(router_row)
     if not host or not router_row.api_username or not password:

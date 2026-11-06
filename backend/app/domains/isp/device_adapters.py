@@ -366,6 +366,18 @@ class BaseIspHealthAdapter(Protocol):
         issues no write at all."""
         ...
 
+    async def ensure_host_route(
+        self,
+        credentials: IspCredentials,
+        *,
+        dst_address: str,
+        gateway: str,
+        comment: str,
+    ) -> None:
+        """Pin one address to one gateway with a comment-tagged /32 route,
+        writing only when it is missing or points elsewhere."""
+        ...
+
     async def ensure_wan_egress(
         self, credentials: IspCredentials, *, interface: str
     ) -> None:
@@ -539,6 +551,24 @@ class MikroTikIspHealthAdapter:
             raise IspDeviceOperationError(
                 "set_default_route_distances", exc.detail
             ) from exc
+
+    async def ensure_host_route(
+        self,
+        credentials: IspCredentials,
+        *,
+        dst_address: str,
+        gateway: str,
+        comment: str,
+    ) -> None:
+        creds = self._gateway_credentials(credentials)
+        try:
+            await get_adapter(DeviceVendor.MIKROTIK).ensure_host_route(
+                creds, dst_address=dst_address, gateway=gateway, comment=comment
+            )
+        except MikroTikConnectionError as exc:
+            raise IspDeviceConnectionError(credentials.host, exc.detail) from exc
+        except MikroTikDeviceError as exc:
+            raise IspDeviceOperationError("ensure_host_route", exc.detail) from exc
 
     async def ensure_wan_egress(
         self, credentials: IspCredentials, *, interface: str

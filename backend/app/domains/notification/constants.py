@@ -49,6 +49,12 @@ class NotificationEventType(StrEnum):
     # balance fell below the org's alert level (spec §13.5). Once per
     # crossing, to Organization.contact_email, from MailIdentity.DEFAULT.
     MARKETING_CREDITS_LOW = "marketing_credits_low"
+    # app.domains.notification.sales_webhook -- a demo-request/demo-booking
+    # lifecycle event POSTed to the sales-automation endpoint over
+    # NotificationChannelType.WEBHOOK. One event type for every lifecycle
+    # event: which one it is travels inside the JSON body (``event``), so a
+    # new lifecycle event never needs a new member here.
+    SALES_AUTOMATION_EVENT = "sales_automation_event"
 
 
 # Every event above that is delivered to Slack rather than to a person.
@@ -157,6 +163,11 @@ class NotificationChannelType(StrEnum):
     EMAIL = "email"
     SMS = "sms"
     SLACK = "slack"
+    #: The sales-automation webhook (``sales_webhook.py``). Same shape as
+    #: ``SLACK``: one fixed internal destination resolved from ``Settings``
+    #: at dispatch time, a constant non-secret ``recipient`` label
+    #: (``SALES_WEBHOOK_RECIPIENT``), and the outbox's retry/backoff.
+    WEBHOOK = "webhook"
 
 
 class NotificationDeliveryStatus(StrEnum):
@@ -193,3 +204,7 @@ TASK_RECORD_ONBOARDING_FAILURE = "notification.record_onboarding_failure"
 # deliberately NOT the webhook URL, which is a bearer credential and is
 # resolved from Settings at dispatch time instead.
 SLACK_ONBOARDING_RECIPIENT = "slack:master-onboarding"
+
+# The `recipient` written on every sales-automation webhook outbox row --
+# same reasoning as SLACK_ONBOARDING_RECIPIENT: a label, never the URL.
+SALES_WEBHOOK_RECIPIENT = "webhook:sales-automation"

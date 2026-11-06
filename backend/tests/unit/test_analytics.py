@@ -865,6 +865,8 @@ def test_celery_app_imports_and_constructs_without_a_broker():
         "analytics-rolling-today",
         "analytics-finalize-yesterday",
         "reports-run-scheduled",
+        # Login funnel "portal opened" rows: 92-day retention.
+        "analytics-portal-impression-retention-sweep",
         "billing-subscription-renewal-sweep",
         "billing-invoice-overdue-sweep",
         "guest-session-timeout-sweep",
@@ -874,6 +876,19 @@ def test_celery_app_imports_and_constructs_without_a_broker():
         "guest-session-presence-sweep",
         "provisioning-engine-drain-queue",
         "queue-management-sweep-schedule-transitions",
+        # Takes an ended guest session's speed-limit row off its router.
+        # Nothing else did: the row stayed first in `/queue simple` and
+        # went on deciding the speed of whoever held that address next.
+        "queue-management-release-ended-session-queues",
+        # Gives a queue to a live session whose login never got one onto
+        # the router (it did not answer; the login's task ran out of
+        # retries). Nothing else came back for it. Inert unless switched on.
+        "queue-management-backfill-unassigned-session-queues",
+        # Takes a session's hotspot bypass off the router once nothing
+        # lists its MAC. The router's own script was meant to and, on every
+        # router provisioned before it was repaired, never has. Inert unless
+        # switched on.
+        "guest-hotspot-binding-reconcile-sweep",
         "guest-fup-time-accrual-sweep",
         "guest-quota-reset-sweep",
         # Only Allowed. The flag used to be answered once, at sign-in, and
@@ -900,6 +915,10 @@ def test_celery_app_imports_and_constructs_without_a_broker():
         # permanent block nobody can find, from a temporary one.
         "guest-access-controller-block-release-sweep",
         "guest-access-device-block-release-sweep",
+        # Aruba AP + MikroTik gateway hybrid: removes a gateway's per-guest
+        # queue once the AP has certainly dropped the guest, and retries a
+        # Stop-time removal that could not reach the gateway.
+        "aruba-hybrid-queue-reconcile-sweep",
         "isp-health-check-sweep",
         "connected-device-sync-sweep",
         # Monitored hardware liveness: the fast ping-driven UP/DOWN path
@@ -977,6 +996,15 @@ def test_celery_app_imports_and_constructs_without_a_broker():
         # CONNECTED indefinitely. See
         # app.domains.network_integration.tasks's own module docstring.
         "network-integration-sync-sweep",
+        # Device Logs: creates the coming months' device_log_events
+        # partitions and drops those past the retention period (24 months).
+        # Without it, ingest falls into the DEFAULT partition and nothing
+        # ever expires. See app.domains.device_logs.partitions.
+        "device-logs-partition-maintenance",
+        # IPDR: archives every closed IST day still inside flow-record
+        # retention as one gzip NDJSON object per location (no-op unless
+        # Settings.ipdr_enabled). See app.domains.ipdr.tasks.
+        "ipdr-daily-build",
         # Back-fills guest data-usage bytes for Omada External-Portal venues
         # from the controller's Open API, on a fixed 5-minute cadence,
         # feeding the same GuestService.record_usage sink RADIUS accounting
@@ -992,6 +1020,10 @@ def test_celery_app_imports_and_constructs_without_a_broker():
         # CLOUDGUEST_INSTANT_ON_POLLER_ENABLED is true. See
         # app.domains.network_integration.instant_on_tasks.
         "instant-on-poll-sweep",
+        # NetFlow/IPFIX: pulls 5-minute windows from the hub flow agent.
+        # Inert unless CLOUDGUEST_TRAFFIC_FLOW_ENABLED is true. See
+        # app.domains.traffic_flow.tasks.
+        "traffic-flow-pull-sweep",
     }
 
 

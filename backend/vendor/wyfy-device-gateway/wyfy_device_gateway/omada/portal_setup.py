@@ -28,6 +28,13 @@ get wrong -- done as one idempotent operation:
   each other's portal for their own. A foreign portal is written in exactly
   one case: ``take_over_ssid_portal``, and then only its ``ssidList`` loses
   our SSID; every other field is sent back as the controller returned it.
+  When our SSID is the *only* thing that portal applies to, the controller
+  refuses to keep it bound to nothing (-34319, measured), so take-over
+  deletes that portal instead -- it could no longer reach anybody anyway.
+* **``portalCustomize`` is required on every portal write** (measured on
+  5.15.24.19, 2026-10-16, against the "unverified" note below): ``addPortal``
+  gets five defaults, and a ``modifyPortal`` sends back what
+  ``getPortalCustomization`` returned, filling only required fields it lacked.
 * **Pre-Authentication Access is merge-only.** The PATCH is full-config (the
   spec says "the full configuration parameters should be passed in"), so the
   body is the controller's own GET result with our entry appended. Every
@@ -131,6 +138,7 @@ from ..controller_contract import (
     PortalSetupReport,
     PortalSetupSpec,
     PortalSetupStep,
+    RadiusPortalSpec,
 )
 from . import sites as sites_module
 from .client import OmadaHttpClient
@@ -153,7 +161,13 @@ from .types import coerce_bool, coerce_int, coerce_str, extract_page
 
 PORTALS_PATH = "/openapi/v1/{omadac_id}/sites/{site_id}/portals"
 PORTAL_PATH = "/openapi/v1/{omadac_id}/sites/{site_id}/portal/{portal_id}"
+PORTAL_CUSTOMIZATION_PATH = PORTAL_PATH + "/customization"
 ADD_PORTAL_PATH = "/openapi/v1/{omadac_id}/sites/{site_id}/portal"
+#: ``getRadiusProfileList`` / ``createRadiusProfile`` and
+#: ``modifyRadiusProfile`` (5.15.24.19 spec; body
+#: ``CreateRadiusProfileOpenApiVO`` for both writes).
+RADIUS_PROFILES_PATH = "/openapi/v1/{omadac_id}/sites/{site_id}/profiles/radius"
+RADIUS_PROFILE_PATH = RADIUS_PROFILES_PATH + "/{radius_profile_id}"
 ACCESS_CONTROL_PATH = "/openapi/v1/{omadac_id}/sites/{site_id}/setting/access-control"
 OPERATORS_PATH = "/openapi/v1/{omadac_id}/sites/{site_id}/hotspot/operators"
 OPERATOR_PATH = (
@@ -164,10 +178,20 @@ OPERATOR_PATH = (
 
 #: ``PortalSetting.authType``: "4: External Portal Server".
 AUTH_TYPE_EXTERNAL_PORTAL = 4
+#: ``PortalSetting.authType``: "2: External Radius Server" -- the RADIUS
+#: contract, where the controller asks our hub whether to let a guest on.
+AUTH_TYPE_EXTERNAL_RADIUS = 2
+#: ``ExternalRadiusSetting.authMode``: "1: PAP; 2: CHAP". PAP is what the
+#: hub was proven with (2026-09-17 and 2026-10-16).
+RADIUS_AUTH_MODE_PAP = 1
+#: ``ExternalRadiusSetting.portalCustom``: "1: Local Web Portal; 2: External
+#: Web Portal" -- ours.
+PORTAL_CUSTOM_EXTERNAL_WEB = 2
 #: ``ExternalServerPortalSetting.hostType``: "1: IP; 2: URL". Only URL has a
 #: path, and the query string lives in the path (see the backend's
 #: ``validators.ExternalPortalUrl``).
 HOST_TYPE_URL = 2
+HOST_TYPE_IP = 1
 #: ``PreAuthAccessPolicyOpenApiVO.type``: "2: URL, and parameter [url] is
 #: needed". A URL entry permits the address the name resolves to, not the
 #: name (measured, ``HARDWARE-FINDINGS.md``).
@@ -203,6 +227,23 @@ _PRESET_AUTH_TIMEOUTS: dict[int, tuple[int, int]] = {
 #: enabled, otherwise no display") and a PATCH still requires one.
 _FALLBACK_AUTH_TIMEOUT: dict[str, int] = {"customTimeout": 1, "customTimeoutUnit": 2}
 
+#: The five fields ``PortalCustomizeOpenApiVO`` marks required. MEASURED on
+#: 5.15.24.19 (2026-10-16): ``addPortal`` and ``modifyPortal`` both refuse a
+#: body without ``portalCustomize`` (-1001 "Parameter [portalCustomize]
+#: should not be null"), and accept exactly these five. ``getPortalDetail``
+#: never returns ``portalCustomize``; ``getPortalCustomization`` does, but a
+#: portal created by an older firmware can lack ``defaultLanguage`` and
+#: ``copyrightEnable`` there -- so these also fill the gaps of what is read.
+#: ``defaultLanguage`` 1 is en_US. None of it is shown by an External Portal
+#: Server portal, whose page is ours.
+_DEFAULT_PORTAL_CUSTOMIZE: dict[str, Any] = {
+    "defaultLanguage": 1,
+    "copyrightEnable": False,
+    "logoDisplay": True,
+    "termsOfServiceEnable": False,
+    "welcomeEnable": False,
+}
+
 #: The ``PortalSetting`` fields that ``PortalDetailResOpenApiVO`` also
 #: returns -- i.e. everything that CAN be echoed back. ``socialLogin`` and
 #: ``google`` exist only in the cloud spec; they are echoed when a controller
@@ -232,9 +273,16 @@ _ECHOABLE_PORTAL_FIELDS: tuple[str, ...] = (
 )
 
 STEP_SSID_TAKEOVER = "ssid_takeover"
+STEP_RADIUS_PROFILE = "radius_profile"
 STEP_PORTAL = "portal"
 STEP_PRE_AUTH_ACCESS = "pre_auth_access"
 STEP_HOTSPOT_OPERATOR = "hotspot_operator"
+
+#: Why a step was not attempted, by the earlier step that failed.
+_DEPENDENCY_FAILURE_REASONS: dict[str, str] = {
+    STEP_SSID_TAKEOVER: "the guest SSID could not be released from the other portal.",
+    STEP_RADIUS_PROFILE: "the RADIUS profile it points at could not be set up.",
+}
 
 #: Failures after which the controller is not answering us at all -- every
 #: later write would fail the same way, so they are reported as not attempted
@@ -370,6 +418,42 @@ def _fill_required_portal_fields(body: dict[str, Any]) -> list[str]:
         if body.get(key) is None:
             body[key] = default
             filled.append(key)
+    # ``ExternalServerPortalSetting`` requires ``hostType``, which
+    # ``getPortalDetail`` omits (MEASURED on 5.15.24.19; the bare -1001 "must
+    # not be null" it causes names no field). The address it carries says
+    # which one it is.
+    external = body.get("externalPortal")
+    if isinstance(external, dict) and external.get("hostType") is None:
+        external["hostType"] = (
+            HOST_TYPE_IP
+            if external.get("serverIp") and not external.get("serverUrl")
+            else HOST_TYPE_URL
+        )
+        filled.append("externalPortal.hostType")
+    return filled
+
+
+def apply_portal_customization(
+    body: dict[str, Any], customization: dict[str, Any] | None
+) -> list[str]:
+    """Put a ``getPortalCustomization`` result on a ``PortalSetting`` body.
+
+    ``portalCustomize`` (and ``pageType``/``importedPortalPage`` when read)
+    go back as the controller returned them, so the portal's local page is
+    unchanged; only required fields the read lacked are filled. Returns those
+    names, prefixed ``portalCustomize.``."""
+    customization = customization if isinstance(customization, dict) else {}
+    current = customization.get("portalCustomize")
+    customize = copy.deepcopy(current) if isinstance(current, dict) else {}
+    filled: list[str] = []
+    for key, default in _DEFAULT_PORTAL_CUSTOMIZE.items():
+        if customize.get(key) is None:
+            customize[key] = default
+            filled.append(f"portalCustomize.{key}")
+    body["portalCustomize"] = customize
+    for key in ("pageType", "importedPortalPage"):
+        if customization.get(key) is not None:
+            body[key] = copy.deepcopy(customization[key])
     return filled
 
 
@@ -386,50 +470,116 @@ def _external_portal(spec: PortalSetupSpec) -> dict[str, Any]:
     }
 
 
-def new_portal_body(spec: PortalSetupSpec, ssid_id: str) -> dict[str, Any]:
-    """``addPortal`` body. Every required ``PortalSetting`` field, and the
-    external-portal settings; nothing a local portal page would need."""
+def _external_radius(
+    radius: RadiusPortalSpec, radius_profile_id: str | None
+) -> dict[str, Any]:
+    """``ExternalRadiusSetting``: authenticate against our profile, then send
+    the guest to our page."""
     return {
+        "radiusProfileId": radius_profile_id,
+        "authMode": RADIUS_AUTH_MODE_PAP,
+        "nasId": radius.nas_id,
+        "portalCustom": PORTAL_CUSTOM_EXTERNAL_WEB,
+        "externalUrlScheme": radius.portal_url_scheme,
+        "externalUrl": radius.portal_url,
+        "disconnectReq": False,
+    }
+
+
+def _set_contract(
+    body: dict[str, Any], spec: PortalSetupSpec, radius_profile_id: str | None
+) -> None:
+    """Write the half of the portal that differs between the two contracts."""
+    if spec.radius is None:
+        body["authType"] = AUTH_TYPE_EXTERNAL_PORTAL
+        body["externalPortal"] = _external_portal(spec)
+    else:
+        body["authType"] = AUTH_TYPE_EXTERNAL_RADIUS
+        body["externalRadius"] = _external_radius(spec.radius, radius_profile_id)
+
+
+def new_portal_body(
+    spec: PortalSetupSpec, ssid_id: str, radius_profile_id: str | None = None
+) -> dict[str, Any]:
+    """``addPortal`` body. Every required ``PortalSetting`` field, and the
+    settings of the caller's contract; nothing a local portal page would
+    need."""
+    body: dict[str, Any] = {
         "name": spec.portal_name,
         "enable": True,
         "ssidList": [ssid_id],
         "networkList": [],
-        "authType": AUTH_TYPE_EXTERNAL_PORTAL,
         "authTimeout": _our_auth_timeout(spec),
         "httpsRedirectEnable": False,
         "landingPage": LANDING_PAGE_ORIGINAL_URL,
-        "externalPortal": _external_portal(spec),
+        "portalCustomize": copy.deepcopy(_DEFAULT_PORTAL_CUSTOMIZE),
     }
+    _set_contract(body, spec, radius_profile_id)
+    return body
 
 
 def portal_drift(
-    detail: dict[str, Any], spec: PortalSetupSpec, ssid_id: str
+    detail: dict[str, Any],
+    spec: PortalSetupSpec,
+    ssid_id: str,
+    radius_profile_id: str | None = None,
 ) -> list[str]:
     """The fields of our portal that differ from ``spec``. Empty means
     nothing to do. Deliberately narrow: settings a venue may tune on our
-    portal (HTTPS redirect, landing page, timeout) are not drift."""
+    portal (HTTPS redirect, landing page, timeout) are not drift.
+
+    On the RADIUS contract ``radius_profile_id`` is the profile the portal
+    must point at, or ``None`` when that profile does not exist yet -- in
+    which case the portal is drifted by definition."""
     drift: list[str] = []
     if coerce_str(detail.get("name")) != spec.portal_name:
         drift.append("name")
     if coerce_bool(detail.get("enable")) is not True:
         drift.append("enable")
-    if coerce_int(detail.get("authType")) != AUTH_TYPE_EXTERNAL_PORTAL:
+    wanted_auth_type = (
+        AUTH_TYPE_EXTERNAL_PORTAL if spec.radius is None else AUTH_TYPE_EXTERNAL_RADIUS
+    )
+    if coerce_int(detail.get("authType")) != wanted_auth_type:
         drift.append("authType")
-    external = detail.get("externalPortal")
-    external = external if isinstance(external, dict) else {}
-    if coerce_int(external.get("hostType")) != HOST_TYPE_URL:
-        drift.append("externalPortal.hostType")
-    if coerce_str(external.get("serverUrlScheme")) != spec.portal_url_scheme:
-        drift.append("externalPortal.serverUrlScheme")
-    if coerce_str(external.get("serverUrl")) != spec.portal_url:
-        drift.append("externalPortal.serverUrl")
+    if spec.radius is None:
+        external = detail.get("externalPortal")
+        external = external if isinstance(external, dict) else {}
+        # ``getPortalDetail`` omits ``hostType`` (measured), so absent is not
+        # drift; only a value that says IP is.
+        host_type = coerce_int(external.get("hostType"))
+        if host_type is not None and host_type != HOST_TYPE_URL:
+            drift.append("externalPortal.hostType")
+        if coerce_str(external.get("serverUrlScheme")) != spec.portal_url_scheme:
+            drift.append("externalPortal.serverUrlScheme")
+        if coerce_str(external.get("serverUrl")) != spec.portal_url:
+            drift.append("externalPortal.serverUrl")
+    else:
+        current = detail.get("externalRadius")
+        current = current if isinstance(current, dict) else {}
+        wanted = _external_radius(spec.radius, radius_profile_id)
+        for key in (
+            "radiusProfileId",
+            "authMode",
+            "nasId",
+            "portalCustom",
+            "externalUrlScheme",
+            "externalUrl",
+        ):
+            have = current.get(key)
+            want = wanted[key]
+            if want is None or str(have) != str(want):
+                drift.append(f"externalRadius.{key}")
     if ssid_id not in _str_list(detail.get("ssidList")):
         drift.append("ssidList")
     return drift
 
 
 def updated_portal_body(
-    detail: dict[str, Any], spec: PortalSetupSpec, ssid_id: str
+    detail: dict[str, Any],
+    spec: PortalSetupSpec,
+    ssid_id: str,
+    customization: dict[str, Any] | None = None,
+    radius_profile_id: str | None = None,
 ) -> dict[str, Any]:
     """``modifyPortal`` body for OUR portal: what it has, with our settings
     laid over it. Other SSIDs a venue bound to it are kept."""
@@ -438,18 +588,20 @@ def updated_portal_body(
     )
     body["name"] = spec.portal_name
     body["enable"] = True
-    body["authType"] = AUTH_TYPE_EXTERNAL_PORTAL
-    body["externalPortal"] = _external_portal(spec)
+    _set_contract(body, spec, radius_profile_id)
     ssids = _str_list(body.get("ssidList"))
     if ssid_id not in ssids:
         ssids.append(ssid_id)
     body["ssidList"] = ssids
     _fill_required_portal_fields(body)
+    apply_portal_customization(body, customization)
     return body
 
 
 def released_portal_body(
-    detail: dict[str, Any], ssid_id: str
+    detail: dict[str, Any],
+    ssid_id: str,
+    customization: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], list[str]]:
     """``modifyPortal`` body for a FOREIGN portal on take-over: exactly what
     the controller returned, minus our SSID. Returns ``(body, filled)``."""
@@ -458,7 +610,61 @@ def released_portal_body(
     )
     body["ssidList"] = [s for s in _str_list(body.get("ssidList")) if s != ssid_id]
     filled = _fill_required_portal_fields(body)
+    filled += apply_portal_customization(body, customization)
     return body, filled
+
+
+def release_leaves_portal_unbound(detail: dict[str, Any], ssid_id: str) -> bool:
+    """True when ``ssid_id`` is everything the portal applies to. Releasing it
+    would leave a portal bound to nothing, which the controller refuses
+    (MEASURED on 5.15.24.19: -34319 "Select at least one SSID or LAN for the
+    portal to take effect on."), so take-over deletes such a portal instead."""
+    remaining = [s for s in _str_list(detail.get("ssidList")) if s != ssid_id]
+    return not remaining and not _str_list(detail.get("networkList"))
+
+
+def radius_profile_body(radius: RadiusPortalSpec) -> dict[str, Any]:
+    """``CreateRadiusProfileOpenApiVO``, for create and modify alike.
+
+    Accounting stays off: on 5.15 it was once seen to fail every login
+    (-41501) and is not needed by the portal flow. CoA is off for the same
+    reason this platform never sends one to a controller."""
+    return {
+        "name": radius.profile_name,
+        "authServer": [
+            {
+                "radiusServerIp": radius.server_ip,
+                "radiusPort": int(radius.server_port),
+                "radiusPwd": radius.shared_secret,
+            }
+        ],
+        "radiusAccountingEnable": False,
+        "interimUpdateEnable": False,
+        "wirelessVlanAssignment": False,
+        "coaEnable": False,
+    }
+
+
+def radius_profile_drift(
+    profile: dict[str, Any], radius: RadiusPortalSpec
+) -> list[str]:
+    """Which of our profile's fields differ. The secret is compared, never
+    reported: the drift entry says only that it differs."""
+    drift: list[str] = []
+    servers = profile.get("authServer")
+    first = servers[0] if isinstance(servers, list) and servers else {}
+    first = first if isinstance(first, dict) else {}
+    if isinstance(servers, list) and len(servers) != 1:
+        drift.append("authServer")
+    if coerce_str(first.get("radiusServerIp")) != radius.server_ip:
+        drift.append("authServer.radiusServerIp")
+    if coerce_int(first.get("radiusPort")) != int(radius.server_port):
+        drift.append("authServer.radiusPort")
+    if first.get("radiusPwd") != radius.shared_secret:
+        drift.append("authServer.radiusPwd")
+    if coerce_bool(profile.get("radiusAccountingEnable")) is True:
+        drift.append("radiusAccountingEnable")
+    return drift
 
 
 def merged_access_control(
@@ -568,8 +774,8 @@ class _Action:
     write: Callable[[], Awaitable[_WriteResult | None]] | None = None
     details: dict[str, object] = field(default_factory=dict)
     provider_code: int | None = None
-    #: Name of an earlier step that must not have failed for this one to run.
-    depends_on: str | None = None
+    #: Earlier steps that must not have failed for this one to run.
+    depends_on: tuple[str, ...] = ()
 
 
 async def _portal_detail(
@@ -578,6 +784,18 @@ async def _portal_detail(
     envelope = await client.request(
         "GET",
         PORTAL_PATH.format(omadac_id=omadac_id, site_id=site_id, portal_id=portal_id),
+    )
+    return envelope.result if isinstance(envelope.result, dict) else {}
+
+
+async def _portal_customization(
+    client: OmadaHttpClient, omadac_id: str, site_id: str, portal_id: str
+) -> dict[str, Any]:
+    envelope = await client.request(
+        "GET",
+        PORTAL_CUSTOMIZATION_PATH.format(
+            omadac_id=omadac_id, site_id=site_id, portal_id=portal_id
+        ),
     )
     return envelope.result if isinstance(envelope.result, dict) else {}
 
@@ -600,13 +818,23 @@ def _owns(
         return True
     if not detail:
         return False
-    external = detail.get("externalPortal")
-    if not isinstance(external, dict):
-        return False
-    if host_of(external.get("serverUrl")) != host_of(spec.portal_url):
-        return False
+    # Either contract's URL can carry the ownership pair: External Portal
+    # Server keeps it in ``externalPortal.serverUrl``, External RADIUS in
+    # ``externalRadius.externalUrl``.
     key, value = spec.ownership_query
-    return value in _query_of(external.get("serverUrl")).get(key, [])
+    for section, field_name in (
+        ("externalPortal", "serverUrl"),
+        ("externalRadius", "externalUrl"),
+    ):
+        block = detail.get(section)
+        if not isinstance(block, dict):
+            continue
+        url = block.get(field_name)
+        if host_of(url) == host_of(spec.portal_url) and value in _query_of(url).get(
+            key, []
+        ):
+            return True
+    return False
 
 
 async def configure_external_portal(
@@ -657,7 +885,8 @@ async def configure_external_portal(
         if portal_id is None:
             continue
         if (
-            coerce_int(summary.get("authType")) == AUTH_TYPE_EXTERNAL_PORTAL
+            coerce_int(summary.get("authType"))
+            in (AUTH_TYPE_EXTERNAL_PORTAL, AUTH_TYPE_EXTERNAL_RADIUS)
             or coerce_str(summary.get("name")) == spec.portal_name
             or ssid_id in _str_list(summary.get("ssidList"))
         ):
@@ -696,7 +925,8 @@ async def configure_external_portal(
                     "changed. Unbind the SSID from that portal on the "
                     "controller, or run again with take-over, which removes "
                     "only this SSID from that portal and changes nothing else "
-                    "on it."
+                    "on it -- or deletes the portal, if this SSID is all it "
+                    "applies to."
                 ),
                 portal_id=coerce_str(first.get("id")),
                 portal_name=_safe_name(first.get("name")),
@@ -716,6 +946,7 @@ async def configure_external_portal(
     state: dict[str, Any] = {
         "operator_credentials_set": False,
         "portal_id": (str(owned[0]["id"]) if len(owned) == 1 else None),
+        "radius_profile_id": None,
     }
     actions: list[_Action] = []
 
@@ -723,7 +954,49 @@ async def configure_external_portal(
     for summary in foreign:
         portal_id = str(summary["id"])
         portal_name = _safe_name(summary.get("name"))
-        body, filled = released_portal_body(details.get(portal_id, {}), ssid_id)
+        detail = details.get(portal_id, {})
+
+        if release_leaves_portal_unbound(detail, ssid_id):
+
+            async def _delete(portal_id: str = portal_id) -> None:
+                await client.request(
+                    "DELETE",
+                    PORTAL_PATH.format(portal_id=portal_id, **paths),
+                    retry_on_transport_error=False,
+                )
+
+            actions.append(
+                _Action(
+                    step=STEP_SSID_TAKEOVER,
+                    outcome=PortalSetupOutcome.UPDATED,
+                    plan_message=(
+                        f"Would delete portal '{portal_name}': SSID "
+                        f"'{ssid_label}' is the only network it applies to, and "
+                        "the controller does not keep a portal bound to nothing."
+                    ),
+                    done_message=(
+                        f"Deleted portal '{portal_name}': SSID '{ssid_label}' "
+                        "was the only network it applied to."
+                    ),
+                    failure_prefix=(
+                        f"Could not delete portal '{portal_name}' to free SSID "
+                        f"'{ssid_label}'."
+                    ),
+                    write=_delete,
+                    details={
+                        "portal_id": portal_id,
+                        "portal_name": portal_name,
+                        "deleted_portal": True,
+                    },
+                )
+            )
+            continue
+
+        body, filled = released_portal_body(
+            detail,
+            ssid_id,
+            await _portal_customization(client, omadac_id, site_id, portal_id),
+        )
 
         async def _release(portal_id: str = portal_id, body: dict = body) -> None:
             await client.request(
@@ -757,6 +1030,24 @@ async def configure_external_portal(
             )
         )
 
+    # -- 1a. our RADIUS profile (RADIUS contract only) ----------------------
+    portal_depends_on: tuple[str, ...] = (STEP_SSID_TAKEOVER,) if foreign else ()
+    if spec.radius is not None:
+        portal_depends_on += (STEP_RADIUS_PROFILE,)
+        actions.append(
+            await _plan_radius_profile(client, spec.radius, paths, state=state)
+        )
+    contract_label = (
+        "External Portal Server"
+        if spec.radius is None
+        else "External RADIUS Server, External Web Portal"
+    )
+    sign_in_url = (
+        f"{spec.portal_url_scheme}://{spec.portal_url}"
+        if spec.radius is None
+        else f"{spec.radius.portal_url_scheme}://{spec.radius.portal_url}"
+    )
+
     # -- 1. our portal -------------------------------------------------------
     if len(owned) > 1:
         names = ", ".join(f"'{_safe_name(s.get('name'))}'" for s in owned)
@@ -773,9 +1064,11 @@ async def configure_external_portal(
             )
         )
     elif not owned:
-        body = new_portal_body(spec, ssid_id)
 
         async def _create_portal() -> _WriteResult:
+            # Built at write time: on the RADIUS contract the profile id is
+            # only known once the step before this one has run.
+            body = new_portal_body(spec, ssid_id, state["radius_profile_id"])
             await client.request(
                 "POST",
                 ADD_PORTAL_PATH.format(**paths),
@@ -798,25 +1091,24 @@ async def configure_external_portal(
                 step=STEP_PORTAL,
                 outcome=PortalSetupOutcome.CREATED,
                 plan_message=(
-                    f"Would create portal '{spec.portal_name}' (External "
-                    f"Portal Server, {spec.portal_url_scheme}://"
-                    f"{spec.portal_url}) bound to SSID '{ssid_label}'."
+                    f"Would create portal '{spec.portal_name}' ({contract_label}, "
+                    f"{sign_in_url}) bound to SSID '{ssid_label}'."
                 ),
                 done_message=(
-                    f"Created portal '{spec.portal_name}' (External Portal "
-                    f"Server) bound to SSID '{ssid_label}'."
+                    f"Created portal '{spec.portal_name}' ({contract_label}) "
+                    f"bound to SSID '{ssid_label}'."
                 ),
                 failure_prefix=f"Could not create portal '{spec.portal_name}'.",
                 write=_create_portal,
                 details={"portal_name": spec.portal_name, "ssid_id": ssid_id},
-                depends_on=STEP_SSID_TAKEOVER if foreign else None,
+                depends_on=portal_depends_on,
             )
         )
     else:
         ours = owned[0]
         portal_id = str(ours["id"])
         detail = details.get(portal_id, {})
-        drift = portal_drift(detail, spec, ssid_id)
+        drift = portal_drift(detail, spec, ssid_id, state["radius_profile_id"])
         if not drift:
             actions.append(
                 _Action(
@@ -831,9 +1123,16 @@ async def configure_external_portal(
                 )
             )
         else:
-            body = updated_portal_body(detail, spec, ssid_id)
+            customization = await _portal_customization(
+                client, omadac_id, site_id, portal_id
+            )
 
-            async def _update_portal(body: dict = body) -> None:
+            async def _update_portal(
+                detail: dict = detail, customization: dict = customization
+            ) -> None:
+                body = updated_portal_body(
+                    detail, spec, ssid_id, customization, state["radius_profile_id"]
+                )
                 await client.request(
                     "PATCH",
                     PORTAL_PATH.format(portal_id=portal_id, **paths),
@@ -852,7 +1151,7 @@ async def configure_external_portal(
                     failure_prefix=(f"Could not update portal '{spec.portal_name}'."),
                     write=_update_portal,
                     details={"portal_id": portal_id, "drift": drift},
-                    depends_on=STEP_SSID_TAKEOVER if foreign else None,
+                    depends_on=portal_depends_on,
                 )
             )
 
@@ -935,6 +1234,121 @@ async def configure_external_portal(
         guest_ssid_id=ssid_id,
         portal_id=state["portal_id"],
         operator_credentials_set=bool(state["operator_credentials_set"]),
+    )
+
+
+async def _plan_radius_profile(
+    client: OmadaHttpClient,
+    radius: RadiusPortalSpec,
+    paths: dict[str, str],
+    *,
+    state: dict[str, Any],
+) -> _Action:
+    """Find our RADIUS profile by name; plan its create or repair.
+
+    Only a profile named ``radius.profile_name`` is ever written. Any other
+    profile on the site -- a venue's own, an older one of ours -- is left as
+    it is, and the portal is simply pointed away from it. The secret is
+    compared but never reported; ``details`` names drifted fields only.
+    """
+    envelope = await client.request("GET", RADIUS_PROFILES_PATH.format(**paths))
+    mine = [
+        row
+        for row in extract_page(envelope.result)
+        if coerce_str(row.get("name")) == radius.profile_name
+    ]
+    target = f"{radius.server_ip}:{int(radius.server_port)}"
+    if len(mine) > 1:
+        return _Action(
+            step=STEP_RADIUS_PROFILE,
+            outcome=PortalSetupOutcome.FAILED,
+            plan_message=(
+                f"More than one RADIUS profile on this site is named "
+                f"'{radius.profile_name}'. Delete the extra one on the "
+                "controller, then run again. No profile was changed."
+            ),
+            details={"profile_name": radius.profile_name, "match_count": len(mine)},
+        )
+    body = radius_profile_body(radius)
+    if not mine:
+
+        async def _create() -> _WriteResult:
+            created = await client.request(
+                "POST",
+                RADIUS_PROFILES_PATH.format(**paths),
+                json=body,
+                retry_on_transport_error=False,
+            )
+            # ``OperationResponseResIdOpenApiVO``: the new id, when the
+            # firmware returns one; otherwise read back by name.
+            result = created.result
+            profile_id = (
+                coerce_str(result.get("id")) if isinstance(result, dict) else None
+            )
+            if profile_id is None:
+                listing = await client.request(
+                    "GET", RADIUS_PROFILES_PATH.format(**paths)
+                )
+                for row in extract_page(listing.result):
+                    if coerce_str(row.get("name")) == radius.profile_name:
+                        profile_id = coerce_str(row.get("radiusProfileId"))
+                        break
+            if profile_id is None:
+                raise OmadaError(
+                    "The controller accepted the RADIUS profile but it could "
+                    "not be found afterwards."
+                )
+            state["radius_profile_id"] = profile_id
+            return _WriteResult(details={"radius_profile_id": profile_id})
+
+        return _Action(
+            step=STEP_RADIUS_PROFILE,
+            outcome=PortalSetupOutcome.CREATED,
+            plan_message=(
+                f"Would create RADIUS profile '{radius.profile_name}' "
+                f"(server {target}, PAP, accounting off) with this venue's "
+                "shared secret."
+            ),
+            done_message=(
+                f"Created RADIUS profile '{radius.profile_name}' (server {target})."
+            ),
+            failure_prefix=(
+                f"Could not create RADIUS profile '{radius.profile_name}'."
+            ),
+            write=_create,
+            details={"profile_name": radius.profile_name, "server": target},
+        )
+
+    profile_id = coerce_str(mine[0].get("radiusProfileId"))
+    state["radius_profile_id"] = profile_id
+    drift = radius_profile_drift(mine[0], radius)
+    if not drift:
+        return _Action(
+            step=STEP_RADIUS_PROFILE,
+            outcome=PortalSetupOutcome.UNCHANGED,
+            plan_message=(
+                f"RADIUS profile '{radius.profile_name}' already points at "
+                f"{target} with this venue's shared secret."
+            ),
+            details={"radius_profile_id": profile_id, "server": target},
+        )
+
+    async def _update() -> None:
+        await client.request(
+            "PATCH",
+            RADIUS_PROFILE_PATH.format(radius_profile_id=profile_id, **paths),
+            json=body,
+        )
+
+    fields = ", ".join(drift)
+    return _Action(
+        step=STEP_RADIUS_PROFILE,
+        outcome=PortalSetupOutcome.UPDATED,
+        plan_message=f"Would update RADIUS profile '{radius.profile_name}': {fields}.",
+        done_message=f"Updated RADIUS profile '{radius.profile_name}': {fields}.",
+        failure_prefix=f"Could not update RADIUS profile '{radius.profile_name}'.",
+        write=_update,
+        details={"radius_profile_id": profile_id, "drift": drift, "server": target},
     )
 
 
@@ -1114,11 +1528,14 @@ async def _apply(actions: list[_Action], *, dry_run: bool) -> list[PortalSetupSt
                 )
             )
             continue
-        if lost_contact or (action.depends_on and action.depends_on in failed_steps):
+        blocked_by = next(
+            (step for step in action.depends_on if step in failed_steps), None
+        )
+        if lost_contact or blocked_by is not None:
             reason = (
                 "an earlier step lost contact with the controller."
                 if lost_contact
-                else "the guest SSID could not be released from the other portal."
+                else _DEPENDENCY_FAILURE_REASONS[blocked_by]
             )
             failed_steps.add(action.step)
             steps.append(
@@ -1167,17 +1584,24 @@ __all__ = [
     "ACCESS_CONTROL_PATH",
     "ADD_PORTAL_PATH",
     "AUTH_TYPE_EXTERNAL_PORTAL",
+    "AUTH_TYPE_EXTERNAL_RADIUS",
+    "HOST_TYPE_IP",
     "HOST_TYPE_URL",
     "OPERATORS_PATH",
     "OPERATOR_PATH",
     "OPERATOR_ROLE_ADMINISTRATOR",
     "PORTALS_PATH",
+    "PORTAL_CUSTOMIZATION_PATH",
     "PORTAL_PATH",
     "PRE_AUTH_POLICY_TYPE_URL",
+    "RADIUS_PROFILES_PATH",
+    "RADIUS_PROFILE_PATH",
     "STEP_HOTSPOT_OPERATOR",
     "STEP_PORTAL",
     "STEP_PRE_AUTH_ACCESS",
+    "STEP_RADIUS_PROFILE",
     "STEP_SSID_TAKEOVER",
+    "apply_portal_customization",
     "auth_timeout_setting",
     "configure_external_portal",
     "host_of",
@@ -1185,6 +1609,9 @@ __all__ = [
     "new_portal_body",
     "portal_drift",
     "portal_setting_from_detail",
+    "radius_profile_body",
+    "radius_profile_drift",
+    "release_leaves_portal_unbound",
     "released_portal_body",
     "resolve_ssid",
     "updated_portal_body",

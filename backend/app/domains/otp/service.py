@@ -120,8 +120,9 @@ import hashlib
 import json
 import logging
 import secrets
+import time
 import uuid
-from collections.abc import Mapping
+from collections.abc import Awaitable, Mapping
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from types import MappingProxyType
@@ -153,7 +154,7 @@ from .exceptions import (
 )
 from .models import OtpRequest
 from .repository import OtpRepositoryProtocol
-from .validators import validate_identifier
+from .validators import normalize_otp_identifier, validate_identifier
 
 logger = logging.getLogger(__name__)
 
@@ -1372,6 +1373,15 @@ class OtpRateLimiter:
             )
 
 
+OTP_PROVIDER_ACCEPTED = "accepted"
+OTP_PROVIDER_REJECTED = "rejected"
+OTP_PROVIDER_NOT_ATTEMPTED = "not_attempted"
+
+
+def _elapsed_ms(started: float) -> int:
+    return round((time.perf_counter() - started) * 1000)
+
+
 class OtpService:
     """Core OTP business logic: request, verify, rate limit."""
 
@@ -1421,7 +1431,7 @@ class OtpService:
         organization_id: uuid.UUID | None,
         location_id: uuid.UUID | None,
     ) -> OtpRequest:
-        identifier = identifier.strip()
+        identifier = normalize_otp_identifier(identifier)
         validate_identifier(identifier, channel)
 
         await OtpRateLimiter.check_and_increment(
@@ -1500,18 +1510,66 @@ class OtpService:
             # the DLT-gated guest sign-in).
             if self.sms_message_template and purpose == OtpPurpose.GUEST_LOGIN:
                 message = self.sms_message_template.replace("{#num#}", code)
-            await self.sms_provider.send(otp_request.identifier, message)
+            await self._send_recorded(
+                otp_request,
+                self.sms_provider,
+                self.sms_provider.send(otp_request.identifier, message),
+            )
         elif channel == OtpChannel.WHATSAPP:
-            await self.whatsapp_provider.send(
-                otp_request.identifier, code=code, message=message
+            await self._send_recorded(
+                otp_request,
+                self.whatsapp_provider,
+                self.whatsapp_provider.send(
+                    otp_request.identifier, code=code, message=message
+                ),
             )
         else:
             email_html = _render_otp_email(
                 intro=intro, code=code, minutes=minutes
             )
-            await self.email_provider.send(
-                otp_request.identifier, subject, email_html
+            await self._send_recorded(
+                otp_request,
+                self.email_provider,
+                self.email_provider.send(otp_request.identifier, subject, email_html),
             )
+
+    @staticmethod
+    async def _send_recorded(
+        otp_request: OtpRequest, provider: object, send: Awaitable[object]
+    ) -> None:
+        """Await the provider's send and note what it did on the row.
+
+        Additive by construction: only plain attribute writes, flushed with the
+        row's own commit, so no new await and nothing that can fail or delay a
+        code. A provider error is re-raised exactly as before. That rolls the row
+        back (``get_db_session``), so a rejected send leaves only the log line;
+        keeping a row for it would also become the guest's "latest" code and
+        break an earlier valid one. The Logging* providers send nothing, so they
+        record ``not_attempted``. The exception's text isn't logged: it can carry
+        the request.
+        """
+        name = type(provider).__name__[:40]
+        started = time.perf_counter()
+        outcome = OTP_PROVIDER_ACCEPTED
+        try:
+            await send
+        except Exception as exc:
+            outcome = OTP_PROVIDER_REJECTED
+            logger.warning(
+                "otp_provider_rejected",
+                extra={
+                    "event_provider": name,
+                    "event_response_ms": _elapsed_ms(started),
+                    "event_error_type": type(exc).__name__,
+                },
+            )
+            raise
+        finally:
+            otp_request.provider_outcome = (
+                OTP_PROVIDER_NOT_ATTEMPTED if name.startswith("Logging") else outcome
+            )
+            otp_request.provider_name = name
+            otp_request.provider_response_ms = _elapsed_ms(started)
 
     # ========================================================================
     # Verify
@@ -1520,7 +1578,7 @@ class OtpService:
     async def verify_otp(
         self, *, identifier: str, code: str, purpose: OtpPurpose
     ) -> OtpRequest:
-        identifier = identifier.strip()
+        identifier = normalize_otp_identifier(identifier)
         otp_request = await self.repository.get_latest_for_identifier(
             identifier, purpose.value
         )

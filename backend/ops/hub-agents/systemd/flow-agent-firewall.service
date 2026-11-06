@@ -1,0 +1,18 @@
+[Unit]
+Description=Host firewall for the Wyfy NetFlow collector (udp 2055 on wg0) and flow agent (tcp 9094, app server only)
+# iptables rules do not survive a reboot. Without this unit the collector
+# and the agent come back up with nothing in front of them. Same shape as
+# wyfy-agent-firewall.service.
+Before=wyfy-nfacctd.service flow-agent.service
+After=network.target
+
+[Service]
+Type=oneshot
+# APP_SOURCES=<app server private /32>[ <another /32>...]. The script
+# refuses to run without it. Not in this file: this repository is public.
+EnvironmentFile=/etc/wyfy/flow-agent-firewall.env
+ExecStart=/usr/local/sbin/flow-agent-firewall.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

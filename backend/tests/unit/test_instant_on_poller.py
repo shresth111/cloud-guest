@@ -27,6 +27,7 @@ from app.domains.network_integration.providers.aruba_instant_on import (
     map_alert,
     map_client,
     map_client_usage,
+    map_event,
     map_network,
 )
 from app.domains.network_integration.providers.aruba_instant_on_client import (
@@ -149,6 +150,10 @@ class ScriptedProvider:
         self._maybe_raise(site_id, "alerts")
         return [map_alert(e) for e in fx.ALERTS["elements"]]
 
+    async def read_events(self, site_id: str):  # noqa: ANN201
+        self._maybe_raise(site_id, "events")
+        return [map_event(e) for e in fx.EVENTS["elements"]]
+
     async def read_health(self, site_id: str):  # noqa: ANN201
         self._maybe_raise(site_id, "health")
         return InstantOnHealth(score=100, status="good")
@@ -224,7 +229,7 @@ class TestCadence:
         provider = ScriptedProvider()
         summary, tx, _ = await _run(repo, provider)
         assert sorted(k for _, k in provider.calls) == sorted(ALL_KINDS)
-        assert summary.sites_ok == 1 and summary.kinds_read == 6
+        assert summary.sites_ok == 1 and summary.kinds_read == 7
         assert site.api_state == "ok" and site.last_success_at == T0
         assert tx.commits == 1
         snap = repo.snap(site, "clients")
@@ -241,7 +246,11 @@ class TestCadence:
         await _run(repo, ScriptedProvider())
         provider = ScriptedProvider()
         await _run(repo, provider, at=T0 + timedelta(seconds=60))
-        assert sorted(k for _, k in provider.calls) == ["access_points", "clients"]
+        assert sorted(k for _, k in provider.calls) == [
+            "access_points",
+            "clients",
+            "events",
+        ]
 
     async def test_five_and_fifteen_minutes(self) -> None:
         site = _site()
@@ -250,7 +259,7 @@ class TestCadence:
         p5 = ScriptedProvider()
         await _run(repo, p5, at=T0 + timedelta(minutes=5))
         assert sorted(k for _, k in p5.calls) == sorted(
-            ["access_points", "clients", "health", "ssids", "alerts"]
+            ["access_points", "clients", "events", "health", "ssids", "alerts"]
         )
         p15 = ScriptedProvider()
         await _run(repo, p15, at=T0 + timedelta(minutes=15))

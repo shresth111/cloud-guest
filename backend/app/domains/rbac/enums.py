@@ -186,6 +186,36 @@ class PermissionModule(StrEnum):
     # integration belongs to the customer, and this module gates who may
     # point this platform at it.
     NETWORK_INTEGRATIONS = "network_integrations"
+    # Traffic Flows: NetFlow/IPFIX rollups (top talkers / destinations per
+    # venue) -- see app.domains.traffic_flow. GLOBAL-only, and held by
+    # fewer GLOBAL roles than usual: the data is guest browsing metadata
+    # (DPDP), so Platform Support and Billing Manager are explicitly NONE.
+    TRAFFIC_FLOWS = "traffic_flows"
+    # Venue Traffic: the CUSTOMER's read of traffic-flow rollups for their
+    # own venue (app.domains.traffic_flow customer routes). A separate
+    # module from TRAFFIC_FLOWS on purpose: that one is GLOBAL-only and
+    # covers the fleet, exporter addresses and router writes, none of which
+    # a customer may reach. This one is read-only and LOCATION-scoped.
+    VENUE_TRAFFIC = "venue_traffic"
+    # Device Logs: syslog (and, later, controller/cloud event feeds) that
+    # venue devices send to the platform, viewed in the Master console. A
+    # separate module because the lines carry guest identifiers (MAC, IP,
+    # masked logins) -- who may read the device-side event stream is a
+    # different grant from who may configure a router. GLOBAL-only for now;
+    # see app.domains.device_logs.
+    DEVICE_LOGS = "device_logs"
+    # NetLogs: the customer's own organization's device log lines (router
+    # syslog + RADIUS decisions + portal sign-in failures), read-only and
+    # LOCATION-scoped. Separate from DEVICE_LOGS for the same reason
+    # VENUE_TRAFFIC is separate from TRAFFIC_FLOWS: that key is the Master
+    # viewer's, GLOBAL-only, and must never become assignable to a customer
+    # role. See app.domains.device_logs.customer_router.
+    NETWORK_LOGS = "network_logs"
+    # IPDR: per-connection records (who held which address, talking to
+    # what) in the CERT-In IPDR column format -- PII for law-enforcement
+    # requests. READ = the masked on-screen table, EXPORT = the unmasked
+    # CSV. ORGANIZATION-scoped, Owner/Admin only. See app.domains.ipdr.
+    IPDR = "ipdr"
 
 
 class OverrideEffect(StrEnum):
@@ -302,6 +332,13 @@ class AuditAction(StrEnum):
     # doesn't change any state, it exposes a secret, so "who saw this and
     # when" is the whole point of logging it.
     ROUTER_CREDENTIALS_REVEALED = "router_credentials_revealed"
+    ROUTER_LOCAL_ADMIN_PASSWORD_CHECKED = "router_local_admin_password_checked"
+    ROUTER_LOCAL_ADMIN_PASSWORD_ISSUED = "router_local_admin_password_issued"
+    ROUTER_LOCAL_ADMIN_PASSWORD_APPLIED = "router_local_admin_password_applied"
+    ROUTER_LOCAL_ADMIN_PASSWORD_APPLY_FAILED = (
+        "router_local_admin_password_apply_failed"
+    )
+    ROUTER_LOCAL_ADMIN_PASSWORD_REVEALED = "router_local_admin_password_revealed"
     ROUTER_DECOMMISSIONED = "router_decommissioned"
     ROUTER_SUSPENDED = "router_suspended"
     ROUTER_REINSTATED = "router_reinstated"
@@ -353,6 +390,11 @@ class AuditAction(StrEnum):
         "router_configuration_plan_final_verified"
     )
     ROUTER_WAN_ROUTING_MODE_CHANGED = "router_wan_routing_mode_changed"
+    # SNMP (Master console, app.domains.router.snmp). Metadata carries
+    # field NAMES and outcomes only, never a community or passphrase.
+    ROUTER_SNMP_CONFIG_UPDATED = "router_snmp_config_updated"
+    ROUTER_SNMP_TESTED = "router_snmp_tested"
+    ROUTER_SNMP_APPLIED = "router_snmp_applied"
 
     # WireGuard domain events (Module 009 Part 3) -- written through this
     # same table by ``app.domains.wireguard.service.WireGuardService`` via

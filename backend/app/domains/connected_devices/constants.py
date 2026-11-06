@@ -136,6 +136,24 @@ MONITORED_HARDWARE_LIVENESS_SWEEP_INTERVAL_SECONDS = 30.0
 #: dikha do" (a wired venue AP answering 0/2 echoes is down, full stop).
 MONITORED_HARDWARE_LIVENESS_PING_COUNT = 2
 
+#: Consecutive failed probes before a device reads DOWN (and alerts). The
+#: first miss already shows amber -- ``degraded`` / ``probe_failing`` -- so
+#: the founder's "ping drop hote hi down dikha do" still holds on screen:
+#: nothing says "Up" once a probe is missed. What waits for the second miss
+#: is the red DOWN, ``is_active=False`` and therefore the alert, which used
+#: to fire on a single dropped sweep. PRTG does the same (Warning, rescan,
+#: then Down). A port that is link-down skips the wait: that is physical.
+MONITORED_HARDWARE_DOWN_AFTER_FAILURES = 2
+
+#: Link-downs on a device's port within 24h at which a responding device
+#: reads ``degraded`` / ``link_flapping``. A power cycle or a loose cable
+#: drops the link; a reboot between two sweeps never fails a ping, so the
+#: port counter is the only place it shows.
+MONITORED_DEVICE_LINK_FLAP_THRESHOLD_24H = 3
+
+#: How long ``monitored_device_events`` rows are kept.
+MONITORED_DEVICE_EVENT_RETENTION_DAYS = 30
+
 # Redis SETNX-style overlap-prevention lock for the liveness sweep's
 # coordinator phase -- identical shape/scope to
 # CONNECTED_DEVICE_SYNC_SWEEP_LOCK_REDIS_KEY above.
@@ -164,6 +182,9 @@ __all__ = [
     "CONNECTED_DEVICE_SYNC_SWEEP_LOCK_TTL_SECONDS",
     "MONITORED_HARDWARE_LIVENESS_SWEEP_INTERVAL_SECONDS",
     "MONITORED_HARDWARE_LIVENESS_PING_COUNT",
+    "MONITORED_HARDWARE_DOWN_AFTER_FAILURES",
+    "MONITORED_DEVICE_LINK_FLAP_THRESHOLD_24H",
+    "MONITORED_DEVICE_EVENT_RETENTION_DAYS",
     "MONITORED_HARDWARE_LIVENESS_SWEEP_LOCK_REDIS_KEY",
     "MONITORED_HARDWARE_LIVENESS_SWEEP_LOCK_TTL_SECONDS",
     "TASK_RUN_MONITORED_HARDWARE_LIVENESS_SWEEP",

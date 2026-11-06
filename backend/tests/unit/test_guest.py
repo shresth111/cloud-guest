@@ -297,6 +297,12 @@ class FakeVoucherService:
     async def get_plan_queue_profile_id(self, plan_id: uuid.UUID) -> uuid.UUID | None:
         return self.plan_queue_profiles.get(plan_id)
 
+    async def get_voucher_by_id(self, voucher_id: uuid.UUID) -> Voucher | None:
+        for voucher, _batch in self.vouchers.values():
+            if voucher.id == voucher_id:
+                return voucher
+        return None
+
 
 @dataclass
 class FakeCaptivePortalService:
@@ -321,6 +327,12 @@ class FakeCaptivePortalService:
         # rather than inherited from the column default.
         collect_guest_name: bool = True,
         collect_guest_email: bool = True,
+        # Name required at sign-in. **Off by default in this fake, ON in
+        # production** (owner decision, migration 0143). Off here so the
+        # hundreds of OTP-login tests that are about something else are not
+        # silently held for a name; tests about the requirement set it, and
+        # ``test_require_guest_name.py`` pins the production default.
+        require_guest_name: bool = False,
         whitelist_only_enabled: bool = False,
         whitelist_only_denied_message: str | None = None,
         # Open Hours. Set explicitly for the same reason
@@ -367,6 +379,7 @@ class FakeCaptivePortalService:
                 social_login_providers=[],
                 collect_guest_name=collect_guest_name,
                 collect_guest_email=collect_guest_email,
+                require_guest_name=require_guest_name,
                 review_card_enabled=False,
                 review_url=None,
                 guest_feedback_enabled=False,
@@ -909,11 +922,15 @@ class FakeGuestRepository:
     async def get_guest_by_identifier(
         self, organization_id: uuid.UUID, identifier: str
     ) -> Guest | None:
+        # Emails mirror the real clause's ``lower(identifier)`` comparison
+        # (``guest_identifier_clause``); everything else stays exact, as
+        # this fake always was.
+        casefold = "@" in identifier
         for guest in self.guests.values():
-            if (
-                guest.organization_id == organization_id
-                and guest.identifier == identifier
-            ):
+            if guest.organization_id != organization_id:
+                continue
+            stored = guest.identifier.lower() if casefold else guest.identifier
+            if stored == (identifier.lower() if casefold else identifier):
                 return guest
         return None
 
@@ -1107,6 +1124,40 @@ class FakeGuestRepository:
         # (no new row is inserted) -- see get_guest_for_update.
         self._release_guest_lock(session.guest_id)
         return session
+
+    async def has_blocking_review_activity(
+        self,
+        *,
+        guest_id: uuid.UUID,
+        location_id: uuid.UUID,
+        shown_since: datetime,
+    ) -> bool:
+        for s in self.sessions.values():
+            if s.guest_id != guest_id or s.location_id != location_id:
+                continue
+            if getattr(s, "is_deleted", False):
+                continue
+            if s.review_link_opened_at is not None:
+                return True
+            shown = s.review_prompt_shown_at
+            if shown is not None and shown >= shown_since:
+                return True
+        return False
+
+    async def count_review_activity(
+        self, *, location_id: uuid.UUID, since: datetime
+    ) -> tuple[int, int]:
+        rows = [
+            s
+            for s in self.sessions.values()
+            if s.location_id == location_id and not getattr(s, "is_deleted", False)
+        ]
+        def _in_window(stamp: datetime | None) -> bool:
+            return stamp is not None and stamp >= since
+
+        shown = sum(1 for s in rows if _in_window(s.review_prompt_shown_at))
+        opened = sum(1 for s in rows if _in_window(s.review_link_opened_at))
+        return shown, opened
 
     async def list_sessions(
         self,
@@ -1657,6 +1708,7 @@ def make_fixture(
     # care about the flags set them explicitly.
     collect_guest_name: bool = True,
     collect_guest_email: bool = True,
+    require_guest_name: bool = False,
     whitelist_only_enabled: bool = False,
     whitelist_only_denied_message: str | None = None,
     business_hours_enabled: bool = False,
@@ -1684,6 +1736,7 @@ def make_fixture(
         pin_login_enabled=pin_login_enabled,
         collect_guest_name=collect_guest_name,
         collect_guest_email=collect_guest_email,
+        require_guest_name=require_guest_name,
         whitelist_only_enabled=whitelist_only_enabled,
         whitelist_only_denied_message=whitelist_only_denied_message,
         business_hours_enabled=business_hours_enabled,
@@ -9186,6 +9239,10 @@ class TestNasSecretRotationIsPlatformOnly:
         endpoint is for."""
         paths = sorted(r.path for r in self._routes_requiring("radius.execute"))
         assert paths == [
+            # Rotating the shared Aruba listener's secret changes the
+            # credential of every venue on that listener: the same key, the
+            # same platform namespace, pinned GLOBAL.
+            "/api/v1/platform/radius/aruba-shared/rotate",
             "/api/v1/platform/radius/nas/{nas_id}/activate",
             "/api/v1/platform/radius/nas/{nas_id}/disable",
             "/api/v1/platform/radius/nas/{nas_id}/regenerate-secret",

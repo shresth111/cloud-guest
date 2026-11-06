@@ -589,10 +589,12 @@ async def list_plans(
         is_active=is_active,
         plan_type=plan_type.value if plan_type else None,
     )
-    responses = []
-    for plan in items:
-        features = await service.list_features(plan.id)
-        responses.append(_plan_response(plan, features))
+    features_by_plan = await service.list_features_for_plans(
+        [plan.id for plan in items]
+    )
+    responses = [
+        _plan_response(plan, features_by_plan.get(plan.id, [])) for plan in items
+    ]
     payload = PlanListResponse(
         items=responses,
         page=meta.page,

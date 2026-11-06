@@ -137,6 +137,10 @@ class QueueManagementRepositoryProtocol(Protocol):
         self, *, download_rate_kbps: int, upload_rate_kbps: int
     ) -> None: ...
 
+    async def acquire_location_reapply_lock(
+        self, *, location_id: uuid.UUID
+    ) -> None: ...
+
 
 async def _paginate_org_or_system(
     session,  # noqa: ANN001
@@ -407,6 +411,28 @@ class QueueManagementRepository:
             self.session,
             namespace=b"queue_profile",
             key=f"{download_rate_kbps}:{upload_rate_kbps}",
+        )
+
+    async def acquire_location_reapply_lock(self, *, location_id: uuid.UUID) -> None:
+        """Makes ``reapply_active_sessions_for_location`` single-flight per
+        location -- see ``_acquire_advisory_lock``.
+
+        One save in the venue's policy screen publishes several policies
+        and so dispatches several re-applies for one location within a
+        second. Each walked the same assignments in its own transaction,
+        and one of them failed a statement mid-run and aborted (the cause
+        was not captured; runs taking the per-target locks in different
+        orders is the likely one). Holding this for the
+        whole of a location's re-apply makes the later ones wait, and by
+        the time they read anything the first has committed -- so they find
+        every assignment already at the published rate and write nothing.
+
+        Blocking, not try-and-skip: a publish that lands while another
+        re-apply is running must still be applied after it."""
+        await _acquire_advisory_lock(
+            self.session,
+            namespace=b"queue_reapply_location",
+            key=str(location_id),
         )
 
     async def get_active_assignment_for_target(

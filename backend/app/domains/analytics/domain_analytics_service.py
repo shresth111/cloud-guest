@@ -166,6 +166,7 @@ from typing import Protocol
 
 from redis.asyncio import Redis
 
+from app.domains.router.vendor_capabilities import is_nas_only
 from app.domains.wireguard.constants import HealthStatus as WireGuardHealthStatus
 from app.domains.wireguard.models import WireGuardPeer
 
@@ -472,8 +473,14 @@ class DomainAnalyticsService:
         bytes_downloaded = bandwidth.bytes_downloaded if bandwidth else 0
         hotspot_sessions = bandwidth.session_count if bandwidth else 0
 
-        internet_available = compute_internet_availability(
-            status=router.status, last_seen_at=router.last_seen_at, now=now
+        # None = not measured: a NAS-only (Aruba Instant On) row never
+        # heartbeats, so the heartbeat proxy would always read False.
+        internet_available = (
+            None
+            if is_nas_only(router)
+            else compute_internet_availability(
+                status=router.status, last_seen_at=router.last_seen_at, now=now
+            )
         )
 
         wireguard = self._build_wireguard_status(peer, now=now)
@@ -571,6 +578,10 @@ class DomainAnalyticsService:
             organization_id=organization_id, location_id=location_id
         )
         now = datetime.now(UTC)
+        # NAS-only rows are not measured by the heartbeat proxy; leaving them
+        # in made an Aruba-only org read 0% available. An org with none is
+        # unaffected; an org with only NAS-only rows reads None (not measured).
+        routers = [router for router in routers if not is_nas_only(router)]
         available_count = sum(
             1
             for router in routers

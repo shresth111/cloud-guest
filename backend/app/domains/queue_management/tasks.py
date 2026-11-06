@@ -23,6 +23,7 @@ full guest/OTP/voucher/captive-portal graph that domain's own
 
 from __future__ import annotations
 
+import contextlib
 import uuid
 
 from app.core.async_task_bridge import run_celery_task
@@ -44,11 +45,22 @@ from app.domains.router.repository import RouterRepository
 from app.domains.router.service import RouterService
 
 from .constants import (
+    BACKFILL_UNASSIGNED_SESSION_QUEUES_MAX_PER_RUN,
+    REAPPLY_POLICY_ASSIGNMENTS_RETRY_SECONDS,
+    TASK_APPLY_ARUBA_HYBRID_QUEUE,
+    TASK_BACKFILL_UNASSIGNED_SESSION_QUEUES,
     TASK_REAPPLY_POLICY_ASSIGNMENTS,
+    TASK_RECONCILE_ARUBA_HYBRID_QUEUES,
+    TASK_RELEASE_ARUBA_HYBRID_QUEUE,
+    TASK_RELEASE_ENDED_SESSION_QUEUES,
     TASK_SWEEP_SCHEDULE_TRANSITIONS,
 )
 from .repository import QueueManagementRepository
-from .service import QueueManagementService
+from .service import (
+    QueueManagementService,
+    SessionWithoutQueue,
+    venue_cap_from_rules,
+)
 
 logger = get_logger(__name__)
 
@@ -71,8 +83,243 @@ logger = get_logger(__name__)
 #: merely imports this task module.
 
 
+class GuestSessionLiveness:
+    """``service.SessionLivenessLookupProtocol`` against the real
+    ``guest_sessions`` table.
+
+    Lives here, not in ``service.py`` and not in the guest domain: the
+    guest domain already depends on this one (it enqueues queue work and
+    imports ``QueueTargetType``), so this is the one place the dependency
+    can point the other way without a cycle -- and the guest imports are
+    function-local for the same reason every other cross-domain import in
+    this module is.
+
+    One ``SELECT id`` per 500 ids, no row is loaded and none is locked."""
+
+    _CHUNK = 500
+
+    def __init__(self, session) -> None:  # noqa: ANN001 -- AsyncSession
+        self._session = session
+
+    @staticmethod
+    def statement(session_ids: list[uuid.UUID]):  # noqa: ANN205
+        from sqlalchemy import select  # noqa: PLC0415
+
+        from app.domains.guest.constants import GuestSessionStatus  # noqa: PLC0415
+        from app.domains.guest.models import GuestSession  # noqa: PLC0415
+
+        return select(GuestSession.id).where(
+            GuestSession.id.in_(session_ids),
+            GuestSession.is_deleted.is_(False),
+            GuestSession.status.in_(
+                [GuestSessionStatus.ACTIVE.value, GuestSessionStatus.PAUSED.value]
+            ),
+        )
+
+    async def live_session_ids(self, session_ids) -> set[uuid.UUID]:  # noqa: ANN001
+        ids = list(session_ids)
+        live: set[uuid.UUID] = set()
+        for start in range(0, len(ids), self._CHUNK):
+            rows = await self._session.execute(
+                self.statement(ids[start : start + self._CHUNK])
+            )
+            live.update(rows.scalars().all())
+        return live
+
+    @staticmethod
+    def guest_ids_statement(session_ids: list[uuid.UUID]):  # noqa: ANN205
+        from sqlalchemy import select  # noqa: PLC0415
+
+        from app.domains.guest.models import GuestSession  # noqa: PLC0415
+
+        return select(GuestSession.id, GuestSession.guest_id).where(
+            GuestSession.id.in_(session_ids),
+            GuestSession.is_deleted.is_(False),
+        )
+
+    async def guest_ids_for_sessions(  # noqa: ANN201
+        self, session_ids
+    ) -> dict[uuid.UUID, uuid.UUID | None]:
+        """Whose session each id is -- what lets a policy re-apply resolve
+        the speed for that guest instead of for nobody (see
+        ``QueueManagementService.reapply_active_sessions_for_location``).
+        Two columns, no row loaded and none locked."""
+        ids = list(session_ids)
+        found: dict[uuid.UUID, uuid.UUID | None] = {}
+        for start in range(0, len(ids), self._CHUNK):
+            rows = await self._session.execute(
+                self.guest_ids_statement(ids[start : start + self._CHUNK])
+            )
+            found.update({row[0]: row[1] for row in rows.all()})
+        return found
+
+
+class GuestSessionsWithoutQueue:
+    """``service.SessionsWithoutQueueLookupProtocol`` against the real
+    ``guest_sessions`` and ``queue_assignments`` tables.
+
+    Here, next to ``GuestSessionLiveness``, for the reason given there: the
+    guest domain already depends on this one, so this is the one place the
+    question can be asked the other way without a cycle.
+
+    One statement, no row loaded and none locked: seven columns of each
+    ACTIVE session that has a router, started at or before the cutoff, and
+    has no SESSION assignment that is ACTIVE, SUSPENDED or DISABLED, plus
+    the MAC of the session's device where it has one (the service asks the
+    router for that device's address rather than trusting the recorded
+    one). A PENDING assignment is not a queue (it never reached the
+    device), so a session holding only one of those is still returned."""
+
+    def __init__(self, session) -> None:  # noqa: ANN001 -- AsyncSession
+        self._session = session
+
+    @staticmethod
+    def statement(  # noqa: ANN205
+        *, started_before, location_id: uuid.UUID | None, limit: int
+    ):
+        from sqlalchemy import select  # noqa: PLC0415
+
+        from app.domains.guest.constants import GuestSessionStatus  # noqa: PLC0415
+        from app.domains.guest.models import (  # noqa: PLC0415
+            GuestDevice,
+            GuestSession,
+        )
+
+        from .constants import QueueStatus, QueueTargetType  # noqa: PLC0415
+        from .models import QueueAssignment  # noqa: PLC0415
+
+        has_queue = (
+            select(QueueAssignment.id)
+            .where(
+                QueueAssignment.target_type == QueueTargetType.SESSION.value,
+                QueueAssignment.target_id == GuestSession.id,
+                QueueAssignment.is_deleted.is_(False),
+                QueueAssignment.status.in_(
+                    [
+                        QueueStatus.ACTIVE.value,
+                        QueueStatus.SUSPENDED.value,
+                        QueueStatus.DISABLED.value,
+                    ]
+                ),
+            )
+            .exists()
+        )
+        statement = (
+            select(
+                GuestSession.id,
+                GuestSession.organization_id,
+                GuestSession.location_id,
+                GuestSession.router_id,
+                GuestSession.ip_address,
+                GuestSession.guest_id,
+                GuestSession.started_at,
+                GuestDevice.mac_address,
+            )
+            .select_from(GuestSession)
+            .outerjoin(GuestDevice, GuestDevice.id == GuestSession.device_id)
+        ).where(
+            GuestSession.status == GuestSessionStatus.ACTIVE.value,
+            GuestSession.is_deleted.is_(False),
+            GuestSession.router_id.is_not(None),
+            GuestSession.started_at <= started_before,
+            ~has_queue,
+        )
+        if location_id is not None:
+            statement = statement.where(GuestSession.location_id == location_id)
+        return statement.order_by(GuestSession.started_at.desc()).limit(limit)
+
+    async def list_sessions_without_queue(
+        self, *, started_before, location_id: uuid.UUID | None = None, limit: int
+    ) -> list[SessionWithoutQueue]:
+        rows = await self._session.execute(
+            self.statement(
+                started_before=started_before, location_id=location_id, limit=limit
+            )
+        )
+        return [
+            SessionWithoutQueue(
+                session_id=row[0],
+                organization_id=row[1],
+                location_id=row[2],
+                router_id=row[3],
+                ip_address=row[4],
+                guest_id=row[5],
+                started_at=row[6],
+                device_mac=row[7],
+            )
+            for row in rows.all()
+        ]
+
+
+    @staticmethod
+    def device_macs_statement(session_ids: list[uuid.UUID]):  # noqa: ANN205
+        from sqlalchemy import select  # noqa: PLC0415
+
+        from app.domains.guest.constants import GuestSessionStatus  # noqa: PLC0415
+        from app.domains.guest.models import (  # noqa: PLC0415
+            GuestDevice,
+            GuestSession,
+        )
+
+        return (
+            select(GuestSession.id, GuestDevice.mac_address)
+            .select_from(GuestSession)
+            .join(GuestDevice, GuestDevice.id == GuestSession.device_id)
+            .where(
+                GuestSession.id.in_(session_ids),
+                GuestSession.is_deleted.is_(False),
+                GuestSession.status == GuestSessionStatus.ACTIVE.value,
+            )
+        )
+
+    async def device_macs_for_active_sessions(  # noqa: ANN201
+        self, session_ids
+    ) -> dict[uuid.UUID, str]:
+        ids = list(session_ids)
+        found: dict[uuid.UUID, str] = {}
+        for start in range(0, len(ids), GuestSessionLiveness._CHUNK):
+            rows = await self._session.execute(
+                self.device_macs_statement(
+                    ids[start : start + GuestSessionLiveness._CHUNK]
+                )
+            )
+            found.update({row[0]: row[1] for row in rows.all() if row[1]})
+        return found
+
+
+def queue_backfill_applies(router_id: uuid.UUID, settings: object) -> bool:
+    """Whether the backfill is switched on for ``router_id``: for every
+    router (``guest_queue_backfill_enabled``), or for this one by name in
+    the comma-separated ``guest_queue_backfill_router_ids`` allow-list. The
+    same two-setting rule as the hotspot gate's, on its own pair of
+    settings. An entry that is not a UUID matches nothing."""
+    if bool(settings.guest_queue_backfill_enabled):  # type: ignore[attr-defined]
+        return True
+    wanted = {
+        part.strip().lower()
+        for part in str(settings.guest_queue_backfill_router_ids or "").split(",")  # type: ignore[attr-defined]
+    }
+    return str(router_id).lower() in wanted
+
+
+def _queue_backfill_is_on_anywhere(settings: object) -> bool:
+    return bool(settings.guest_queue_backfill_enabled) or bool(  # type: ignore[attr-defined]
+        str(settings.guest_queue_backfill_router_ids or "").strip()  # type: ignore[attr-defined]
+    )
+
+
+def _queue_backfill_max_per_run(settings: object) -> int:
+    return int(
+        getattr(
+            settings,
+            "guest_queue_backfill_max_per_run",
+            BACKFILL_UNASSIGNED_SESSION_QUEUES_MAX_PER_RUN,
+        )
+    )
+
+
 async def _reapply_policy_assignments_async(
-    policy_id: str, version_id: str
+    policy_id: str, version_id: str, location_id: str = ""
 ) -> dict[str, int]:
     """The actual async work behind ``reapply_policy_assignments`` -- a
     fresh session per task run, mirroring
@@ -123,11 +370,17 @@ async def _reapply_policy_assignments_async(
             # passes. Without it this task refuses every controller-managed
             # venue -- see the module-level note above.
             controller_speed_hook=build_controller_speed_hook(session),
+            # So a publish is not re-applied to guests who have left -- see
+            # ``reapply_active_sessions_for_location``.
+            session_liveness_lookup=GuestSessionLiveness(session),
+            # So a publish also reaches a live guest who has no queue at
+            # all -- see the backfill call below.
+            sessions_without_queue_lookup=GuestSessionsWithoutQueue(session),
         )
         policy_repository = PolicyRepository(session)
         policy = await policy_repository.get_policy_by_id(uuid.UUID(policy_id))
         if policy is None:
-            return {"reapplied": 0, "failed": 0, "locations": 0}
+            return {"reapplied": 0, "failed": 0, "locations": 0, "assigned": 0}
         assignments = await policy_repository.list_assignments_for_policy(
             uuid.UUID(policy_id)
         )
@@ -138,20 +391,82 @@ async def _reapply_policy_assignments_async(
             and a.scope_type == "location"
             and a.scope_id is not None
         }
+        # A mapping that has just been deactivated is no longer among the
+        # active rows above, and its location is exactly the one whose
+        # guests must be re-resolved -- so the caller names it.
+        if location_id:
+            with contextlib.suppress(ValueError):
+                location_ids.add(uuid.UUID(location_id))
+        # Whether this policy has ever stated a venue total. A venue that
+        # never set one has no parent row on its routers to take away, so
+        # its routers are not read for one -- a publish there costs exactly
+        # the device calls it cost before venue totals existed.
+        ever_capped = any(
+            venue_cap_from_rules(version.rules) is not None
+            for version in await policy_repository.list_versions_for_policy(policy.id)
+        )
         total_reapplied = 0
         total_failed = 0
-        for location_id in location_ids:
+        total_assigned = 0
+        backfill_on = _queue_backfill_is_on_anywhere(settings)
+        # Sorted, so two runs that cover the same locations take the
+        # per-location locks in the same order.
+        for location_id in sorted(location_ids, key=str):
             result = await service.reapply_active_sessions_for_location(
                 location_id=location_id,
                 requesting_organization_id=policy.organization_id,
+                # One assignment's failed statement is rolled back on its
+                # own instead of aborting the transaction the rest share.
+                unit_of_work=session.begin_nested,
+                clear_venue_cap_when_uncapped=ever_capped,
             )
             total_reapplied += result["reapplied"]
             total_failed += result["failed"]
+            # The re-apply above walks existing assignments, so a live guest
+            # whose login never got a queue onto the router is not in it.
+            # The venue has just saved a speed; this is the moment they
+            # expect it to reach everybody who is online. Same switch and
+            # same rules as the periodic backfill, narrowed to this location.
+            if backfill_on:
+                backfilled = await service.backfill_queues_for_unassigned_sessions(
+                    location_id=location_id,
+                    max_per_run=_queue_backfill_max_per_run(settings),
+                    router_allowed=lambda rid: queue_backfill_applies(rid, settings),
+                    unit_of_work=session.begin_nested,
+                )
+                total_assigned += backfilled["assigned"]
+                total_failed += backfilled["failed"]
+        # A location this policy used to be mapped to and is not any more
+        # still has the policy's parent row on its routers. It is brought
+        # in line with whatever its bandwidth policy is *now* -- another
+        # policy's total, or none.
+        if ever_capped:
+            formerly = {
+                a.scope_id
+                for a in assignments
+                if not a.is_active
+                and a.scope_type == "location"
+                and a.scope_id is not None
+            } - location_ids
+            for location_id in sorted(formerly, key=str):
+                try:
+                    async with session.begin_nested():
+                        await service.sync_venue_cap_for_location(
+                            location_id=location_id,
+                            requesting_organization_id=policy.organization_id,
+                        )
+                except Exception as exc:  # noqa: BLE001 -- per-location isolation
+                    total_failed += 1
+                    logger.warning(
+                        "venue_cap_sync_failed",
+                        extra={"location_id": str(location_id), "error": str(exc)},
+                    )
         await session.commit()
         return {
             "reapplied": total_reapplied,
             "failed": total_failed,
             "locations": len(location_ids),
+            "assigned": total_assigned,
         }
 
 
@@ -161,7 +476,7 @@ async def _reapply_policy_assignments_async(
     max_retries=3,
 )
 def reapply_policy_assignments(
-    self, *, policy_id: str, version_id: str
+    self, *, policy_id: str, version_id: str, location_id: str = ""
 ) -> dict[str, int]:
     """Fired by the Policy router after a bandwidth-policy publish. Re-runs
     every live (ACTIVE) session queue assignment in the policy's mapped
@@ -172,19 +487,38 @@ def reapply_policy_assignments(
     per-item isolation) and does not fail the task."""
     try:
         result = run_celery_task(
-            _reapply_policy_assignments_async(policy_id, version_id)
+            _reapply_policy_assignments_async(policy_id, version_id, location_id)
         )
-        logger.info(
-            "queue_management_task_reapply_policy_assignments_completed",
-            extra=result,
-        )
-        return result
     except Exception as exc:  # noqa: BLE001
         logger.warning(
             "queue_management_task_reapply_policy_assignments_failed",
             extra={"policy_id": policy_id, "error": str(exc)},
         )
-        raise self.retry(exc=exc, countdown=30) from exc
+        raise self.retry(
+            exc=exc, countdown=REAPPLY_POLICY_ASSIGNMENTS_RETRY_SECONDS
+        ) from exc
+    logger.info(
+        "queue_management_task_reapply_policy_assignments_completed",
+        extra=result,
+    )
+    # A guest whose write failed is still at the speed they had -- the new
+    # row is written before the old one is touched -- and nothing else
+    # comes back for them: every later re-apply is somebody saving a policy
+    # again. So a run that left work undone runs again, while it has
+    # retries left. What already succeeded costs the repeat no device call.
+    if reapply_should_run_again(
+        result, retries=self.request.retries, max_retries=self.max_retries
+    ):
+        raise self.retry(countdown=REAPPLY_POLICY_ASSIGNMENTS_RETRY_SECONDS)
+    return result
+
+
+def reapply_should_run_again(
+    result: dict[str, int], *, retries: int, max_retries: int | None
+) -> bool:
+    """Whether a policy re-apply that finished should be run once more: it
+    left at least one guest's write failed, and the task has a retry left."""
+    return bool(result.get("failed")) and retries < (max_retries or 0)
 
 
 async def _sweep_schedule_transitions_async() -> dict[str, int]:
@@ -248,4 +582,362 @@ def sweep_schedule_transitions() -> dict[str, int]:
     return result
 
 
-__all__ = ["sweep_schedule_transitions", "reapply_policy_assignments"]
+async def _release_ended_session_queues_async() -> dict[str, int]:
+    """The actual async work behind ``release_ended_session_queues`` -- a
+    fresh session per run, composed exactly as
+    ``_sweep_schedule_transitions_async`` composes it, plus the liveness
+    lookup this sweep cannot work without."""
+    from app.domains.network_integration.client_hooks import (  # noqa: PLC0415
+        build_controller_speed_hook,
+    )
+
+    settings = get_settings()
+    async with SessionLocal() as session:
+        audit_repository = RBACRepository(session)
+        organization_service = OrganizationService(
+            OrganizationRepository(session), audit_writer=audit_repository
+        )
+        location_service = LocationService(
+            LocationRepository(session),
+            organization_service,
+            location_code_counter=LocationCodeCounterRepository(session),
+            audit_writer=audit_repository,
+        )
+        router_service = RouterService(
+            RouterRepository(session),
+            location_service,
+            organization_service,
+            audit_writer=audit_repository,
+            provisioning_token_ttl_hours=settings.router_provisioning_token_expire_hours,
+        )
+        policy_service = PolicyService(
+            PolicyRepository(session),
+            organization_service,
+            location_service,
+            audit_writer=audit_repository,
+        )
+        service = QueueManagementService(
+            QueueManagementRepository(session),
+            router_service,
+            policy_service,
+            audit_writer=audit_repository,
+            controller_speed_hook=build_controller_speed_hook(session),
+            session_liveness_lookup=GuestSessionLiveness(session),
+        )
+        result = await service.release_queues_for_ended_sessions()
+        await session.commit()
+        return result
+
+
+@celery_app.task(name=TASK_RELEASE_ENDED_SESSION_QUEUES)
+def release_ended_session_queues() -> dict[str, int]:
+    """Beat-scheduled (see ``app.core.celery_app``'s ``beat_schedule`` --
+    every ``constants.RELEASE_ENDED_SESSION_QUEUES_INTERVAL_SECONDS``).
+    Takes the speed-limit row of every ended guest session off its router;
+    see ``QueueManagementService.release_queues_for_ended_sessions``."""
+    result = run_celery_task(_release_ended_session_queues_async())
+    logger.info(
+        "queue_management_task_release_ended_session_queues_completed", extra=result
+    )
+    return result
+
+
+async def _backfill_unassigned_session_queues_async() -> dict[str, int]:
+    """The actual async work behind ``backfill_unassigned_session_queues``
+    -- a fresh session per run, composed exactly as
+    ``_release_ended_session_queues_async`` composes it, plus the lookup
+    this sweep cannot work without. Opens nothing at all while the backfill
+    is switched off everywhere."""
+    settings = get_settings()
+    result = {
+        "assigned": 0,
+        "failed": 0,
+        "skipped_unreachable": 0,
+        "skipped_no_target": 0,
+        "skipped_address_in_use": 0,
+        "retargeted": 0,
+        "retarget_failed": 0,
+        "venue_caps_written": 0,
+        "venue_caps_failed": 0,
+    }
+    if not _queue_backfill_is_on_anywhere(settings):
+        return result
+
+    from app.domains.network_integration.client_hooks import (  # noqa: PLC0415
+        build_controller_speed_hook,
+    )
+
+    async with SessionLocal() as session:
+        audit_repository = RBACRepository(session)
+        organization_service = OrganizationService(
+            OrganizationRepository(session), audit_writer=audit_repository
+        )
+        location_service = LocationService(
+            LocationRepository(session),
+            organization_service,
+            location_code_counter=LocationCodeCounterRepository(session),
+            audit_writer=audit_repository,
+        )
+        router_service = RouterService(
+            RouterRepository(session),
+            location_service,
+            organization_service,
+            audit_writer=audit_repository,
+            provisioning_token_ttl_hours=settings.router_provisioning_token_expire_hours,
+        )
+        policy_service = PolicyService(
+            PolicyRepository(session),
+            organization_service,
+            location_service,
+            audit_writer=audit_repository,
+        )
+        service = QueueManagementService(
+            QueueManagementRepository(session),
+            router_service,
+            policy_service,
+            audit_writer=audit_repository,
+            controller_speed_hook=build_controller_speed_hook(session),
+            session_liveness_lookup=GuestSessionLiveness(session),
+            sessions_without_queue_lookup=GuestSessionsWithoutQueue(session),
+        )
+        result = await service.backfill_queues_for_unassigned_sessions(
+            max_per_run=_queue_backfill_max_per_run(settings),
+            router_allowed=lambda rid: queue_backfill_applies(rid, settings),
+            # One session's failed attempt is undone on its own, as the
+            # login task's rollback undoes it; everything that succeeded
+            # before and after it in this run is kept.
+            unit_of_work=session.begin_nested,
+        )
+        # The other way a live guest ends up unshaped: the queue is there,
+        # on an address the device no longer holds. Same switch, same cap,
+        # same per-row savepoint.
+        moved = await service.retarget_queues_for_moved_devices(
+            max_per_run=_queue_backfill_max_per_run(settings),
+            router_allowed=lambda rid: queue_backfill_applies(rid, settings),
+            unit_of_work=session.begin_nested,
+        )
+        result["retargeted"] = moved["retargeted"]
+        result["retarget_failed"] = moved["failed"]
+        # A venue's total cap that did not reach a router when it was saved
+        # (the router was not answering), or whose parent row has since
+        # gone. Same switch as the two above; one read per router that has
+        # a guest online, and no write where the router already matches.
+        venue = await service.sync_venue_caps_for_live_locations(
+            router_allowed=lambda rid: queue_backfill_applies(rid, settings),
+            unit_of_work=session.begin_nested,
+        )
+        result["venue_caps_written"] = venue["wrote"]
+        result["venue_caps_failed"] = venue["failed"]
+        await session.commit()
+        return result
+
+
+@celery_app.task(name=TASK_BACKFILL_UNASSIGNED_SESSION_QUEUES)
+def backfill_unassigned_session_queues() -> dict[str, int]:
+    """Beat-scheduled (see ``app.core.celery_app``'s ``beat_schedule`` --
+    every ``constants.BACKFILL_UNASSIGNED_SESSION_QUEUES_INTERVAL_SECONDS``).
+    Gives a queue to a live guest session whose login never got one onto
+    the router; see ``QueueManagementService
+    .backfill_queues_for_unassigned_sessions``. Does nothing unless switched
+    on (``Settings.guest_queue_backfill_enabled`` / ``_router_ids``)."""
+    result = run_celery_task(_backfill_unassigned_session_queues_async())
+    logger.info(
+        "queue_management_task_backfill_unassigned_session_queues_completed",
+        extra=result,
+    )
+    return result
+
+
+__all__ = [
+    "GuestSessionLiveness",
+    "GuestSessionsWithoutQueue",
+    "queue_backfill_applies",
+    "backfill_unassigned_session_queues",
+    "sweep_schedule_transitions",
+    "reapply_policy_assignments",
+    "release_ended_session_queues",
+]
+
+
+# ============================================================================
+# Aruba AP + MikroTik gateway hybrid (see speed_gateway.py)
+# ============================================================================
+
+
+def _build_speed_gateway_service(session):  # noqa: ANN001, ANN202
+    """``SpeedGatewayService`` over the same hand-built ``QueueManagementService``
+    graph the two tasks above compose (controller hook included, so the
+    composition does not drift from the FastAPI dependency's)."""
+    from app.domains.network_integration.client_hooks import (  # noqa: PLC0415
+        build_controller_speed_hook,
+    )
+
+    from .speed_gateway import SpeedGatewayRepository, SpeedGatewayService
+
+    settings = get_settings()
+    audit_repository = RBACRepository(session)
+    organization_service = OrganizationService(
+        OrganizationRepository(session), audit_writer=audit_repository
+    )
+    location_service = LocationService(
+        LocationRepository(session),
+        organization_service,
+        location_code_counter=LocationCodeCounterRepository(session),
+        audit_writer=audit_repository,
+    )
+    router_service = RouterService(
+        RouterRepository(session),
+        location_service,
+        organization_service,
+        audit_writer=audit_repository,
+        provisioning_token_ttl_hours=settings.router_provisioning_token_expire_hours,
+    )
+    policy_service = PolicyService(
+        PolicyRepository(session),
+        organization_service,
+        location_service,
+        audit_writer=audit_repository,
+    )
+    queue_service = QueueManagementService(
+        QueueManagementRepository(session),
+        router_service,
+        policy_service,
+        audit_writer=audit_repository,
+        controller_speed_hook=build_controller_speed_hook(session),
+    )
+    return SpeedGatewayService(
+        SpeedGatewayRepository(session),
+        router_service,
+        queue_service=queue_service,
+        enabled=settings.aruba_hybrid_speed_gateway_enabled,
+    )
+
+
+async def _run_hybrid(work) -> dict[str, object]:  # noqa: ANN001
+    async with SessionLocal() as session:
+        try:
+            service = _build_speed_gateway_service(session)
+            result = await work(service)
+            await session.commit()
+        except Exception:
+            await session.rollback()
+            raise
+    return result.as_dict() if hasattr(result, "as_dict") else result
+
+
+@celery_app.task(name=TASK_APPLY_ARUBA_HYBRID_QUEUE)
+def apply_aruba_hybrid_queue(
+    *,
+    session_id: str,
+    nas_router_id: str,
+    framed_ip: str | None = None,
+    verify: bool = False,
+) -> dict[str, object]:
+    """Put this guest's per-device queue on the venue's gateway MikroTik.
+    Never retried here: the next Interim-Update (~5 min) re-runs it, and a
+    failure must not pile retries onto an unreachable router."""
+    try:
+        result = run_celery_task(
+            _run_hybrid(
+                lambda service: service.apply_for_session(
+                    session_id=uuid.UUID(session_id),
+                    nas_router_id=uuid.UUID(nas_router_id),
+                    framed_ip=framed_ip,
+                    verify=verify,
+                )
+            )
+        )
+    except Exception as exc:  # noqa: BLE001 -- logged; next interim retries
+        logger.warning(
+            "aruba_hybrid_apply_failed",
+            extra={"session_id": session_id, "error": str(exc)},
+        )
+        return {"action": "failed", "reason": str(exc)}
+    return result
+
+
+@celery_app.task(name=TASK_RELEASE_ARUBA_HYBRID_QUEUE)
+def release_aruba_hybrid_queue(*, session_id: str) -> dict[str, object]:
+    """Take an ended guest's queue off the gateway (Accounting-Stop). A
+    failure leaves the assignment ACTIVE for the reconcile sweep."""
+    try:
+        return run_celery_task(
+            _run_hybrid(
+                lambda service: service.release_for_session(
+                    session_id=uuid.UUID(session_id)
+                )
+            )
+        )
+    except Exception as exc:  # noqa: BLE001 -- the sweep retries
+        logger.warning(
+            "aruba_hybrid_release_failed",
+            extra={"session_id": session_id, "error": str(exc)},
+        )
+        return {"action": "failed", "reason": str(exc)}
+
+
+@celery_app.task(name=TASK_RECONCILE_ARUBA_HYBRID_QUEUES)
+def reconcile_aruba_hybrid_queues() -> dict[str, object]:
+    """Beat: release gateway queues whose session has ended and whose AP-side
+    cut-off has passed. Does nothing unless
+    CLOUDGUEST_ARUBA_HYBRID_SPEED_GATEWAY_ENABLED is true."""
+    if not get_settings().aruba_hybrid_speed_gateway_enabled:
+        return {"checked": 0, "released": 0, "failed": 0, "kept": 0}
+    result = run_celery_task(_run_hybrid(lambda service: service.reconcile()))
+    logger.info("aruba_hybrid_reconcile_completed", extra=result)
+    return result
+
+
+async def enqueue_aruba_hybrid_apply(
+    *,
+    session_id: uuid.UUID,
+    nas_router_id: uuid.UUID,
+    framed_ip: str | None,
+    verify: bool,
+) -> None:
+    """Publish from the RADIUS request path without blocking the event loop.
+    Never raises (an accounting packet must never fail on a broker hiccup)."""
+    from asyncio import to_thread  # noqa: PLC0415
+
+    def _publish() -> None:
+        apply_aruba_hybrid_queue.delay(
+            session_id=str(session_id),
+            nas_router_id=str(nas_router_id),
+            framed_ip=framed_ip,
+            verify=verify,
+        )
+
+    try:
+        await to_thread(_publish)
+    except Exception as exc:  # noqa: BLE001 -- see docstring
+        logger.warning(
+            "aruba_hybrid_apply_enqueue_failed",
+            extra={"session_id": str(session_id), "error": str(exc)},
+        )
+
+
+async def enqueue_aruba_hybrid_release(*, session_id: uuid.UUID) -> None:
+    """See ``enqueue_aruba_hybrid_apply``."""
+    from asyncio import to_thread  # noqa: PLC0415
+
+    def _publish() -> None:
+        release_aruba_hybrid_queue.delay(session_id=str(session_id))
+
+    try:
+        await to_thread(_publish)
+    except Exception as exc:  # noqa: BLE001 -- see docstring
+        logger.warning(
+            "aruba_hybrid_release_enqueue_failed",
+            extra={"session_id": str(session_id), "error": str(exc)},
+        )
+
+
+__all__ = [
+    "sweep_schedule_transitions",
+    "reapply_policy_assignments",
+    "apply_aruba_hybrid_queue",
+    "release_aruba_hybrid_queue",
+    "reconcile_aruba_hybrid_queues",
+    "enqueue_aruba_hybrid_apply",
+    "enqueue_aruba_hybrid_release",
+]

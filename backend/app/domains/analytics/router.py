@@ -80,6 +80,7 @@ from .dashboard_schemas import (
     LocationDashboardResponse,
     OrganizationDashboardResponse,
     PlatformHealthSummaryResponse,
+    PlatformOrganizationSummaryResponse,
     SuperAdminDashboardResponse,
     UnifiedSuperAdminDashboardResponse,
 )
@@ -121,6 +122,7 @@ from .schemas import (
 )
 from .service import AnalyticsService
 from .validators import validate_date_range
+from .venue_insights_router import router as venue_insights_router
 from .voucher_analytics_schemas import (
     VoucherRedemptionAnalyticsResponse,
     VoucherRedemptionListResponse,
@@ -332,6 +334,34 @@ async def get_unified_super_admin_dashboard(
     return build_response(
         success=True,
         message="Unified Super Admin dashboard retrieved",
+        data=payload.model_dump(mode="json"),
+        request_id=_request_id(request),
+    )
+
+
+@router.get(
+    "/dashboard/super-admin/organizations",
+    response_model=ApiResponse[PlatformOrganizationSummaryResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("analytics.read", scope=ScopeType.GLOBAL))],
+)
+async def get_platform_organization_summaries(
+    request: Request,
+    limit: int = Query(default=12, ge=1, le=100),
+    user: AuthUser = Depends(CurrentUser),
+    service: DashboardService = Depends(get_dashboard_service),
+):
+    """The Master console's organization table in one request -- see
+    ``DashboardService.get_platform_organization_summaries`` for what it
+    replaces and why every figure matches ``GET /dashboard/organization``.
+    GLOBAL is pinned on the route (never inferred) because the response
+    spans tenants."""
+    payload = await service.get_platform_organization_summaries(
+        uuid.UUID(user.id), limit=limit
+    )
+    return build_response(
+        success=True,
+        message="Platform organization summaries retrieved",
         data=payload.model_dump(mode="json"),
         request_id=_request_id(request),
     )
@@ -864,6 +894,8 @@ async def get_operational_recommendations(
 # ============================================================================
 
 router.include_router(report_router)
+# Customer-dashboard venue insights -- see venue_insights.py.
+router.include_router(venue_insights_router)
 
 
 __all__ = ["router"]

@@ -23,7 +23,7 @@ import logging
 import re
 import uuid
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from types import SimpleNamespace
 
 import httpx
@@ -50,7 +50,13 @@ from app.domains.otp.exceptions import (
     OtpRequestRateLimitExceededError,
 )
 from app.domains.otp.models import OtpRequest
-from app.domains.otp.router import router as otp_router
+from app.domains.otp.router import (
+    get_daily_sms_consumption,
+)
+from app.domains.otp.router import (
+    router as otp_router,
+)
+from app.domains.otp.schemas import OtpRequestAdminResponse
 from app.domains.otp.service import (
     LoggingEmailProvider,
     LoggingSmsProvider,
@@ -1233,6 +1239,47 @@ def test_otp_requests_listing_resolves_org_from_auth_scope_not_query_param():
     assert CurrentOrganization in dependency_calls
 
 
+async def test_daily_sms_consumption_returns_only_real_request_counts():
+    """The report is an ``otp_requests`` volume report, never a DLR proxy."""
+
+    class DailyUsageRepository:
+        async def get_daily_sms_consumption(self, **kwargs):  # noqa: ANN003
+            assert kwargs == {
+                "organization_id": organization_id,
+                "start_date": date(2026, 10, 1),
+                "end_date": date(2026, 10, 2),
+            }
+            return [(date(2026, 10, 1), location_id, "Main Campus", 7)]
+
+    organization_id = uuid.uuid4()
+    location_id = uuid.uuid4()
+    response = await get_daily_sms_consumption(
+        request=SimpleNamespace(state=SimpleNamespace(request_id="request-123")),
+        start_date=date(2026, 10, 1),
+        end_date=date(2026, 10, 2),
+        organization_id=organization_id,
+        service=SimpleNamespace(repository=DailyUsageRepository()),
+    )
+
+    assert response == {
+        "success": True,
+        "message": "Daily SMS OTP request consumption retrieved",
+        "data": {
+            "start_date": date(2026, 10, 1),
+            "end_date": date(2026, 10, 2),
+            "items": [
+                {
+                    "usage_date": date(2026, 10, 1),
+                    "location_id": str(location_id),
+                    "location_name": "Main Campus",
+                    "sms_otp_requests": 7,
+                }
+            ],
+        },
+        "request_id": "request-123",
+    }
+
+
 # ============================================================================
 # Venue gates on POST /otp/request
 # ----------------------------------------------------------------------------
@@ -1516,3 +1563,85 @@ class TestOtpRequestEnforcesVenueGates:
 
         assert resp.status_code == 201, resp.text
         assert len(fx.sms_provider.sent) == 1
+
+
+class TestProviderOutcome:
+    """What the provider call did is noted on the row, and nothing else about
+    requesting or verifying a code changes. OTP is shared by every vendor."""
+
+    async def _request(self, fx: Fixture, channel: OtpChannel, identifier: str):  # noqa: ANN202
+        return await fx.service.request_otp(
+            identifier=identifier,
+            channel=channel,
+            purpose=OtpPurpose.GUEST_LOGIN,
+            organization_id=None,
+            location_id=None,
+        )
+
+    @pytest.mark.parametrize(
+        ("channel", "identifier", "provider"),
+        [
+            (OtpChannel.SMS, "+15551234567", "RecordingSmsProvider"),
+            (OtpChannel.EMAIL, "guest@example.com", "RecordingEmailProvider"),
+            (OtpChannel.WHATSAPP, "+15551234567", "RecordingWhatsAppProvider"),
+        ],
+    )
+    async def test_accepted_on_every_channel(
+        self, channel: OtpChannel, identifier: str, provider: str
+    ) -> None:
+        row = await self._request(make_service(), channel, identifier)
+        assert row.provider_outcome == "accepted"
+        assert row.provider_name == provider
+        assert isinstance(row.provider_response_ms, int)
+        assert row.provider_response_ms >= 0
+
+    async def test_the_code_still_verifies(self) -> None:
+        fx = make_service()
+        await self._request(fx, OtpChannel.SMS, "+15551234567")
+        code = _extract_code(fx.sms_provider.sent[0])
+        verified = await fx.service.verify_otp(
+            identifier="+15551234567", code=code, purpose=OtpPurpose.GUEST_LOGIN
+        )
+        assert verified.is_consumed is True
+        assert verified.provider_outcome == "accepted"
+
+    async def test_a_logging_provider_sent_nothing(self) -> None:
+        repository = FakeOtpRepository()
+        service = OtpService(repository, FakeRedis(), audit_writer=FakeAuditLogWriter())
+        row = await service.request_otp(
+            identifier="+15551234567",
+            channel=OtpChannel.SMS,
+            purpose=OtpPurpose.GUEST_LOGIN,
+            organization_id=None,
+            location_id=None,
+        )
+        assert row.provider_outcome == "not_attempted"
+        assert row.provider_name == "LoggingSmsProvider"
+
+    async def test_a_provider_error_is_raised_unchanged_and_logs_no_code(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        class Boom(Exception):
+            pass
+
+        fx = make_service()
+
+        async def fail(phone_number: str, message: str) -> None:
+            raise Boom(f"gateway refused: {message}")
+
+        fx.service.sms_provider.send = fail  # type: ignore[method-assign]
+        with caplog.at_level(logging.WARNING), pytest.raises(Boom):
+            await self._request(fx, OtpChannel.SMS, "+15551234567")
+        record = next(r for r in caplog.records if r.message == "otp_provider_rejected")
+        assert record.event_error_type == "Boom"
+        assert "gateway refused" not in caplog.text
+        assert "verification code" not in caplog.text
+        row = next(iter(fx.repository.requests.values()))
+        assert row.provider_outcome == "rejected"
+
+    def test_the_admin_response_carries_it_but_never_the_code_hash(self) -> None:
+        fields = OtpRequestAdminResponse.model_fields
+        assert {"provider_outcome", "provider_name", "provider_response_ms"} <= set(
+            fields
+        )
+        assert "code_hash" not in fields

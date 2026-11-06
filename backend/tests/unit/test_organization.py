@@ -100,12 +100,14 @@ class FakeOrganizationRepository:
             return None
         return organization
 
-    async def get_by_slug(self, slug: str) -> Organization | None:
+    async def get_by_slug(
+        self, slug: str, *, include_deleted: bool = False
+    ) -> Organization | None:
         return next(
             (
                 org
                 for org in self.organizations.values()
-                if org.slug == slug and not org.is_deleted
+                if org.slug == slug and (include_deleted or not org.is_deleted)
             ),
             None,
         )
@@ -445,6 +447,28 @@ class TestOrganizationCRUD:
             slug="acme-corp",
             contact_email="admin@acme.example.com",
         )
+
+        with pytest.raises(DuplicateSlugError):
+            await service.create_organization(
+                actor_user_id=uuid.uuid4(),
+                name="Acme Corp Again",
+                slug="acme-corp",
+                contact_email="other@acme.example.com",
+            )
+
+    async def test_create_organization_rejects_slug_of_soft_deleted_org(
+        self,
+    ) -> None:
+        # Prod 2026-10-03: a soft-deleted org still held "wyfyguest", the DB
+        # unique constraint fired, and Master's location wizard got a 500.
+        service, repo, _audit = make_service()
+        deleted = await service.create_organization(
+            actor_user_id=uuid.uuid4(),
+            name="Acme Corp",
+            slug="acme-corp",
+            contact_email="admin@acme.example.com",
+        )
+        deleted.mark_deleted()
 
         with pytest.raises(DuplicateSlugError):
             await service.create_organization(

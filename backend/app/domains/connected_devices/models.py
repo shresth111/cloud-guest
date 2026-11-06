@@ -30,11 +30,22 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, String, Text, text
+from sqlalchemy import (
+    BigInteger,
+    Boolean,
+    DateTime,
+    Float,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    text,
+)
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
-from app.database.base import BaseModel
+from app.database.base import Base, BaseModel, UUIDMixin
 
 from .constants import ConnectionType
 
@@ -153,4 +164,113 @@ class ConnectedDevice(BaseModel):
         )
 
 
-__all__ = ["ConnectedDevice"]
+class MonitoredDeviceHealth(UUIDMixin, Base):
+    """Current health of one monitored device, one row per
+    ``ConnectedDevice`` the liveness sweep probes. Written only by
+    ``service.run_monitored_hardware_liveness_sweep``.
+
+    Lives apart from ``connected_devices`` (one row per guest phone too) so
+    that the dozen health columns exist only for the handful of monitored
+    rows. Plain ``Base`` + UUID, no soft-delete/audit/version: this is
+    sweep-owned state, deleted with its device row (``CASCADE``).
+
+    ``since`` is the last *coarse* transition this platform observed
+    (into up/degraded, or into down) -- "up since" / "down since". It is
+    our own observation, not the device's uptime; nothing behind a router
+    reports that. ``state_changed_at`` is the last fine-grained change
+    (e.g. up -> degraded).
+    """
+
+    __tablename__ = "monitored_device_health"
+
+    connected_device_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("connected_devices.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    organization_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
+    location_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
+    # health.HealthState / health.HealthReason values.
+    state: Mapped[str] = mapped_column(String(16), nullable=False)
+    reason: Mapped[str] = mapped_column(String(32), nullable=False)
+    since: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    state_changed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    consecutive_failures: Mapped[int] = mapped_column(Integer, default=0)
+    last_probe_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    last_ok_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    last_rtt_ms: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # "icmp" / "arp" -- which probe last answered.
+    probe_method: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    # The bridge port the MAC was last learned on. Remembered across
+    # sweeps on purpose: a bridge-host entry ages out ~5 min after the
+    # link drops, which is exactly when the port name matters most.
+    port_name: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    port_running: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    port_link_downs: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    port_last_link_down_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    port_last_link_up_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    port_rx_bytes: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    port_tx_bytes: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    port_counters_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # Port rates between the last two sweeps (bits/s). rx = from the
+    # device, tx = to the device. NULL across a counter reset.
+    rx_bps: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    tx_bps: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    # Other non-local MACs learned on the same port: an AP's / home
+    # router's clients (or everything behind a switch).
+    clients_behind: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    __table_args__ = (
+        Index(
+            "uq_monitored_device_health_connected_device_id",
+            "connected_device_id",
+            unique=True,
+        ),
+    )
+
+
+class MonitoredDeviceEvent(UUIDMixin, Base):
+    """Append-only transitions for a monitored device: ``state`` changes,
+    ``link_down`` (the port's ``link-downs`` counter moved; ``count`` is by
+    how much), ``ip_changed``. Not one row per probe -- a healthy device
+    writes nothing. Pruned by the sweep after
+    ``MONITORED_DEVICE_EVENT_RETENTION_DAYS``."""
+
+    __tablename__ = "monitored_device_events"
+
+    connected_device_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("connected_devices.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    organization_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
+    location_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
+    kind: Mapped[str] = mapped_column(String(16), nullable=False)
+    from_state: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    to_state: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    reason: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    detail: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    occurred_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+
+    __table_args__ = (
+        Index(
+            "ix_monitored_device_events_device_occurred",
+            "connected_device_id",
+            "occurred_at",
+        ),
+        Index("ix_monitored_device_events_occurred_at", "occurred_at"),
+    )
+
+
+__all__ = ["ConnectedDevice", "MonitoredDeviceEvent", "MonitoredDeviceHealth"]

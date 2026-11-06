@@ -88,6 +88,9 @@ from typing import Protocol
 
 from wyfy_device_gateway.contract import DeviceCredentials as _GatewayDeviceCredentials
 from wyfy_device_gateway.contract import DeviceVendor
+from wyfy_device_gateway.contract import LanBridgeHost as LanBridgeHost
+from wyfy_device_gateway.contract import LanPort as LanPort
+from wyfy_device_gateway.contract import LanSnapshot as LanSnapshot
 from wyfy_device_gateway.mikrotik_adapter import (
     MikroTikConnectionError,
     MikroTikDeviceError,
@@ -176,6 +179,7 @@ class ArpPingResult:
     sent: int
     received: int
     replied_macs: frozenset[str]
+    avg_rtt_ms: float | None = None
 
 
 class BaseConnectedDeviceAdapter(Protocol):
@@ -216,6 +220,12 @@ class BaseConnectedDeviceAdapter(Protocol):
         """An L2 probe at ``target`` on ``interface`` from the router. For
         devices that drop ICMP but must still answer ARP to be on the LAN
         at all -- see the gateway's ``MikroTikAdapter.arp_ping``."""
+        ...
+
+    async def read_lan_snapshot(self, credentials: DeviceCredentials) -> LanSnapshot:
+        """Port link facts, the MAC-to-port table and the router clock, in
+        one connection -- read once per router per liveness sweep. See the
+        gateway's ``MikroTikAdapter.read_lan_snapshot``."""
         ...
 
     async def disconnect_device(
@@ -312,7 +322,19 @@ class MikroTikConnectedDeviceAdapter:
             sent=result.sent,
             received=result.received,
             replied_macs=result.replied_macs,
+            avg_rtt_ms=result.avg_rtt_ms,
         )
+
+    async def read_lan_snapshot(self, credentials: DeviceCredentials) -> LanSnapshot:
+        creds = self._gateway_credentials(credentials)
+        try:
+            return await get_adapter(DeviceVendor.MIKROTIK).read_lan_snapshot(creds)
+        except MikroTikConnectionError as exc:
+            raise ConnectedDeviceConnectionError(credentials.host, exc.detail) from exc
+        except MikroTikDeviceError as exc:
+            raise ConnectedDeviceOperationError(
+                "read_lan_snapshot", exc.detail
+            ) from exc
 
     async def disconnect_device(
         self, credentials: DeviceCredentials, *, mac_address: str, interface: str | None
@@ -352,6 +374,9 @@ __all__ = [
     "DeviceCredentials",
     "DiscoveredDevice",
     "ArpPingResult",
+    "LanBridgeHost",
+    "LanPort",
+    "LanSnapshot",
     "PingResult",
     "BaseConnectedDeviceAdapter",
     "MikroTikConnectedDeviceAdapter",

@@ -1211,6 +1211,33 @@ class TestAgentHeartbeat:
         second = await fx.agent_service.heartbeat(router=first)
         assert second.public_ip_address == "8.8.8.8"
 
+    async def test_heartbeat_falls_back_to_source_ip_address(self) -> None:
+        """The CGNAT case where the device's own api.ipify.org lookup failed
+        and the key was omitted: the address the request arrived from is
+        recorded instead, a device-reported value still wins over it, and a
+        non-public source (an untrusted proxy hop) never overwrites a good
+        value."""
+        fx = make_services()
+        organization = fx.org_lookup.add()
+        router_device = await make_router(fx, organization, status=RouterStatus.ONLINE)
+
+        from_source = await fx.agent_service.heartbeat(
+            router=router_device, source_ip_address="1.1.1.1"
+        )
+        assert from_source.public_ip_address == "1.1.1.1"
+
+        reported = await fx.agent_service.heartbeat(
+            router=from_source,
+            public_ip_address="8.8.8.8",
+            source_ip_address="1.1.1.1",
+        )
+        assert reported.public_ip_address == "8.8.8.8"
+
+        proxy_hop = await fx.agent_service.heartbeat(
+            router=reported, source_ip_address="172.18.0.1"
+        )
+        assert proxy_hop.public_ip_address == "8.8.8.8"
+
 
 # ============================================================================
 # Config pull

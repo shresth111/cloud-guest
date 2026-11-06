@@ -56,6 +56,7 @@ from typing import Protocol
 from redis.asyncio import Redis
 
 from app.core.config import Settings
+from app.domains.router.vendor_capabilities import is_nas_only
 
 from .constants import AUDIT_ACTION_FORECAST_VIEWED, AnalyticsSnapshotType
 from .dashboard_audit import DashboardAuditThrottle
@@ -371,6 +372,9 @@ class ForecastService:
         routers = await self.repository.list_routers_for_scope(
             organization_id=organization_id, location_id=location_id
         )
+        # No health history can exist for a NAS-only (Aruba Instant On) row;
+        # listing it as "not at risk" would be a judgement made on no data.
+        routers = [row for row in routers if not is_nas_only(row)]
         router_ids = [row.router_id for row in routers]
         health_history = await self.repository.get_router_health_snapshot_history(
             router_ids, start=now - health_lookback, end=now

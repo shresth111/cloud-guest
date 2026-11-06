@@ -18,7 +18,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict, EmailStr, Field
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, model_validator
 
 from app.domains.auth.schemas import MessageResponse
 
@@ -167,6 +167,15 @@ class VoucherBatchCreate(BaseModel):
             "(not the batch's own shelf-life)."
         ),
     )
+    session_timeout_minutes: int | None = Field(
+        default=None,
+        ge=1,
+        description=(
+            "How long each login lasts, when shorter than validity_minutes. "
+            "Applied at Aruba Instant On venues only; every login spends one "
+            "of max_uses_per_voucher."
+        ),
+    )
     batch_expires_at: datetime | None = Field(
         default=None,
         description="Codes not redeemed by this timestamp become permanently invalid.",
@@ -192,6 +201,17 @@ class VoucherBatchCreate(BaseModel):
             }
         }
     )
+
+    @model_validator(mode="after")
+    def _session_timeout_within_validity(self) -> VoucherBatchCreate:
+        if (
+            self.session_timeout_minutes is not None
+            and self.session_timeout_minutes > self.validity_minutes
+        ):
+            raise ValueError(
+                "session_timeout_minutes must not be greater than validity_minutes"
+            )
+        return self
 
 
 class VoucherBatchRevokeRequest(BaseModel):
@@ -243,6 +263,7 @@ class VoucherBatchResponse(BaseModel):
     code_length: int
     code_prefix: str | None
     validity_minutes: int
+    session_timeout_minutes: int | None = None
     batch_expires_at: datetime | None
     max_uses_per_voucher: int
     data_limit_mb: int | None

@@ -97,6 +97,24 @@ NARROWING_HELPERS = frozenset({"agent_managed_only", "agent_managed_vendor_crite
 # ---------------------------------------------------------------------------
 
 AGENT_MANAGED_ONLY: dict[str, str] = {
+    "app/domains/analytics/venue_insights.py::"
+    "VenueInsightsRepository.get_router_liveness": (
+        "The customer venue-comparison card judges each router online or "
+        "not by heartbeat (`compute_internet_availability`: status ONLINE "
+        "and last_seen_at within the stale window). A controller-managed "
+        "row never heartbeats, so counting it would report a working Omada "
+        "or Aruba venue as offline. Narrowed here; a venue left with no "
+        "agent-managed router is shown as 'status not reported', never as "
+        "offline or as having no equipment."
+    ),
+    "app/domains/guest/tasks.py::_run_hotspot_binding_reconcile_sweep_async": (
+        "The routers the session-bypass reconciliation sweep runs on: each "
+        "row gets an 8728 session with its own stored credentials and may "
+        "have `cloudguest-authmac` ip-bindings removed. A controller's "
+        "synthetic row has no RouterOS and no ip-binding table; the "
+        "per-router function refuses it again by vendor "
+        "(`hotspot_gate.router_takes_hotspot_bindings`)."
+    ),
     "app/domains/router/repository.py::RouterRepository.list_routers_in_scope": (
         "The routers a blocklist device rule is written to "
         "(`guest_access.device_blocking`): each row gets an 8728 session and "
@@ -197,6 +215,112 @@ _PROVISIONING_JOB_TENANCY_JOIN = (
 
 
 VENDOR_NEUTRAL: dict[str, str] = {
+    # -- analytics (venue insights: login funnel) --------------------------
+    "app/domains/analytics/portal_impressions.py::build_impression_insert": (
+        "Scoping only: a portal impression keeps its router_id when that "
+        "router is at the impression's location in the same org, and drops "
+        "it otherwise. Any vendor's router is a valid answer to 'is this "
+        "router at this venue'; nothing is judged about the device, and "
+        "nothing is dispatched."
+    ),
+    "app/domains/analytics/venue_insights.py::"
+    "VenueInsightsRepository.get_router_coverage": (
+        "Decides per venue whether 'internet confirmed' can be measured at "
+        "all, by vendor and integration mode (`router_confirmation_gap`). "
+        "It needs every row: the controller rows are exactly the ones it "
+        "reasons about (Omada Open-API or RADIUS portal mode report; legacy "
+        "external-portal mode does not, and is shown as 'not tracked' with "
+        "that reason). A controller is never reported as broken hardware "
+        "from this read."
+    ),
+    # -- traffic_flow (NetFlow/IPFIX) ---------------------------------------
+    "app/domains/traffic_flow/service.py::TrafficFlowRepository.exporter_router_map": (
+        "Attribution of a received flow window: joins wireguard_peers to "
+        "routers to learn which router owns an exporter tunnel address. A "
+        "controller has no peer, so the join itself excludes it; an "
+        "address that matches nothing is reported as an unknown exporter, "
+        "and no judgement about device health is made from the result."
+    ),
+    "app/domains/traffic_flow/service.py::TrafficFlowRepository.fleet_routers": (
+        "The Master fleet status lists every router on purpose, so an "
+        "operator can see which venues cannot be switched on at all. A "
+        "controller-managed row is never described as silent or broken "
+        "hardware: `flow_state` gives any non-MikroTik vendor the explicit "
+        "state `unsupported_vendor` before it looks at data, and the apply "
+        "path refuses such a router with UNSUPPORTED_VENDOR before any "
+        "device call. Nothing is dispatched from this list. The customer "
+        "venue view reads the same rows for one location and folds them "
+        "into three states, where a venue with only controller-managed "
+        "equipment reads `not_available`, never \"not collecting\"."
+    ),
+    "app/domains/traffic_flow/flow_records.py::FlowRecordRepository.target": (
+        "Master flow-record search by router: reads one router's venue and "
+        "organization so the audit row can name them, and so a router id "
+        "that does not exist is a 404. Any vendor's row answers that "
+        "question; no judgement about the device is made from it, and a "
+        "router that never exported simply has no records. The customer "
+        "path never calls it with a router id."
+    ),
+    "app/domains/traffic_flow/service.py::TrafficFlowRepository.router_labels": (
+        "Name/vendor/location labels for routers that already have flow "
+        "windows or are switched on, for the Master overview. Every vendor "
+        "belongs in the answer (a non-MikroTik is shown with its vendor and "
+        "is refused by the apply path, never reported as broken hardware); "
+        "nothing is written to it."
+    ),
+    # -- device_logs (syslog) -----------------------------------------------
+    "app/domains/device_logs/repository.py::DeviceLogsRepository.owners_by_tunnel_ip": (
+        "Attribution of a received syslog line: joins wireguard_peers to "
+        "routers to learn which router owns a tunnel address. A controller "
+        "has no peer, so it can never match -- the join itself excludes it, "
+        "and no judgement about device health is made from the result."
+    ),
+    "app/domains/device_logs/repository.py::DeviceLogsRepository.get_router_context": (
+        "Loads one router by id for the Master drawer. Every vendor belongs "
+        "in the answer: a non-MikroTik is reported as blocker NOT_MIKROTIK "
+        "(Aruba Instant On is named as unable to send syslog), never as "
+        "broken hardware, and nothing is written to it."
+    ),
+    "app/domains/device_logs/repository.py::DeviceLogsRepository.list_configs": (
+        "Display-name join for routers Wyfy has set up remote logging on "
+        "(router_remote_logging rows). Only routers with such a row appear, "
+        "and a row can only be created through the MikroTik writer."
+    ),
+    "app/domains/device_logs/repository.py::DeviceLogsRepository.list_events": (
+        "Outer join for the router name on stored log lines. Names only; "
+        "the set of rows is decided by device_log_events, not by routers."
+    ),
+    "app/domains/device_logs/repository.py::CustomerLogsRepository.list_events": (
+        "Outer join for the router name on the customer NetLogs list. Names "
+        "only; the rows are decided by device_log_events, scoped to one org."
+    ),
+    "app/domains/device_logs/repository.py::CustomerLogsRepository.top_routers": (
+        "Name join for the busiest routers in one org's NetLogs summary. "
+        "Counts come from device_log_events; every vendor's name may appear "
+        "and nothing about device health is judged or written."
+    ),
+    "app/domains/device_logs/repository.py::CustomerLogsRepository.router_owner": (
+        "Ownership check (org, location) of a router_id a customer filtered "
+        "on, so another tenant's router is refused. Vendor-neutral by design."
+    ),
+    "app/domains/ipdr/repository.py::IpdrRepository.router_owner": (
+        "Ownership check (org, location) of a router_id a customer filtered "
+        "the IPDR on, so another tenant's router is refused. Vendor-neutral."
+    ),
+    "app/domains/ipdr/repository.py::IpdrRepository.router_public_ips": (
+        "The public address of routers that already exported flow records, "
+        "for the IPDR's derived Translated IP. Rows are decided by "
+        "traffic_flow_records; nothing is polled, pushed or judged."
+    ),
+    # -- network integration ------------------------------------------------
+    "app/domains/network_integration/client_hooks.py::location_has_nas_only_access_points": (  # noqa: E501
+        "A vendor question, not a fleet count: it asks whether this location "
+        "has a live NAS-only row (Aruba Instant On), filtering on "
+        "`vendor IN NAS_ONLY_VENDORS` itself. Narrowing it to agent-managed "
+        "rows would remove exactly the rows it exists to find. Its answer "
+        "only decides whether the idle sweep observes `last_activity_at` "
+        "instead of assuming it moves; it feeds no device work."
+    ),
     # -- security -----------------------------------------------------------
     "app/domains/security/repository.py::SecurityRepository.fleet_counts": (
         "Narrowing happened upstream and this method cannot undo it: every "
@@ -455,6 +579,13 @@ VENDOR_NEUTRAL: dict[str, str] = {
         "`agent_managed_only` would make it find nothing, by definition."
     ),
     "app/domains/network_integration/instant_on_repository.py::"
+    "InstantOnRepository.list_sites": (
+        "Joins `routers` only to drop `instant_on_sites` rows whose fleet router "
+        "was deleted, for the Master site list. An Instant On site row exists "
+        "only for a NAS-only router, so this never loads a MikroTik or Omada "
+        "one. `agent_managed_only` would make it find nothing, by definition."
+    ),
+    "app/domains/network_integration/instant_on_repository.py::"
     "InstantOnRepository.list_pollable_sites": (
         "Joins `routers` only to narrow `instant_on_sites` to rows whose fleet "
         "router is live AND `Router.vendor IN NAS_ONLY_VENDORS` (Aruba Instant "
@@ -473,6 +604,13 @@ VENDOR_NEUTRAL: dict[str, str] = {
         "name is a better label for it than a bare id, and a vendor filter "
         "would make an Omada venue's own controller show as an unlabelled "
         "uuid. Read-only, every row genuinely belongs."
+    ),
+    "app/domains/network_integration/aruba_access_points.py::"
+    "ArubaAccessPointService._aruba_routers_at": (
+        "The customer per-AP read: the NAS-only (Aruba Instant On) rows of one "
+        "location, filtered by `vendor IN NAS_ONLY_VENDORS` plus the caller's "
+        "organization. `agent_managed_only` would make it empty by "
+        "definition. Read-only; never device work."
     ),
     "app/domains/network_integration/instant_on_repository.py::"
     "InstantOnRepository.get_live_site_by_site_id": (

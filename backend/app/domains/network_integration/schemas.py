@@ -1345,6 +1345,16 @@ class ControllerLivenessView(BaseModel):
     reason: str | None = None
 
 
+#: Why a venue-wide total speed is not offered where the venue's network is
+#: not a router this platform configures. Written for the person looking at
+#: the disabled field.
+VENUE_RATE_LIMIT_UNSUPPORTED_REASON = (
+    "A total speed for the whole venue can only be set where Wyfy manages "
+    "the venue's router directly. At this venue it would not take effect, "
+    "so it is not offered. Each guest's own speed limit is unaffected."
+)
+
+
 class ClientCapabilitiesResponse(BaseModel):
     """Every client action's availability at one location, and separately,
     whether the controller behind them is answering.
@@ -1370,6 +1380,18 @@ class ClientCapabilitiesResponse(BaseModel):
     list_blocked: ClientCapabilityView
     disconnect: ClientCapabilityView
     client_stats: ClientCapabilityView
+    # Not a per-device action, and reported here anyway because this is the
+    # one capability answer the Guest WiFi Limits screen already reads. A
+    # venue's total speed cap (the bandwidth policy's
+    # ``venue_*_rate_kbps``) is enforced as a parent queue on a router this
+    # platform logs in to, and on nothing else -- and every venue that gets
+    # an answer from this endpoint at all is one whose network is run from
+    # somewhere this platform does not write queues. So it is always
+    # unsupported here; a venue with no answer from this endpoint (404: no
+    # controller) is the kind where it works.
+    venue_rate_limit: ClientCapabilityView = ClientCapabilityView(
+        supported=False, reason=VENUE_RATE_LIMIT_UNSUPPORTED_REASON
+    )
     controller: ControllerLivenessView = ControllerLivenessView()
 
 

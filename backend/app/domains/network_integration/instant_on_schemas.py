@@ -102,6 +102,16 @@ class InstantOnAlertItem(_Item):
     device_name: str | None = None
 
 
+class InstantOnEventItem(_Item):
+    event_id: str | None = None
+    event: str
+    state: str | None = None
+    category: str | None = None
+    occurred_at: datetime | None = None
+    device_name: str | None = None
+    network_name: str | None = None
+
+
 class InstantOnHealthItem(_Item):
     score: int | None = None
     status: str | None = None
@@ -193,3 +203,102 @@ class InstantOnAccountSitesResponse(BaseModel):
     unavailable_reason: str | None = None
     message: str | None = None
     sites: list[InstantOnAccountSite] | None = None
+
+
+class InstantOnGuestRateLimitRequest(BaseModel):
+    """Master: the guest SSID's per-client cap on Instant On. Integer Mbps
+    (Instant On's own unit, 1..1000); both ``None`` clears the cap.
+    ``dry_run`` defaults to True: nothing is written unless asked.
+    ``extra="forbid"`` so a misspelt field is a 422, never a silently
+    ignored no-op (the credential-shape lesson)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    network_id: str = Field(min_length=1, max_length=128)
+    download_mbps: int | None = Field(default=None, ge=1, le=1000)
+    upload_mbps: int | None = Field(default=None, ge=1, le=1000)
+    dry_run: bool = True
+
+
+class InstantOnGuestRateLimitState(BaseModel):
+    network_id: str
+    network_name: str | None = None
+    enabled: bool
+    download_mbps: int | None = None
+    upload_mbps: int | None = None
+    is_guest: bool | None = None
+
+
+class InstantOnGuestNetworksResponse(BaseModel):
+    source: Literal["instant_on"] = "instant_on"
+    status: Literal["ok", "unavailable", "failed"]
+    reason: str | None = None
+    message: str | None = None
+    networks: list[InstantOnGuestRateLimitState] | None = None
+
+
+class InstantOnGuestRateLimitResponse(BaseModel):
+    source: Literal["instant_on"] = "instant_on"
+    status: Literal["preview", "applied", "unavailable", "failed"]
+    reason: str | None = None
+    message: str | None = None
+    before: InstantOnGuestRateLimitState | None = None
+    requested: InstantOnGuestRateLimitState | None = None
+    after: InstantOnGuestRateLimitState | None = None
+
+
+class InstantOnVenueGuestSpeedRequest(BaseModel):
+    """Customer: one speed for every device on a guest WiFi network.
+    Each direction is a preset (10, 20, ... 100 Mbps), the value it already
+    holds, or ``None`` (no limit); enforced in ``set_venue_guest_speed``.
+    ``extra="forbid"`` so a misspelt field is a 422, never a silent no-op."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    network_id: str = Field(min_length=1, max_length=128)
+    download_mbps: int | None = Field(default=None, ge=1, le=1000)
+    upload_mbps: int | None = Field(default=None, ge=1, le=1000)
+
+
+class InstantOnVenueNetworkTotalRequest(BaseModel):
+    """Customer: one total for one guest WiFi network, not the whole venue.
+    Previews unless ``dry_run`` is false. Both speeds ``None`` clears it."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    network_id: str = Field(min_length=1, max_length=128)
+    download_mbps: int | None = Field(default=None, ge=1, le=1000)
+    upload_mbps: int | None = Field(default=None, ge=1, le=1000)
+    dry_run: bool = True
+
+
+class InstantOnNetworkTotalPreview(BaseModel):
+    network_id: str
+    download_mbps: int | None = None
+    upload_mbps: int | None = None
+    replaces_per_device: bool = False
+
+
+class InstantOnVenueGuestNetwork(BaseModel):
+    network_id: str
+    network_name: str | None = None
+    enabled: bool
+    download_mbps: int | None = None
+    upload_mbps: int | None = None
+    other_mode_limit: bool = False
+    network_download_mbps: int | None = None
+    network_upload_mbps: int | None = None
+
+
+class InstantOnVenueGuestSpeedResponse(BaseModel):
+    """Never carries a network secret: eight fields per network, nothing else."""
+
+    source: Literal["instant_on"] = "instant_on"
+    status: Literal["ok", "applied", "preview", "unavailable", "failed"]
+    reason: str | None = None
+    message: str | None = None
+    presets_mbps: list[int]
+    network_total_write_enabled: bool = False
+    preview: InstantOnNetworkTotalPreview | None = None
+    networks: list[InstantOnVenueGuestNetwork] = Field(default_factory=list)
+    applied: InstantOnVenueGuestNetwork | None = None

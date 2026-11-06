@@ -30,6 +30,11 @@ from app.domains.customer_provisioning.router import (
 from app.domains.dashboard.router import router as dashboard_router
 from app.domains.demo_booking.router import router as demo_booking_router
 from app.domains.demo_request.router import router as demo_request_router
+from app.domains.device_logs.customer_router import netlogs_customer_router
+from app.domains.device_logs.router import (
+    device_logs_ingest_router,
+    device_logs_platform_router,
+)
 from app.domains.device_sync.router import router as device_sync_router
 from app.domains.dhcp.router import router as dhcp_router
 from app.domains.dns.router import router as dns_router
@@ -41,16 +46,26 @@ from app.domains.feature_entitlement.router import router as feature_entitlement
 from app.domains.firewall.router import router as firewall_router
 from app.domains.guest.router import admin_router as guest_admin_router
 from app.domains.guest.router import analytics_router as guest_analytics_router
+from app.domains.guest.router import (
+    aruba_shared_platform_router as guest_aruba_shared_platform_router,
+)
 from app.domains.guest.router import guest_router
 from app.domains.guest.router import nas_cross_reference_router as guest_nas_xref_router
 from app.domains.guest.router import nas_platform_router as guest_nas_platform_router
 from app.domains.guest.router import nas_router as guest_nas_router
 from app.domains.guest.router import radius_router as guest_radius_router
+from app.domains.guest.ssid_tier_router import (
+    ssid_tier_guest_router as guest_ssid_tier_guest_router,
+)
+from app.domains.guest.ssid_tier_router import (
+    ssid_tier_router as guest_ssid_tier_router,
+)
 from app.domains.guest_access.router import router as guest_access_router
 from app.domains.guest_teams.router import admin_router as guest_teams_admin_router
 from app.domains.guest_teams.router import guest_router as guest_teams_guest_router
 from app.domains.hotspot.router import router as hotspot_router
 from app.domains.hub_reconciliation.router import router as hub_reconciliation_router
+from app.domains.ipdr.router import ipdr_router
 from app.domains.isp.router import router as isp_router
 from app.domains.isp_routing.router import router as isp_routing_router
 from app.domains.live_sessions.router import router as live_sessions_router
@@ -71,6 +86,12 @@ from app.domains.monitoring.router import router as monitoring_router
 from app.domains.network_config.router import router as network_config_router
 from app.domains.network_device.router import router as network_device_router
 from app.domains.network_diagnostics.router import router as network_diagnostics_router
+from app.domains.network_integration.aruba_ap_router import (
+    aruba_ap_customer_router as network_integration_aruba_ap_customer_router,
+)
+from app.domains.network_integration.aruba_ap_router import (
+    aruba_ap_platform_router as network_integration_aruba_ap_platform_router,
+)
 from app.domains.network_integration.customer_router import (
     customer_router as network_integration_customer_router,
 )
@@ -94,16 +115,43 @@ from app.domains.port_forwarding.router import router as port_forwarding_router
 from app.domains.provisioning_engine.router import router as provisioning_engine_router
 from app.domains.qos.router import router as qos_router
 from app.domains.queue_management.router import router as queue_management_router
+from app.domains.queue_management.speed_gateway_router import (
+    speed_gateway_customer_router as queue_speed_gateway_customer_router,
+)
+from app.domains.queue_management.speed_gateway_router import (
+    speed_gateway_platform_router as queue_speed_gateway_platform_router,
+)
 from app.domains.quotation.router import router as quotation_router
 from app.domains.rbac.router import router as rbac_router
 from app.domains.readiness.router import router as readiness_router
 from app.domains.router.router import router as router_router
+from app.domains.router.snmp_router import router as router_snmp_router
 from app.domains.router_agent.router import router as router_agent_router
 from app.domains.router_provisioning.router import router as router_provisioning_router
 from app.domains.security.router import router as security_router
 from app.domains.support_tickets.router import router as support_tickets_router
 from app.domains.system.router import router as system_router
 from app.domains.system_settings.router import router as system_settings_router
+from app.domains.traffic_flow.customer_router import traffic_flow_customer_router
+from app.domains.traffic_flow.destinations_customer_router import (
+    traffic_flow_destinations_customer_router,
+)
+from app.domains.traffic_flow.destinations_router import (
+    traffic_flow_destinations_platform_router,
+)
+from app.domains.traffic_flow.findings_customer_router import (
+    traffic_flow_findings_customer_router,
+)
+from app.domains.traffic_flow.flow_records_customer_router import (
+    traffic_flow_records_customer_router,
+)
+from app.domains.traffic_flow.flow_records_router import (
+    traffic_flow_records_platform_router,
+)
+from app.domains.traffic_flow.geo_customer_router import (
+    traffic_flow_geo_customer_router,
+)
+from app.domains.traffic_flow.router import traffic_flow_platform_router
 from app.domains.user.router import router as user_router
 from app.domains.vlan.router import router as vlan_router
 from app.domains.voucher.router import router as voucher_router
@@ -171,6 +219,7 @@ api_v1_router.include_router(organization_router)
 api_v1_router.include_router(location_router)
 api_v1_router.include_router(user_router)
 api_v1_router.include_router(router_router)
+api_v1_router.include_router(router_snmp_router)
 api_v1_router.include_router(router_provisioning_router)
 api_v1_router.include_router(router_agent_router)
 api_v1_router.include_router(wireguard_router)
@@ -184,6 +233,9 @@ api_v1_router.include_router(guest_radius_router)
 api_v1_router.include_router(guest_nas_router)
 api_v1_router.include_router(guest_nas_xref_router)
 api_v1_router.include_router(guest_nas_platform_router)
+api_v1_router.include_router(guest_aruba_shared_platform_router)
+api_v1_router.include_router(guest_ssid_tier_router, dependencies=_PAID_WRITES)
+api_v1_router.include_router(guest_ssid_tier_guest_router)
 api_v1_router.include_router(guest_analytics_router)
 api_v1_router.include_router(guest_access_router, dependencies=_PAID_WRITES)
 api_v1_router.include_router(guest_teams_guest_router)
@@ -226,6 +278,34 @@ api_v1_router.include_router(network_integration_customer_router)
 # license-gated: nothing here changes a venue's network.
 api_v1_router.include_router(network_integration_instant_on_customer_router)
 api_v1_router.include_router(network_integration_instant_on_platform_router)
+api_v1_router.include_router(traffic_flow_platform_router)
+api_v1_router.include_router(traffic_flow_destinations_platform_router)
+# The Master flow table (per-flow records). GLOBAL-pinned, audited.
+api_v1_router.include_router(traffic_flow_records_platform_router)
+# The same table for a customer's OWN venue, behind the second add-on
+# (traffic_flow_records, off for every customer until Master unlocks it)
+# and venue_traffic.read. Read-only, audited.
+api_v1_router.include_router(traffic_flow_records_customer_router)
+# Traffic flow, customer side: one venue, read-only, behind the per-customer
+# TRAFFIC_FLOW add-on (RequireFeature) and venue_traffic.read. Not on
+# _PAID_WRITES: it has no writes.
+api_v1_router.include_router(traffic_flow_customer_router)
+# Destinations for the same venue page: same three guards (the list is
+# imported from the customer router), read-only, every call audited.
+api_v1_router.include_router(traffic_flow_destinations_customer_router)
+# Geo Location for the same venue page: same three guards, read-only.
+api_v1_router.include_router(traffic_flow_geo_customer_router)
+# Findings for the same venue page: same three guards, read-only, computed
+# on read (no table, no notification).
+api_v1_router.include_router(traffic_flow_findings_customer_router)
+api_v1_router.include_router(network_integration_aruba_ap_customer_router)
+api_v1_router.include_router(network_integration_aruba_ap_platform_router)
+# Aruba AP + MikroTik gateway hybrid: Master links a venue MikroTik as an
+# Instant On access point's speed gateway (GLOBAL, platform DB only); the
+# customer reads one boolean. Queue writes happen in the worker, behind
+# CLOUDGUEST_ARUBA_HYBRID_SPEED_GATEWAY_ENABLED.
+api_v1_router.include_router(queue_speed_gateway_customer_router)
+api_v1_router.include_router(queue_speed_gateway_platform_router)
 api_v1_router.include_router(monitored_hardware_router, dependencies=_PAID_WRITES)
 api_v1_router.include_router(content_filtering_router, dependencies=_PAID_WRITES)
 # Cloudflare Gateway category filtering: the provider-backed half of the same
@@ -289,3 +369,10 @@ api_v1_router.include_router(quotation_router)
 api_v1_router.include_router(assistant_router)
 api_v1_router.include_router(readiness_router)
 api_v1_router.include_router(channel_partner_router)
+# Device Logs (syslog): Master-only GLOBAL-pinned reads/writes, plus the
+# collector's shared-secret ingest endpoint (404 while the flag is off).
+# Platform surface, so not on _PAID_WRITES.
+api_v1_router.include_router(device_logs_platform_router)
+api_v1_router.include_router(device_logs_ingest_router)
+api_v1_router.include_router(netlogs_customer_router)
+api_v1_router.include_router(ipdr_router)

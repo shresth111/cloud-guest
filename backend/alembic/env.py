@@ -51,6 +51,7 @@ from app.domains.content_filtering import (
 # autogenerate coverage, not something this migration introduced.)
 from app.domains.demo_booking import models as demo_booking_models  # noqa: F401
 from app.domains.demo_request import models as demo_request_models  # noqa: F401
+from app.domains.device_logs import models as device_logs_models  # noqa: F401
 from app.domains.device_sync import models as device_sync_models  # noqa: F401
 from app.domains.dhcp import models as dhcp_models  # noqa: F401
 from app.domains.dns import models as dns_models  # noqa: F401
@@ -60,6 +61,7 @@ from app.domains.guest import models as guest_models  # noqa: F401
 from app.domains.guest_access import models as guest_access_models  # noqa: F401
 from app.domains.guest_teams import models as guest_teams_models  # noqa: F401
 from app.domains.hotspot import models as hotspot_models  # noqa: F401
+from app.domains.ipdr import models as ipdr_models  # noqa: F401
 from app.domains.isp import models as isp_models  # noqa: F401
 from app.domains.isp_routing import models as isp_routing_models  # noqa: F401
 from app.domains.location import models as location_models  # noqa: F401
@@ -98,6 +100,7 @@ from app.domains.router_provisioning import (
 )
 from app.domains.support_tickets import models as support_tickets_models  # noqa: F401
 from app.domains.system_settings import models as system_settings_models  # noqa: F401
+from app.domains.traffic_flow import models as traffic_flow_models  # noqa: F401
 from app.domains.vlan import models as vlan_models  # noqa: F401
 from app.domains.voucher import models as voucher_models  # noqa: F401
 from app.domains.wireguard import models as wireguard_models  # noqa: F401

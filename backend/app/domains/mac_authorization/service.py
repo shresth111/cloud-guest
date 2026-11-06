@@ -86,6 +86,50 @@ def _event_extra(event: object) -> dict[str, object]:
     }
 
 
+async def _request_binding_reconcile(
+    *, organization_id: uuid.UUID | None, location_id: uuid.UUID | None
+) -> None:
+    """Ask for the session bypasses on every router this entry applied at
+    to be reconciled against the authorized list (see
+    ``app.domains.guest.hotspot_binding_reconcile``). Publishes nothing
+    unless that is switched on, and never raises -- a clean-up on a router
+    must not be able to fail a dashboard edit. Imported late: ``guest``'s
+    import graph is large and this module is otherwise independent of it.
+
+    An entry that merely *expires* has no call site to hook: nothing runs
+    at ``expires_at``. That case is the periodic sweep's."""
+    from app.domains.guest.hotspot_binding_events import (  # noqa: PLC0415
+        request_hotspot_binding_reconcile_for_scope,
+    )
+
+    await request_hotspot_binding_reconcile_for_scope(
+        organization_id=organization_id, location_id=location_id
+    )
+
+
+async def _request_binding_push(entry: MacAuthorizationEntry) -> None:
+    """Ask for this entry's bypass binding to be added now on every router
+    it applies at (see ``app.domains.guest.hotspot_gate``), rather than on
+    each router's next one-minute poll -- in that minute the device is
+    still shown the login page. Publishes nothing unless the sign-in push
+    is switched on, and never raises, like ``_request_binding_reconcile``
+    above. Whether the entry still authorizes its MAC is asked again in the
+    worker; the check here only avoids publishing for one that cannot."""
+    if not is_currently_valid(
+        is_enabled=entry.is_enabled, expires_at=entry.expires_at, now=datetime.now(UTC)
+    ):
+        return
+    from app.domains.guest.hotspot_binding_events import (  # noqa: PLC0415
+        request_trusted_device_hotspot_gate_open,
+    )
+
+    await request_trusted_device_hotspot_gate_open(
+        entry_id=entry.id,
+        organization_id=entry.organization_id,
+        location_id=entry.location_id,
+    )
+
+
 class AuditLogWriter(Protocol):
     async def create_audit_log_entry(self, **fields: object) -> object: ...
 
@@ -163,7 +207,11 @@ class MacAuthorizationService:
         expires_at: datetime | None = None,
         comment: str | None = None,
         is_enabled: bool = True,
+        push_binding: bool = True,
     ) -> MacAuthorizationEntry:
+        """``push_binding`` is false only for a bulk import, which would
+        otherwise ask every router in scope once per imported row; those
+        devices are added by the routers' own poll, as before."""
         if requesting_organization_id is None:
             raise OrganizationRequiredError()
         normalized_mac = normalize_mac_address(mac_address)
@@ -199,6 +247,8 @@ class MacAuthorizationService:
             organization_id=requesting_organization_id,
             description=f"MAC authorization entry '{normalized_mac}' created",
         )
+        if push_binding:
+            await _request_binding_push(entry)
         return entry
 
     async def get_entry(
@@ -283,9 +333,37 @@ class MacAuthorizationService:
                 now=datetime.now(UTC),
             )
 
+        previous_location_id = entry.location_id
+        previous_mac_address = entry.mac_address
+        was_valid = is_currently_valid(
+            is_enabled=entry.is_enabled,
+            expires_at=entry.expires_at,
+            now=datetime.now(UTC),
+        )
         updated = await self.repository.update_entry(
             entry, {**fields, "updated_by": actor_user_id}
         )
+        # Disabling an entry, expiring it, moving it to another location or
+        # changing its MAC can each take a device off a router's authorized
+        # list. Its bypass binding stays on the router until something
+        # removes it. Organization-wide when the location changed, so both
+        # the old and the new location's routers are looked at.
+        await _request_binding_reconcile(
+            organization_id=updated.organization_id,
+            location_id=(
+                updated.location_id
+                if updated.location_id == previous_location_id
+                else None
+            ),
+        )
+        # The other direction: enabling an entry, or changing its MAC or its
+        # location, puts a device on a router's list that was not there.
+        if (
+            not was_valid
+            or updated.mac_address != previous_mac_address
+            or updated.location_id != previous_location_id
+        ):
+            await _request_binding_push(updated)
         event = MacAuthorizationEntryUpdated(id=updated.id)
         logger.info("mac_authorization_entry_updated", extra=_event_extra(event))
         await self._audit(
@@ -308,6 +386,12 @@ class MacAuthorizationService:
             entry_id, requesting_organization_id=requesting_organization_id
         )
         deleted = await self.repository.soft_delete_entry(entry)
+        # A deleted Trusted Device kept its bypass on the router for as long
+        # as nobody removed it by hand. See ``_request_binding_reconcile``.
+        await _request_binding_reconcile(
+            organization_id=deleted.organization_id,
+            location_id=deleted.location_id,
+        )
         event = MacAuthorizationEntryDeleted(
             id=deleted.id, organization_id=deleted.organization_id
         )
@@ -347,6 +431,7 @@ class MacAuthorizationService:
                     expires_at=raw.get("expires_at"),
                     comment=raw.get("comment"),
                     is_enabled=bool(raw.get("is_enabled", True)),
+                    push_binding=False,
                 )
                 imported_ids.append(created.id)
             except (MacAuthorizationError, ValueError) as exc:

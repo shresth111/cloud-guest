@@ -17,6 +17,8 @@ import uuid
 from pydantic import BaseModel, ConfigDict, Field
 
 __all__ = [
+    "PlatformOrganizationSummaryItem",
+    "PlatformOrganizationSummaryResponse",
     "GrowthPointResponse",
     "RevenueMetricsResponse",
     "CountryStatisticsResponse",
@@ -186,6 +188,27 @@ class PlatformHealthSummaryResponse(BaseModel):
     device_counts_by_status: dict[str, int]
     average_response_time_ms: float | None
     availability_percentage: float | None
+
+
+class PlatformOrganizationSummaryItem(BaseModel):
+    """One row of the Master console's organization table. Each figure is
+    the same-named field of ``OrganizationDashboardResponse`` for that
+    organization (MSP children rolled in, exactly as there)."""
+
+    organization_id: uuid.UUID
+    organization_name: str
+    guest_count_unique: int
+    router_count: int
+    location_count: int
+
+
+class PlatformOrganizationSummaryResponse(BaseModel):
+    """``GET /dashboard/super-admin/organizations`` -- the first ``limit``
+    organizations in ``GET /organizations`` order, with the three figures
+    the platform table shows for each."""
+
+    items: list[PlatformOrganizationSummaryItem]
+    total_organizations: int
 
 
 class UnifiedSuperAdminDashboardResponse(BaseModel):

@@ -40,6 +40,8 @@ from app.core.async_task_bridge import run_celery_task
 from app.core.celery_app import celery_app
 from app.database.redis import create_redis_client
 from app.database.session import SessionLocal
+from app.domains.dhcp.repository import DhcpRepository
+from app.domains.dhcp.service import DhcpService
 from app.domains.guest.repository import GuestRepository
 from app.domains.guest_access.repository import GuestAccessRepository
 from app.domains.guest_access.service import GuestAccessService
@@ -226,6 +228,9 @@ async def _sync_single_router_devices_async(
                 device_adapter_resolver=get_connected_device_adapter,
                 routers=[router],
             )
+            await _pin_monitored_hardware_leases(
+                session, repository, router_service, router
+            )
             await session.commit()
             return summary
         except Exception:
@@ -316,6 +321,55 @@ async def _run_monitored_hardware_liveness_sweep_async() -> dict[str, int]:
             await redis.delete(MONITORED_HARDWARE_LIVENESS_SWEEP_LOCK_REDIS_KEY)
     finally:
         await redis.aclose()
+
+
+async def _pin_monitored_hardware_leases(
+    session,  # noqa: ANN001
+    repository: ConnectedDeviceRepository,
+    router_service: RouterService,
+    router,  # noqa: ANN001
+) -> None:
+    """Keep every registered access point / printer on a fixed address:
+    a monitored MAC's dynamic lease on this router is made static on the
+    address it already holds (``DhcpService.pin_device_leases``).
+
+    Rides on the device sync rather than a sweep of its own, so a device
+    registered while it was offline is bound on the first sync after it
+    takes a lease, at no cost to a router without registered hardware (no
+    MACs, no RouterOS call). Best-effort by design: a failure here is
+    logged and never fails the device sync that already succeeded."""
+    try:
+        macs = await repository.list_monitored_macs_for_router(router.id)
+        if not macs:
+            return
+        dhcp_service = DhcpService(
+            DhcpRepository(session),
+            router_service,
+            audit_writer=RBACRepository(session),
+        )
+        outcomes = await dhcp_service.pin_device_leases(
+            router, macs, actor_user_id=None
+        )
+    except Exception as exc:  # noqa: BLE001 -- best-effort, see docstring
+        logger.warning(
+            "monitored_hardware_lease_pin_failed",
+            extra={"router_id": str(router.id), "error": str(exc)},
+        )
+        return
+    pinned = sum(1 for o in outcomes if o.status == "pinned")
+    if pinned or any(o.status in {"conflict", "failed"} for o in outcomes):
+        logger.info(
+            "monitored_hardware_leases_pinned",
+            extra={
+                "router_id": str(router.id),
+                "pinned": pinned,
+                "problems": [
+                    f"{o.mac_address}:{o.status}"
+                    for o in outcomes
+                    if o.status in {"conflict", "failed"}
+                ],
+            },
+        )
 
 
 @celery_app.task(name=TASK_SYNC_SINGLE_ROUTER_DEVICES)

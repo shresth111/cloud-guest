@@ -31,12 +31,15 @@ from __future__ import annotations
 
 import uuid
 
-from fastapi import APIRouter, Depends, status
+from fastapi import APIRouter, Depends, Request, status
 
+from app.core.logging import get_logger
+from app.domains.captive_portal.dependencies import get_captive_portal_service
+from app.domains.captive_portal.service import CaptivePortalService
 from app.domains.guest.dependencies import get_guest_repository
 from app.domains.guest.repository import GuestRepositoryProtocol
 from app.domains.guest_access.dependencies import get_access_decision_service
-from app.domains.guest_access.service import GuestAccessService, is_blocklisted
+from app.domains.guest_access.service import GuestAccessService
 from app.domains.isp.dependencies import get_isp_service
 from app.domains.isp.service import IspService
 from app.domains.mac_authorization.dependencies import (
@@ -48,6 +51,7 @@ from app.domains.monitoring.dependencies import get_monitoring_service
 from app.domains.monitoring.service import MonitoringService
 from app.domains.router.enums import RouterStatus
 
+from .authorized_macs import list_authorized_macs
 from .dependencies import AgentIdentity, CurrentAgent, get_router_agent_service
 from .schemas import (
     AgentActionCompleteRequest,
@@ -69,6 +73,8 @@ from .validators import (
     validate_netwatch_link_owned_by_router,
 )
 
+logger = get_logger(__name__)
+
 router = APIRouter(prefix="/agent", tags=["Router Agent"])
 
 
@@ -78,6 +84,7 @@ router = APIRouter(prefix="/agent", tags=["Router Agent"])
     status_code=status.HTTP_200_OK,
 )
 async def agent_heartbeat(
+    request: Request,
     payload: AgentHeartbeatRequest,
     identity: AgentIdentity = Depends(CurrentAgent),
     service: RouterAgentService = Depends(get_router_agent_service),
@@ -104,6 +111,7 @@ async def agent_heartbeat(
         routeros_version=payload.routeros_version,
         management_ip_address=payload.management_ip_address,
         public_ip_address=payload.public_ip_address,
+        source_ip_address=request.client.host if request.client else None,
     )
     await monitoring_service.record_heartbeat(
         component_type=HeartbeatComponentType.ROUTER,
@@ -239,6 +247,7 @@ async def agent_authorized_macs(
         get_mac_authorization_service
     ),
     access_decision_service: GuestAccessService = Depends(get_access_decision_service),
+    captive_portal_service: CaptivePortalService = Depends(get_captive_portal_service),
 ) -> AuthorizedMacsResponse:
     """Every MAC this router should let straight through: guests with a
     currently ``ACTIVE`` session that no ``BLOCKLIST`` rule now covers,
@@ -276,42 +285,24 @@ async def agent_authorized_macs(
     be ignored by every script already deployed, so the fix would do
     nothing until every router in the fleet was re-provisioned by hand.
     """
-    sessions = await guest_repository.list_active_sessions_for_router(
-        identity.router.id
+    # The rule itself lives in ``authorized_macs`` so that the sign-in push
+    # (``app.domains.guest.hotspot_gate``) applies literally the same one:
+    # a binding written for a session this list leaves out would be removed
+    # by the router's script one poll later.
+    listed = await list_authorized_macs(
+        identity.router.id,
+        guest_repository=guest_repository,
+        mac_authorization_service=mac_authorization_service,
+        access_decision_service=access_decision_service,
+        captive_portal_service=captive_portal_service,
     )
-    macs: list[str] = []
-    for session in sessions:
-        if session.device_id is None:
-            continue
-        device = await guest_repository.get_device_by_id(session.device_id)
-        if device is None:
-            continue
-        # A guest blocked after they were admitted keeps an ``ACTIVE`` row
-        # whenever the device-side removal failed (see
-        # ``guest_access.enforcement``). Returning their MAC here kept a
-        # ``type=bypassed`` binding on the router -- internet with no
-        # login and no expiry. Leaving it out makes the agent's own
-        # reconciliation withdraw that binding on its next poll.
-        guest = await guest_repository.get_guest_by_id(session.guest_id)
-        if await is_blocklisted(
-            access_decision_service,
-            organization_id=session.organization_id,
-            location_id=session.location_id,
-            identifier=guest.identifier if guest is not None else None,
-            mac_address=device.mac_address,
-        ):
-            continue
-        macs.append(device.mac_address)
+    if listed.dropped:
+        logger.warning(
+            "agent_authorized_macs_dropped_malformed",
+            extra={"router_id": str(identity.router.id), "dropped": listed.dropped},
+        )
 
-    # Scoped by the service against this router's own organization and
-    # location; the agent identity is the router, so there is no caller
-    # organization to pass and none to check against.
-    trusted = await mac_authorization_service.list_active_entries_for_router(
-        identity.router.id, requesting_organization_id=None
-    )
-    macs.extend(entry.mac_address for entry in trusted)
-
-    return AuthorizedMacsResponse(mac_addresses=sorted(set(macs)))
+    return AuthorizedMacsResponse(mac_addresses=list(listed.mac_addresses))
 
 
 @router.post(

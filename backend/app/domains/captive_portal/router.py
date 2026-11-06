@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import hashlib
 import uuid
+from datetime import UTC, datetime, timedelta
 
 from fastapi import (
     APIRouter,
@@ -44,10 +45,13 @@ from fastapi import (
     UploadFile,
     status,
 )
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.common.responses import ApiResponse, build_response
 from app.core.config import get_settings
 from app.core.storage import ObjectStorageError, get_object_storage
+from app.database.session import get_db_session
+from app.domains.analytics.portal_impressions import schedule_portal_impression
 from app.domains.auth.models import AuthUser
 from app.domains.auth.schemas import MessageResponse
 from app.domains.billing.dependencies import get_entitlement_checker
@@ -59,14 +63,22 @@ from app.domains.branding.service import (
     PUBLIC_BACKGROUND_IMAGE_PATH_TEMPLATE,
     PUBLIC_LOGO_PATH_TEMPLATE,
 )
+from app.domains.guest.repository import GuestRepository
+from app.domains.location.models import Location
 from app.domains.rbac.dependencies import (
+    CurrentLocation,
     CurrentOrganization,
     CurrentUser,
     RequirePermission,
 )
+from app.domains.rbac.enums import ScopeType
 
 from .dependencies import get_captive_portal_service
-from .exceptions import InvalidContentImageError
+from .exceptions import (
+    InvalidContentImageError,
+    ReviewStatsCrossLocationError,
+    ReviewStatsLocationNotFoundError,
+)
 from .models import CaptivePortalConfig
 from .schemas import (
     CaptivePortalConfigCreateRequest,
@@ -74,6 +86,7 @@ from .schemas import (
     CaptivePortalConfigResponse,
     CaptivePortalConfigUpdateRequest,
     ResolvedCaptivePortalConfigResponse,
+    ReviewStatsResponse,
 )
 from .service import CaptivePortalService
 from .validators import is_open_now
@@ -171,6 +184,7 @@ def _config_response(config: CaptivePortalConfig) -> CaptivePortalConfigResponse
         # about what a venue turned on.
         collect_guest_name=config.collect_guest_name,
         collect_guest_email=config.collect_guest_email,
+        require_guest_name=config.require_guest_name,
         review_card_enabled=config.review_card_enabled,
         review_url=config.review_url,
         guest_feedback_enabled=config.guest_feedback_enabled,
@@ -252,6 +266,7 @@ async def create_captive_portal_config(
         content_survey=payload.content_survey,
         collect_guest_name=payload.collect_guest_name,
         collect_guest_email=payload.collect_guest_email,
+        require_guest_name=payload.require_guest_name,
         review_card_enabled=payload.review_card_enabled,
         review_url=payload.review_url,
         guest_feedback_enabled=payload.guest_feedback_enabled,
@@ -615,6 +630,73 @@ async def get_captive_portal_content_image_public(
 
 
 @router.get(
+    "/captive-portal/review-stats",
+    response_model=ApiResponse[ReviewStatsResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[
+        Depends(RequirePermission("captive_portal.read", scope=ScopeType.LOCATION))
+    ],
+)
+async def get_review_stats(
+    request: Request,
+    location_id: uuid.UUID = Query(...),
+    days: int = Query(default=30, ge=1, le=365),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    header_location_id: uuid.UUID | None = Depends(CurrentLocation),
+    db: AsyncSession = Depends(get_db_session),
+):
+    """How many guests at one location were shown the "Rate us on Google"
+    page, and how many opened the review link, over the last ``days``.
+
+    ``opened`` counts link opens, never reviews: Google tells this platform
+    nothing about whether a review was written.
+
+    Scoping: the permission check is explicitly LOCATION-scoped and runs
+    against the ``location_id`` query parameter (or the ``X-Location-Id``
+    header, which must then name the same location). The location is
+    loaded and its organization compared with the caller's; a mismatch is
+    the same 404 as a missing location. A Global Super Admin (no
+    organization) may read any location, but only ever one at a time --
+    there is no all-locations form of this query.
+    """
+    if header_location_id is not None and header_location_id != location_id:
+        raise ReviewStatsCrossLocationError()
+    location = await db.get(Location, location_id)
+    if location is None or location.is_deleted:
+        raise ReviewStatsLocationNotFoundError()
+    if (
+        requesting_organization_id is not None
+        and location.organization_id != requesting_organization_id
+    ):
+        raise ReviewStatsLocationNotFoundError()
+    since = datetime.now(UTC) - timedelta(days=days)
+    shown, opened = await GuestRepository(db).count_review_activity(
+        location_id=location.id, since=since
+    )
+    return build_response(
+        success=True,
+        message="OK",
+        data=ReviewStatsResponse(
+            location_id=str(location.id),
+            days=days,
+            shown=shown,
+            opened=opened,
+            since=since,
+        ).model_dump(mode="json"),
+        request_id=_request_id(request),
+    )
+
+
+def _uuid_or_none(value: str | None) -> uuid.UUID | None:
+    if not value:
+        return None
+    try:
+        return uuid.UUID(value)
+    except ValueError:
+        return None
+
+
+@router.get(
     "/captive-portal/resolve",
     response_model=ApiResponse[ResolvedCaptivePortalConfigResponse],
     status_code=status.HTTP_200_OK,
@@ -623,11 +705,33 @@ async def resolve_captive_portal_config(
     request: Request,
     organization_id: uuid.UUID | None = Query(default=None),
     location_id: uuid.UUID | None = Query(default=None),
+    # "Portal opened" for the venue dashboard's login funnel. Sent only by
+    # the guest portal runtime, once per page load -- the dashboard's Portal
+    # Preview calls this same endpoint without it and is never counted. The
+    # write is detached from this request (see
+    # ``analytics.portal_impressions``): it can neither fail nor slow it.
+    # Loose types on purpose: these ride along on the call that loads the
+    # portal, so a malformed value must never turn it into a 422 and leave
+    # the guest without a login page. Parsed below; bad input just drops
+    # the field from the impression.
+    record_impression: str | None = Query(default=None),
+    router_id: str | None = Query(default=None),
+    device_mac: str | None = Query(default=None),
     service: CaptivePortalService = Depends(get_captive_portal_service),
 ):
     resolved = await service.resolve_portal_config(
         organization_id=organization_id, location_id=location_id
     )
+    if record_impression == "true" and location_id is not None:
+        # The organization the config resolved to, which
+        # ``resolve_portal_config`` has already proved owns the location;
+        # the insert re-checks both in SQL anyway.
+        schedule_portal_impression(
+            organization_id=resolved.config.organization_id,
+            location_id=location_id,
+            router_id=_uuid_or_none(router_id),
+            device_mac=device_mac[:64] if device_mac else None,
+        )
     config_payload = _config_response(resolved.config).model_dump()
 
     # Whitelist-only mode is an operator setting, not something a guest is
