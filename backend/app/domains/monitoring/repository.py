@@ -53,6 +53,7 @@ from app.domains.network_integration.models import (
     NetworkIntegrationAuthorization,
 )
 from app.domains.organization.models import Organization
+from app.domains.rbac.enums import CUSTOMER_HIDDEN_AUDIT_ACTIONS
 from app.domains.rbac.models import AuditLogEntry
 from app.domains.router.models import Router
 from app.domains.router_provisioning.constants import ProvisioningJobStatus
@@ -627,7 +628,9 @@ class MonitoringRepository:
         statement = select(AuditLogEntry).where(AuditLogEntry.is_deleted.is_(False))
         if organization_id is not None:
             statement = statement.where(
-                AuditLogEntry.organization_id == organization_id
+                AuditLogEntry.organization_id == organization_id,
+                # Same customer-hidden set the Admin Logs page applies.
+                AuditLogEntry.action.notin_(CUSTOMER_HIDDEN_AUDIT_ACTIONS),
             )
         if start is not None:
             statement = statement.where(AuditLogEntry.created_at >= start)

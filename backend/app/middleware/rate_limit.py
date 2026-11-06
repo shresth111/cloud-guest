@@ -280,6 +280,15 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
 
         if exceeded_key is not None:
             retry_after = await self._retry_after(exceeded_key)
+            # The key's *type*, never the key: it embeds the client IP.
+            logger.warning(
+                "rate_limit_exceeded",
+                extra={
+                    "path": path,
+                    "key_type": _key_type(exceeded_key),
+                    "retry_after_seconds": retry_after,
+                },
+            )
             return JSONResponse(
                 status_code=429,
                 content=build_response(
@@ -316,6 +325,14 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         except Exception:  # noqa: BLE001 -- the 429 stands; only the hint is lost
             return self.window_seconds
         return ttl if ttl and ttl > 0 else self.window_seconds
+
+
+def _key_type(key: str) -> str:
+    if key.startswith(_RESOLVE_VENUE_KEY_TEMPLATE.split("{", 1)[0]):
+        return "portal_resolve_venue"
+    if key.startswith(_RESOLVE_IP_KEY_TEMPLATE.split("{", 1)[0]):
+        return "portal_resolve_ip"
+    return "ip_path"
 
 
 __all__ = [

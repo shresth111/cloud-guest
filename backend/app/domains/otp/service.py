@@ -86,6 +86,12 @@ start auditing it needs no migration) and every request is still logged
 via the structured logger (``otp_requested``) -- just not written to the
 audit table.
 
+**Superseded 2026-11-06:** ``request_otp`` now writes an ``OTP_REQUESTED``
+row (masked identifier, channel, org/location) for the security detection
+sweep. The volume equals ``otp_requests`` itself and is bounded by
+``OtpRateLimiter``. The action is in ``CUSTOMER_HIDDEN_AUDIT_ACTIONS``, so
+no venue's activity log shows it.
+
 ``OTP_VERIFIED`` (success) and ``OTP_VERIFICATION_FAILED`` (only for the two
 *adversarially-relevant* failure reasons -- a wrong code presented against
 a still-live OTP, or a code that has already hit its attempt cap) **are**
@@ -130,6 +136,7 @@ from typing import Protocol
 
 from redis.asyncio import Redis
 
+from app.common.masking import mask_identifier
 from app.core.config import Settings
 from app.core.email_layout import (
     callout,
@@ -1466,8 +1473,24 @@ class OtpService:
             purpose=purpose.value,
         )
         logger.info("otp_requested", extra=_event_extra(event))
-        # Deliberately not written to audit_log_entries -- see module
-        # docstring's audit-volume judgment call.
+        # Revisited 2026-11-06 (SOC report): one row per request is the same
+        # volume as otp_requests itself, bounded by OtpRateLimiter, and
+        # without it a pumping run leaves no audit trail. The identifier is
+        # masked; the full value stays only in otp_requests.
+        if self.audit_writer is not None:
+            await self.audit_writer.create_audit_log_entry(
+                actor_user_id=None,
+                action=AuditAction.OTP_REQUESTED.value,
+                entity_type="otp_request",
+                entity_id=otp_request.id,
+                description=f"OTP requested (purpose={purpose.value})",
+                event_metadata={
+                    "channel": channel.value,
+                    "identifier_masked": mask_identifier(identifier),
+                },
+                organization_id=organization_id,
+                location_id=location_id,
+            )
         return otp_request
 
     async def _dispatch(

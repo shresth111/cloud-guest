@@ -5,7 +5,8 @@ reuse), malformed-identifier rejection, provider-interface invocation (a
 test double standing in for the honest ``LoggingSmsProvider``/
 ``LoggingEmailProvider`` default), and the audit-volume judgment call
 (``OTP_VERIFIED``/adversarially-relevant ``OTP_VERIFICATION_FAILED`` reasons
-are audited; routine failures and every ``otp_requested`` call are not).
+are audited, and so is every ``otp_requested`` call with a masked
+identifier since 2026-11-06; routine failures are not).
 
 Follows this project's plain-``assert``/native-``async def`` style (see
 ``tests/unit/test_wireguard.py``); ``asyncio_mode = "auto"`` runs async
@@ -390,22 +391,33 @@ class TestRequestAndVerifyHappyPath:
         await fx.service.verify_otp(
             identifier="+15551234567", code=code, purpose=OtpPurpose.GUEST_LOGIN
         )
-        assert len(fx.audit_writer.entries) == 1
-        assert fx.audit_writer.entries[0]["action"] == "otp_verified"
+        actions = [e["action"] for e in fx.audit_writer.entries]
+        assert actions == ["otp_requested", "otp_verified"]
 
-    async def test_request_itself_is_never_audited(self) -> None:
-        """See service.py's module docstring: OTP_REQUESTED exists as an
-        AuditAction value but is deliberately never written -- high-volume,
-        guest-facing, unauthenticated requests would flood the audit table."""
+    async def test_request_is_audited_with_masked_identifier(self) -> None:
+        """Since 2026-11-06 every request writes one OTP_REQUESTED row for
+        the security detection sweep. The identifier is masked; the raw
+        number lives only in otp_requests."""
         fx = make_service()
-        await fx.service.request_otp(
+        org_id, loc_id = uuid.uuid4(), uuid.uuid4()
+        otp_request = await fx.service.request_otp(
             identifier="+15551234567",
             channel=OtpChannel.SMS,
             purpose=OtpPurpose.GUEST_LOGIN,
-            organization_id=None,
-            location_id=None,
+            organization_id=org_id,
+            location_id=loc_id,
         )
-        assert fx.audit_writer.entries == []
+        assert len(fx.audit_writer.entries) == 1
+        entry = fx.audit_writer.entries[0]
+        assert entry["action"] == "otp_requested"
+        assert entry["entity_id"] == otp_request.id
+        assert entry["organization_id"] == org_id
+        assert entry["location_id"] == loc_id
+        assert entry["event_metadata"] == {
+            "channel": "sms",
+            "identifier_masked": "XXXXXX34567",
+        }
+        assert "5551234567" not in str(entry)
 
 
 # ============================================================================
@@ -541,7 +553,8 @@ class TestExpiry:
             await fx.service.verify_otp(
                 identifier="+15551234567", code="000000", purpose=OtpPurpose.GUEST_LOGIN
             )
-        assert fx.audit_writer.entries == []
+        actions = [e["action"] for e in fx.audit_writer.entries]
+        assert actions == ["otp_requested"]
 
 
 # ============================================================================
@@ -615,7 +628,11 @@ class TestAttemptLockout:
                 purpose=OtpPurpose.GUEST_LOGIN,
             )
         actions = [entry["action"] for entry in fx.audit_writer.entries]
-        assert actions == ["otp_verification_failed", "otp_verification_failed"]
+        assert actions == [
+            "otp_requested",
+            "otp_verification_failed",
+            "otp_verification_failed",
+        ]
 
 
 # ============================================================================
