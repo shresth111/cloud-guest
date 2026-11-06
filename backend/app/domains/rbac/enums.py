@@ -682,6 +682,10 @@ class AuditAction(StrEnum):
     # human-initiated email-dispatch attempt and its outcome (see
     # ``InvoiceService.record_invoice_emailed``'s own docstring).
     INVOICE_EMAILED = "invoice_emailed"
+    # A Master Console operator pressed "Send" on a Billing > Reminders row
+    # (``POST /billing/reminders/send``). Written for every attempt, with
+    # the outcome (sent / not sent + why) in the description and metadata.
+    BILLING_REMINDER_EMAILED = "billing_reminder_emailed"
     CREDIT_NOTE_ISSUED = "credit_note_issued"
     DEBIT_NOTE_ISSUED = "debit_note_issued"
     TAX_RATE_CREATED = "tax_rate_created"

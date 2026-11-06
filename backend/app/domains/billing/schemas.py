@@ -16,6 +16,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 from decimal import Decimal
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -842,6 +843,24 @@ class InvoiceGenerateAndSendResponse(BaseModel):
     invoice: InvoiceResponse
     email_sent: bool
     email_recipient: str
+    email_error: str | None = None
+
+
+class BillingReminderSendRequest(BaseModel):
+    """``POST /billing/reminders/send``. Only the target and the kind: the
+    email's facts are read server-side (see ``reminder_dispatch``)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    organization_id: uuid.UUID
+    kind: Literal["payment_failed", "invoice_due", "expiry"]
+
+
+class BillingReminderSendResponse(BaseModel):
+    kind: str
+    organization_id: uuid.UUID
+    email_sent: bool
+    email_recipient: str | None = None
     email_error: str | None = None
 
 

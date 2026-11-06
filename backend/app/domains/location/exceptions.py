@@ -46,6 +46,28 @@ class LocationArchivedError(LocationError):
         )
 
 
+class LocationHasRoutersError(LocationError):
+    """``DELETE /locations/{id}`` refused because routers are still attached.
+
+    Archiving only soft-deletes the location row: the routers keep their
+    tunnel, RADIUS client and hotspot config and keep serving guests, but
+    vanish from every location-scoped screen. Decommission them first."""
+
+    def __init__(self, location_id: uuid.UUID, router_count: int) -> None:
+        # Shown verbatim in the customer dashboard's toast, so it names no
+        # id and says what to do. Decommissioning is a Wyfy operator action
+        # (``routers.delete`` at GLOBAL scope), so a venue owner is pointed
+        # at support rather than at a button they do not have.
+        self.location_id = location_id
+        noun = "router is" if router_count == 1 else "routers are"
+        super().__init__(
+            f"This location cannot be archived: {router_count} {noun} still "
+            "attached and serving guests. Contact Wyfy support to "
+            "decommission the router first, then archive the location.",
+            status_code=status.HTTP_409_CONFLICT,
+        )
+
+
 class LocationOrganizationImmutableError(LocationError):
     """A location's ``organization_id`` cannot be changed after creation --
     see ``docs/location/LOCATION_ARCHITECTURE.md`` for the reasoning."""

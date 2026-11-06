@@ -281,6 +281,8 @@ async def create_captive_portal_config(
         social_login_providers=payload.social_login_providers,
         whitelist_only_enabled=payload.whitelist_only_enabled,
         whitelist_only_denied_message=payload.whitelist_only_denied_message,
+        guest_font_choice=payload.guest_font_choice,
+        background_overlay_strength=payload.background_overlay_strength,
     )
     return build_response(
         success=True,

@@ -79,7 +79,9 @@ from app.domains.rbac.location_scope import (
 )
 
 from .constants import (
+    DEFAULT_BACKGROUND_OVERLAY_STRENGTH,
     DEFAULT_FEEDBACK_DWELL_MINUTES,
+    DEFAULT_GUEST_FONT_CHOICE,
     DEFAULT_PORTAL_CONTENT_MODE,
     PRIVACY_POLICY_LABEL,
     TERMS_AND_CONDITIONS_LABEL,
@@ -803,8 +805,14 @@ class CaptivePortalService:
         review_url: str | None = None,
         guest_feedback_enabled: bool = False,
         feedback_dwell_minutes: int = DEFAULT_FEEDBACK_DWELL_MINUTES,
+        # Defaults are the columns' own, so the provisioning flow and the
+        # existing tests that never pass them are unchanged.
+        guest_font_choice: str = DEFAULT_GUEST_FONT_CHOICE.value,
+        background_overlay_strength: int = DEFAULT_BACKGROUND_OVERLAY_STRENGTH,
     ) -> CaptivePortalConfig:
         validate_hex_color(primary_color, field_name="primary_color")
+        validate_guest_font_choice(guest_font_choice)
+        validate_background_overlay_strength(background_overlay_strength)
         validate_hex_color(secondary_color, field_name="secondary_color")
         validate_single_content_source(
             terms_and_conditions_text,
@@ -907,6 +915,8 @@ class CaptivePortalService:
             social_login_providers=list(social_login_providers),
             whitelist_only_enabled=whitelist_only_enabled,
             whitelist_only_denied_message=whitelist_only_denied_message,
+            guest_font_choice=guest_font_choice,
+            background_overlay_strength=background_overlay_strength,
             powered_by_enabled=powered_by_enabled,
             created_by=actor_user_id,
         )

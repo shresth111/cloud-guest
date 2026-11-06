@@ -51,12 +51,14 @@ from app.domains.rbac.dependencies import (
 )
 from app.domains.rbac.enums import ScopeType
 from app.domains.router.dependencies import get_router_service
+from app.domains.router.enums import RouterStatus
 from app.domains.router.service import RouterService
 from app.domains.vlan.dependencies import get_vlan_service
 from app.domains.vlan.service import VlanService
 
 from .dependencies import get_location_service
 from .enums import LocationStatus, PropertyType
+from .exceptions import LocationHasRoutersError
 from .models import Location
 from .provisioning_dependencies import get_location_provisioning_service
 from .provisioning_schemas import (
@@ -443,7 +445,36 @@ async def archive_location(
     user: AuthUser = Depends(CurrentUser),
     requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     location_service: LocationService = Depends(get_location_service),
+    router_service: RouterService = Depends(get_router_service),
 ):
+    """Archives (soft-deletes) a location. Refused with ``409`` while any
+    router that is not decommissioned is still attached -- archiving does not
+    touch the devices, so they would keep serving guests from a location no
+    screen shows any more. Composed here, at the router layer, for the same
+    reason ``get_location_overview`` is: ``RouterService`` already depends on
+    ``LocationService``."""
+    _, router_meta = await router_service.list_routers(
+        location_id=location_id,
+        requesting_organization_id=requesting_organization_id,
+        page=1,
+        page_size=1,
+    )
+    attached = router_meta.total_items
+    if attached > 0:
+        # ``list_routers`` hides soft-deleted rows only; a DECOMMISSIONED
+        # router is still listed. It no longer serves guests, so it must not
+        # block the archive -- otherwise a location whose router was
+        # decommissioned could never be deleted by anyone.
+        _, decommissioned_meta = await router_service.list_routers(
+            location_id=location_id,
+            requesting_organization_id=requesting_organization_id,
+            page=1,
+            page_size=1,
+            status=RouterStatus.DECOMMISSIONED,
+        )
+        attached -= decommissioned_meta.total_items
+    if attached > 0:
+        raise LocationHasRoutersError(location_id, attached)
     await location_service.archive_location(
         actor_user_id=uuid.UUID(user.id),
         location_id=location_id,
