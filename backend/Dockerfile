@@ -43,13 +43,30 @@ RUN if [ "$FETCH_THREAT_DATA" = "1" ]; then \
         || echo "WARNING: threat list not fetched; known-bad destinations will read 'could not be checked'"; \
     fi
 
-RUN chmod +x /app/scripts/run_api.sh \
-    && mkdir -p /var/log/cloudguest
+# The processes run as a fixed non-root uid/gid (10001). The container starts
+# as root only so scripts/docker-entrypoint.sh can chown the writable paths
+# (the prod log volume is root-owned from earlier images) and then exec the
+# command as `app` via setpriv; see that script for the fail-safe. Writable at
+# runtime, and nothing else under /app:
+#   /var/log/cloudguest  CLOUDGUEST_LOG_DIR in prod (named volume)
+#   /app/logs            the log_dir default when CLOUDGUEST_LOG_DIR is unset
+#   /app/var             ipdr_local_dir default (var/ipdr) when no IPDR bucket
+#   /app (the directory itself, not its contents) -- celery beat writes its
+#                        `celerybeat-schedule` file into the working directory
+#   /tmp                 celery beat's pidfile
+# Port 8000 is unprivileged, so binding needs no capability.
+RUN groupadd --gid 10001 app \
+    && useradd --uid 10001 --gid app --home-dir /app --no-create-home \
+         --shell /usr/sbin/nologin app \
+    && chmod +x /app/scripts/run_api.sh /app/scripts/docker-entrypoint.sh \
+    && mkdir -p /var/log/cloudguest /app/logs /app/var \
+    && chown app:app /app /var/log/cloudguest /app/logs /app/var
 
 EXPOSE 8000
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
     CMD curl -fsS http://localhost:8000/api/v1/health/live || exit 1
 
+ENTRYPOINT ["/app/scripts/docker-entrypoint.sh"]
 CMD ["/app/scripts/run_api.sh"]
 

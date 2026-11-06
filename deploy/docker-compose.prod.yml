@@ -1,4 +1,4 @@
-# Production stack for the app server (i-0cf9b79511abe6000, ap-south-1).
+# Production stack for the app server (ap-south-1).
 #
 # This is the file that belongs at /home/ubuntu/deploy/docker-compose.yml. It
 # is a transcription of what was actually running there on 2026-08-27, with
@@ -46,8 +46,12 @@
 services:
   frontend:
     image: ${FRONTEND_IMAGE:?FRONTEND_IMAGE is unset -- see ~/deploy/.deploy.env}
+    # Loopback only. The host nginx is the sole consumer (proxy_pass
+    # http://127.0.0.1:3000) and Docker-published ports bypass ufw, so
+    # "3000:3000" left the SPA server open on every interface, guarded only by
+    # the security group.
     ports:
-      - "3000:3000"
+      - "127.0.0.1:3000:3000"
     environment:
       - NODE_ENV=production
       - PORT=3000
@@ -91,6 +95,14 @@ services:
       # `materialise_cloudflare_env`. Same rules as slack.env, including
       # `touch ~/deploy/cloudflare.env` before adding this line by hand.
       - ${CLOUDFLARE_ENV_FILE:-./cloudflare.env}
+    # NOT loopback, deliberately. The host nginx proxies to 127.0.0.1:8000, but
+    # FreeRADIUS on the hub also calls this API directly over the VPC on the
+    # instance's PRIVATE address (backend/ops/freeradius/rest.conf,
+    # connect_uri). Binding to 127.0.0.1 would fail every guest authorize and
+    # accounting request fleet-wide. The security group is what keeps 8000 off
+    # the internet; if this is ever narrowed in compose, publish it twice --
+    # "127.0.0.1:8000:8000" and "<private-ip>:8000:8000" -- and keep the
+    # private address in ~/deploy/.deploy.env, not in this (public) file.
     ports:
       - "8000:8000"
     depends_on:

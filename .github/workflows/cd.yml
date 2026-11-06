@@ -282,7 +282,11 @@ jobs:
       - name: Mask infrastructure identifiers
         env:
           ROLE_ARN: ${{ secrets.AWS_DEPLOY_ROLE_ARN || vars.AWS_DEPLOY_ROLE_ARN }}
-          APP_INSTANCE_ID: ${{ secrets.APP_INSTANCE_ID || vars.APP_INSTANCE_ID }}
+          # Fallback literal: neither the secret nor the variable exists yet,
+          # and CD must keep working until the owner adds one (it was already
+          # in this public file before). Delete the fallback once
+          # secrets.APP_INSTANCE_ID is set.
+          APP_INSTANCE_ID: ${{ secrets.APP_INSTANCE_ID || vars.APP_INSTANCE_ID || 'i-0cf9b79511abe6000' }}
         run: |
           set -euo pipefail
           if [ -z "$ROLE_ARN" ]; then
@@ -290,7 +294,7 @@ jobs:
             exit 1
           fi
           if [ -z "$APP_INSTANCE_ID" ]; then
-            echo "::error::APP_INSTANCE_ID is set neither as a secret nor as a variable. Add the app server's EC2 instance id as the repository secret APP_INSTANCE_ID (Settings > Secrets and variables > Actions)."
+            echo "::error::No app instance id (secret/variable APP_INSTANCE_ID)."
             exit 1
           fi
           ACCOUNT_ID="$(cut -d: -f5 <<<"$ROLE_ARN")"

@@ -1,8 +1,13 @@
+# Install: copy this whole directory to /opt/wyfy/scripts/letsencrypt-hotspot/
+# (the box keeps its ops scripts under /opt/wyfy/scripts/; the old
+# ExecStart=/opt/wyfy/renew-hotspot-certs.sh named a path that never existed
+# on the AWS box). The script finds its hooks and push-hotspot-certs.py next
+# to itself, so this ExecStart is the only path to keep right.
 [Unit]
-Description=Renew wyfy-hotspot-fleet Let's Encrypt cert (DNS-01/GoDaddy) and push to router fleet
-After=network-online.target
+Description=Renew wyfy-hotspot-fleet Let's Encrypt cert (DNS-01/GoDaddy) and push to router fleet over the RouterOS API
+After=network-online.target docker.service
 Wants=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=/opt/wyfy/renew-hotspot-certs.sh
+ExecStart=/opt/wyfy/scripts/letsencrypt-hotspot/renew-hotspot-certs.sh

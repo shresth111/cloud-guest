@@ -1,0 +1,10 @@
+# Daily expiry check; exits 1 under 21 days, 2 when expired or missing.
+# systemd marks the unit failed on a non-zero exit (OnFailure= can hook a
+# notifier), and --metric publishes HotspotCertDaysRemaining for a
+# CloudWatch alarm (Minimum < 21, missing data = breaching).
+[Unit]
+Description=Check days remaining on the wyfy-hotspot-fleet certificate
+
+[Service]
+Type=oneshot
+ExecStart=/opt/wyfy/scripts/letsencrypt-hotspot/check-hotspot-cert-expiry.sh --warn-days 21 --metric Wyfy/Hotspot
