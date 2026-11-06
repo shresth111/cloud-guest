@@ -195,9 +195,7 @@ def _request_id(request: Request) -> str:
     return str(getattr(request.state, "request_id", ""))
 
 
-async def _one(
-    router_device: Router, router_service: RouterService
-) -> RouterResponse:
+async def _one(router_device: Router, router_service: RouterService) -> RouterResponse:
     """Serialize one router, resolving its controller context first.
 
     Every route that emits a ``RouterResponse`` goes through this or through
@@ -842,7 +840,13 @@ async def reinstate_router(
     "/routers/{router_id}/device-connection",
     response_model=ApiResponse[DeviceConnectionResponse],
     status_code=status.HTTP_200_OK,
-    dependencies=[Depends(RequirePermission("routers.manage"))],
+    # GLOBAL, like the local-admin routes below. Without ``scope=`` the check
+    # ran at the caller's own scope, and organization-owner holds
+    # routers.manage at FULL, so any venue owner's token could read the
+    # platform's decrypted API login for its routers. Both remaining callers
+    # are operator screens (Master Console Remote Access, and the setup
+    # script generator); the config-agent bridge is retired.
+    dependencies=[Depends(RequirePermission("routers.manage", scope=ScopeType.GLOBAL))],
 )
 async def get_device_connection(
     request: Request,
@@ -854,12 +858,13 @@ async def get_device_connection(
     """The one place this domain hands back a *decrypted* credential, not
     just its encrypted-at-rest form -- gated by the same ``routers.manage``
     permission as heartbeat/suspend/reinstate (real, high-trust device
-    operations), never a lower-tier read permission. Two callers today:
-    the dashboard's own SSH-capable config-push bridge (a small agent the
-    browser calls directly, to apply a rendered network config to the real
-    device without routing the push itself through this backend), and
-    Master Console's "Remote Access" panel (a human clicking "reveal" to
-    get WinBox connection details). Routes through
+    operations), never a lower-tier read permission. Two callers today,
+    both operator-only screens: Master Console's "Remote Access" panel (a
+    human clicking "reveal" to get WinBox connection details) and the setup
+    script generator, which reads the stored API login back so a
+    regenerated script carries the same password. The config-agent bridge
+    that used to call this is retired (config push now runs server-side,
+    see ``network_config.router``). Routes through
     ``RouterService.reveal_credentials`` rather than calling
     ``get_router``/``get_decrypted_api_secret`` directly so both callers
     leave an audit trail (``AuditAction.ROUTER_CREDENTIALS_REVEALED``) --
@@ -997,7 +1002,9 @@ WEBFIG_SESSION_TTL_SECONDS = 600
     "/routers/{router_id}/webfig-session",
     response_model=ApiResponse[WebfigSessionResponse],
     status_code=status.HTTP_201_CREATED,
-    dependencies=[Depends(RequirePermission("routers.manage"))],
+    # GLOBAL for the same reason as device-connection: a WebFig session is a
+    # full admin login on the device, which organization-owner must not get.
+    dependencies=[Depends(RequirePermission("routers.manage", scope=ScopeType.GLOBAL))],
 )
 async def create_webfig_session(
     request: Request,
@@ -1149,9 +1156,7 @@ async def proxy_webfig(
     body = await request.body()
     excluded_headers = {"host", "authorization", "content-length"}
     forward_headers = {
-        k: v
-        for k, v in request.headers.items()
-        if k.lower() not in excluded_headers
+        k: v for k, v in request.headers.items() if k.lower() not in excluded_headers
     }
     # WebFig establishes its own router-side session via a Set-Cookie on a
     # successful request; that cookie must round-trip (browser -> proxy ->

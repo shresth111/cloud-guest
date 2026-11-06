@@ -129,6 +129,7 @@ from app.common.spreadsheet_safety import sanitize_spreadsheet_row
 from app.core.email_layout import esc, heading, paragraph, render_email
 from app.core.storage import ObjectStorageProtocol
 from app.database.constants import MAX_BULK_CREATE_SIZE
+from app.database.utils.filters import AnyOfOrNull
 from app.domains.location.models import Location
 from app.domains.notification.constants import (
     NotificationChannelType,
@@ -138,6 +139,7 @@ from app.domains.organization.models import Organization
 from app.domains.rbac.enums import AuditAction
 from app.domains.rbac.location_scope import (
     LocationScope,
+    confine_location_filter,
     enforce_entity_location,
 )
 
@@ -588,12 +590,27 @@ class VoucherService:
         self,
         *,
         requesting_organization_id: uuid.UUID | None,
+        location_id: uuid.UUID | None = None,
         page: int = 1,
         page_size: int = 25,
     ) -> tuple[list[VoucherBatch], object]:
         filters: dict[str, object] = {}
         if requesting_organization_id is not None:
             filters["organization_id"] = requesting_organization_id
+        # One venue's batches, plus the organization-wide ones (no location),
+        # which are valid at every venue. A caller holding only location
+        # grants is confined to their own sites, as ``get_batch`` already is;
+        # before this the listing returned every venue's batches.
+        location_filter = confine_location_filter(
+            requested_location_id=location_id,
+            caller_location_scope=self.caller_location_scope,
+            error=CrossLocationVoucherBatchAccessError(),
+            include_organization_wide=True,
+        )
+        if isinstance(location_filter, uuid.UUID):
+            location_filter = AnyOfOrNull((location_filter,))
+        if location_filter is not None:
+            filters["location_id"] = location_filter
         batches, meta = await self.repository.list_batches(
             page=page, page_size=page_size, filters=filters or None
         )

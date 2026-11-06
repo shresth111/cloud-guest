@@ -744,6 +744,11 @@ async def list_alerts(
     request: Request,
     organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     router_id: uuid.UUID | None = Query(default=None),
+    # One venue's alerts. ``location_id`` is a scope alias, so RBAC checks the
+    # caller against this location (and its containment in the organization)
+    # before the handler runs; the service then confines callers who hold
+    # only location grants to their own sites.
+    location_id: uuid.UUID | None = Query(default=None),
     alert_status: AlertStatus | None = Query(default=None, alias="status"),
     severity: str | None = Query(default=None),
     page: int = Query(default=DEFAULT_LIST_PAGE, ge=1),
@@ -762,6 +767,7 @@ async def list_alerts(
         status=alert_status.value if alert_status is not None else None,
         severity=severity,
         router_id=router_id,
+        location_id=location_id,
         page=page,
         page_size=page_size,
     )
