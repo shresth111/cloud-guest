@@ -87,7 +87,7 @@ def test_platform_only_permissions_are_pinned_global(route_checks) -> None:
 
 def test_platform_only_paths_are_pinned_global(route_checks) -> None:
     seen = {(m, p) for m, p, _k, _s in route_checks}
-    assert PLATFORM_ONLY_PATHS <= seen
+    assert seen >= PLATFORM_ONLY_PATHS
     unpinned = sorted(
         f"{method} {path} ({key})"
         for method, path, key, scope in route_checks
