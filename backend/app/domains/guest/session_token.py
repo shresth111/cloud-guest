@@ -97,20 +97,32 @@ def require_guest_session_proof(
     """Raise ``GuestSessionProofRequiredError`` unless the caller proved it
     owns ``session_id``.
 
-    A token that is sent is always checked, whatever the enforcement mode,
-    so a forged or stale one is never silently accepted. A missing token is
+    A token that is sent is always checked. In ``sensitive``/``all`` mode a
+    forged or stale one is refused; in ``off`` mode it is logged
+    (``guest_session_token_invalid``) and treated as missing, so the
+    transition mode can never lock a guest out. A missing token is
     refused per ``guest_session_token_enforcement``: on ``sensitive``
     endpoints in ``sensitive`` mode, everywhere in ``all`` mode, nowhere in
     ``off`` mode (logged, so the switch to ``all`` can be timed on data)."""
     from app.domains.guest.exceptions import GuestSessionProofRequiredError
 
+    mode = get_settings().guest_session_token_enforcement
     if session_token is not None:
-        if not verify_guest_session_token(
+        if verify_guest_session_token(
             session_token, guest_id=guest_id, session_id=session_id
         ):
+            return
+        if mode != "off":
             raise GuestSessionProofRequiredError()
-        return
-    mode = get_settings().guest_session_token_enforcement
+        # ``off`` is the transition mode and must not refuse anyone. A token
+        # that fails to verify there is most often an honest one past
+        # ``guest_session_token_ttl_seconds`` (a venue whose sessions run
+        # longer than the TTL, a guest pressing Disconnect on day two), so it
+        # is logged and treated exactly like a missing token.
+        _logger.warning(
+            "guest_session_token_invalid",
+            extra={"event_session_id": str(session_id), "event_sensitive": sensitive},
+        )
     if mode == "all" or (mode == "sensitive" and sensitive):
         raise GuestSessionProofRequiredError()
     _logger.info(

@@ -116,13 +116,25 @@ class TestEnforcementModes:
             self._call(token=None, sensitive=True)
         self._call(token=None, sensitive=False)
 
-    def test_a_bad_token_is_refused_in_every_mode(
+    def test_a_bad_token_is_refused_once_enforcing(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        for mode in ("off", "sensitive", "all"):
+        for mode in ("sensitive", "all"):
             monkeypatch.setattr(get_settings(), "guest_session_token_enforcement", mode)
             with pytest.raises(GuestSessionProofRequiredError):
                 self._call(token="forged.token", sensitive=False)
+
+    def test_off_mode_treats_a_bad_or_expired_token_as_missing(self) -> None:
+        """``off`` accepts the bare pair anyway, so refusing a token that fails
+        to verify (most often an honest one past its TTL on a long session)
+        would only lock real guests out, with no security gained."""
+        assert get_settings().guest_session_token_enforcement == "off"
+        self._call(token="forged.token", sensitive=True)
+        g, sid = uuid.uuid4(), uuid.uuid4()
+        expired = issue_guest_session_token(g, sid, now=0)
+        require_guest_session_proof(
+            guest_id=g, session_id=sid, session_token=expired, sensitive=True
+        )
 
     def test_all_mode(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(get_settings(), "guest_session_token_enforcement", "all")
@@ -163,7 +175,12 @@ class TestSetPasswordNeedsTheToken:
         )
         await guest_set_password(_request(), payload, service=fx.guest_service)
 
-    async def test_a_forged_token_is_refused(self) -> None:
+    async def test_a_forged_token_is_refused(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            get_settings(), "guest_session_token_enforcement", "sensitive"
+        )
         fx = make_fixture()
         result = await _sign_in(fx)
         payload = GuestSetPasswordRequest(
