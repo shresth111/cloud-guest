@@ -201,6 +201,10 @@ from app.domains.monitoring.constants import (
     TASK_RUN_ALERT_RULE_EVALUATION_SWEEP,
     TASK_RUN_HEALTH_CHECK_SWEEP,
 )
+from app.domains.monitoring.security_detection_constants import (
+    SECURITY_DETECTION_SWEEP_INTERVAL_SECONDS,
+    TASK_SECURITY_DETECTION_SWEEP,
+)
 from app.domains.network_diagnostics.constants import (
     DIAGNOSTIC_RUN_RETENTION_SWEEP_INTERVAL_SECONDS,
     TASK_RUN_DIAGNOSTIC_RUN_RETENTION_SWEEP,
@@ -297,6 +301,7 @@ celery_app = Celery(
         "app.domains.isp.tasks",
         "app.domains.marketing.tasks",
         "app.domains.monitoring.tasks",
+        "app.domains.monitoring.security_detections",
         "app.domains.network_diagnostics.tasks",
         "app.domains.network_integration.tasks",
         "app.domains.network_integration.usage_tasks",
@@ -492,6 +497,12 @@ celery_app.conf.update(
         "monitoring-health-check-sweep": {
             "task": TASK_RUN_HEALTH_CHECK_SWEEP,
             "schedule": HEALTH_CHECK_SWEEP_INTERVAL_SECONDS,
+        },
+        # Read-only security rules (app.domains.monitoring
+        # .security_detections). Pure DB, default queue.
+        "security-detection-sweep": {
+            "task": TASK_SECURITY_DETECTION_SWEEP,
+            "schedule": SECURITY_DETECTION_SWEEP_INTERVAL_SECONDS,
         },
         "hub-reconciliation-sweep": {
             "task": TASK_RUN_HUB_RECONCILIATION_SWEEP,

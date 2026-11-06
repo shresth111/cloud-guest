@@ -1958,6 +1958,37 @@ class Settings(BaseSettings):
         return url
 
     # ======================================================================
+    # Security detection sweep (app.domains.monitoring.security_detections)
+    # ======================================================================
+    # Read-only rules over audit/OTP/session tables every 5 minutes; hits
+    # become platform_events (category='security', organization_id NULL so
+    # no tenant timeline ever shows them) plus one email to
+    # platform_alert_emails. Every threshold is a plain env var so a noisy
+    # rule can be loosened without a deploy of new code.
+    security_detection_enabled: bool = Field(default=True)
+    security_detection_statement_timeout_ms: int = Field(default=5000, ge=100)
+    security_detection_max_lookback_minutes: int = Field(default=60, ge=5)
+    security_detection_dedup_hours: int = Field(default=24, ge=1)
+    security_detection_max_hits_per_rule: int = Field(default=50, ge=1)
+    security_detection_sms_hourly_max: int = Field(default=300, ge=1)
+    security_detection_sms_baseline_multiplier: float = Field(default=3.0, gt=1)
+    # Floor under the baseline comparison: 3x of a quiet hour's 2 SMS is 7,
+    # which is a normal lunch rush, not pumping.
+    security_detection_sms_baseline_min_count: int = Field(default=30, ge=1)
+    security_detection_venueless_otp_hourly_max: int = Field(default=20, ge=1)
+    security_detection_venue_sms_hourly_max: int = Field(default=100, ge=1)
+    security_detection_otp_verify_ratio_min: float = Field(default=0.2, ge=0, le=1)
+    security_detection_otp_verify_ratio_min_sample: int = Field(default=50, ge=1)
+    security_detection_webhook_rejected_max: int = Field(default=5, ge=1)
+    security_detection_login_failures_per_email_max: int = Field(default=20, ge=1)
+    security_detection_login_failures_total_max: int = Field(default=50, ge=1)
+    security_detection_login_failures_distinct_emails: int = Field(default=10, ge=1)
+    security_detection_voucher_failures_per_location_max: int = Field(
+        default=30, ge=1
+    )
+    security_detection_otp_failures_per_code_max: int = Field(default=10, ge=1)
+
+    # ======================================================================
     # Demo booking calendar (app.domains.demo_booking)
     # ======================================================================
     # The availability rules behind the public "pick a time" calendar.
