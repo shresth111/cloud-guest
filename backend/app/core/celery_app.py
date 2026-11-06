@@ -503,6 +503,9 @@ celery_app.conf.update(
         "security-detection-sweep": {
             "task": TASK_SECURITY_DETECTION_SWEEP,
             "schedule": SECURITY_DETECTION_SWEEP_INTERVAL_SECONDS,
+            # A run still queued when the next is due is dropped, never
+            # stacked behind guest-facing work on a busy worker.
+            "options": {"expires": SECURITY_DETECTION_SWEEP_INTERVAL_SECONDS - 30},
         },
         "hub-reconciliation-sweep": {
             "task": TASK_RUN_HUB_RECONCILIATION_SWEEP,

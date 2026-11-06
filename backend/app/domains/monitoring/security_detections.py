@@ -1459,7 +1459,15 @@ async def _security_detection_sweep_async() -> dict[str, object]:
     return result.as_dict()
 
 
-@celery_app.task(name=TASK_SECURITY_DETECTION_SWEEP)
+@celery_app.task(
+    name=TASK_SECURITY_DETECTION_SWEEP,
+    # The worker shares one prefork pool across the celery, device_io and
+    # marketing queues, so a hung sweep holds a slot the guest-facing tasks
+    # need. Each rule is already capped by statement_timeout; this caps the
+    # whole run, well inside the 5-minute interval.
+    soft_time_limit=120,
+    time_limit=150,
+)
 def security_detection_sweep() -> dict[str, object]:
     """Beat-scheduled every 5 minutes (``security-detection-sweep``)."""
     return run_celery_task(_security_detection_sweep_async())

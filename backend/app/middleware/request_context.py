@@ -1,4 +1,5 @@
 import contextvars
+import ipaddress
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -220,7 +221,20 @@ def _forwarded_for(request: Request) -> str | None:
     """Raw ``X-Forwarded-For``, capped. Its leftmost entries are client
     supplied; the rightmost is what nginx itself saw."""
     value = request.headers.get("X-Forwarded-For")
-    return value[:200] if value else None
+    if not value:
+        return None
+    # Client-supplied, so only entries that parse as an IP address are
+    # logged; anything else (a phone number, an email, a token pasted into
+    # the header) becomes "-" and is never written to the log.
+    entries = []
+    for raw in value[:200].split(","):
+        candidate = raw.strip()
+        try:
+            ipaddress.ip_address(candidate)
+        except ValueError:
+            candidate = "-"
+        entries.append(candidate)
+    return ", ".join(entries)
 
 
 def _parse_uuid(value: str | None) -> uuid.UUID | None:

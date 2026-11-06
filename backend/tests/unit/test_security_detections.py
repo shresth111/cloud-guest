@@ -514,6 +514,20 @@ class TestRequestLog:
         assert record.user_id == "token-user"
         assert record.impersonator_user_id == "op-1"
 
+    def test_forwarded_for_logs_only_ip_addresses(self, caplog) -> None:
+        """X-Forwarded-For is client-supplied: a phone number or token put
+        there must never reach the log."""
+        caplog.set_level(logging.INFO)
+        TestClient(_app()).get(
+            "/ok",
+            headers={
+                "X-Forwarded-For": "+919811122233, tok.abc.def, 2001:db8::1, 9.9.9.9"
+            },
+        )
+        [record] = _records(caplog, "http_request_completed")
+        assert record.forwarded_for == "-, -, 2001:db8::1, 9.9.9.9"
+        assert "919811122233" not in caplog.text
+
     def test_spoofed_user_header_is_not_logged(self, caplog) -> None:
         caplog.set_level(logging.INFO)
         spoofed = str(uuid.uuid4())
