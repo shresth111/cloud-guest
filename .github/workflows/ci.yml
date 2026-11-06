@@ -27,6 +27,16 @@ on:
       SLACK_WEBHOOK_URL:
         required: false
 
+# Superseded PR pushes cancel each other; nothing else does. The group keys on
+# github.workflow because inside workflow_call it is the CALLER's name ("CD"),
+# so the copy cd.yml calls never shares a group with a direct CI run for the
+# same commit, and on push/workflow_call the group is per-SHA with no
+# cancellation -- cancelling the CI that cd.yml is waiting on would cancel the
+# deploy.
+concurrency:
+  group: ci-backend-${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 defaults:
   run:
     working-directory: backend
@@ -37,10 +47,10 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.13"
           cache: "pip"
@@ -237,7 +247,7 @@ jobs:
       # can be used. Sparse-checked-out: this job wants one action.yml, not a
       # backend, a node_modules-sized frontend, or a vendored gateway.
       - name: Check out the composite action
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           sparse-checkout: .github/actions
           sparse-checkout-cone-mode: false
