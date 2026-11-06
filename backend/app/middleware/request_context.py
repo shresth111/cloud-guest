@@ -38,6 +38,11 @@ class MaskingContext:
     masking_enabled: bool = True
     user_id: str | None = None
     organization_id: str | None = None
+    # The real operator behind an impersonation token (its
+    # ``impersonation.actor_user_id`` claim), set by ``CurrentUser``. Read by
+    # ``RBACRepository.create_audit_log_entry`` so audited actions taken
+    # while impersonating name the operator, not only the target.
+    impersonator_user_id: str | None = None
     accessed_kinds: list[str] = field(default_factory=list)
 
 
@@ -68,31 +73,39 @@ def get_masking_context() -> MaskingContext:
 class RequestContextMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next) -> Response:
         request_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())
-        user_id = request.headers.get("X-User-ID")
         organization_id = request.headers.get("X-Organization-ID")
         started_at = time.perf_counter()
 
         request.state.request_id = request_id
         request_token = request_id_context.set(request_id)
-        user_token = user_id_context.set(user_id)
+        # Never the client-supplied X-User-ID header: anyone can send it.
+        # CurrentUser sets the real, token-derived id once it resolves.
+        user_token = user_id_context.set(None)
         organization_token = organization_id_context.set(organization_id)
         masking_token = masking_context.set(MaskingContext())
+        status_code = 500
 
         try:
             response = await call_next(request)
+            status_code = response.status_code
         finally:
             elapsed_ms = round((time.perf_counter() - started_at) * 1000, 3)
+            context = get_masking_context()
             logger.info(
                 "http_request_completed",
                 extra={
                     "method": request.method,
                     "path": request.url.path,
+                    "status_code": status_code,
                     "execution_time_ms": elapsed_ms,
-                    "user_id": user_id,
+                    "client_ip": _client_ip(request),
+                    "forwarded_for": _forwarded_for(request),
+                    "user_id": context.user_id,
+                    "impersonator_user_id": context.impersonator_user_id,
                     "organization_id": organization_id,
                 },
             )
-            await _flush_pii_access_audit(request, get_masking_context())
+            await _flush_pii_access_audit(request, context)
             request_id_context.reset(request_token)
             user_id_context.reset(user_token)
             organization_id_context.reset(organization_token)
@@ -193,6 +206,21 @@ async def _flush_pii_access_audit(request: Request, context: MaskingContext) -> 
             },
             exc_info=True,
         )
+
+
+def _client_ip(request: Request) -> str | None:
+    """The peer address after uvicorn's proxy-header trust
+    (``--forwarded-allow-ips``): the real client when the proxy is trusted,
+    the Docker bridge gateway when it is not. ``forwarded_for`` is logged
+    beside it so the second case is still recoverable."""
+    return request.client.host if request.client else None
+
+
+def _forwarded_for(request: Request) -> str | None:
+    """Raw ``X-Forwarded-For``, capped. Its leftmost entries are client
+    supplied; the rightmost is what nginx itself saw."""
+    value = request.headers.get("X-Forwarded-For")
+    return value[:200] if value else None
 
 
 def _parse_uuid(value: str | None) -> uuid.UUID | None:

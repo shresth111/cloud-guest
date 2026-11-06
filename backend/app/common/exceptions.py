@@ -59,6 +59,13 @@ def register_exception_handlers(app: FastAPI) -> None:
             "application_error",
             extra={"status_code": exc.status_code, "path": request.url.path},
         )
+        if exc.status_code == status.HTTP_429_TOO_MANY_REQUESTS:
+            # Which limiter tripped (OTP, login, voucher, ...), by class name;
+            # never the identifier it was keyed on.
+            logger.warning(
+                "rate_limit_exceeded",
+                extra={"path": request.url.path, "key_type": type(exc).__name__},
+            )
         return JSONResponse(
             status_code=exc.status_code,
             content=build_response(

@@ -1202,5 +1202,8 @@ CUSTOMER_HIDDEN_AUDIT_ACTIONS: frozenset[str] = frozenset(
         AuditAction.WIREGUARD_TUNNEL_CREATED,
         AuditAction.WIREGUARD_TUNNEL_ROTATED,
         AuditAction.WIREGUARD_TUNNEL_REVOKED,
+        # Security telemetry (one row per guest OTP request, 2026-11-06):
+        # written for the detection sweep, not for a venue's activity log.
+        AuditAction.OTP_REQUESTED,
     }
 )

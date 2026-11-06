@@ -221,6 +221,21 @@ class RBACRepositoryProtocol(Protocol):
     ) -> tuple[list[AuditLogEntry], PaginationMeta]: ...
 
 
+def _with_impersonator(fields: dict[str, object]) -> dict[str, object]:
+    """Adds ``metadata.impersonator_user_id`` when the current request runs
+    on an impersonation token. The actor stays the impersonated user (every
+    existing reader keeps working); this records who was really behind it.
+    No-op outside a request, or when the caller already set the key."""
+    from app.middleware.request_context import get_masking_context
+
+    impersonator = get_masking_context().impersonator_user_id
+    if not impersonator:
+        return fields
+    metadata = dict(fields.get("event_metadata") or {})  # type: ignore[call-overload]
+    metadata.setdefault("impersonator_user_id", impersonator)
+    return {**fields, "event_metadata": metadata}
+
+
 class RBACRepository:
     """Concrete, SQLAlchemy-backed implementation of ``RBACRepositoryProtocol``."""
 
@@ -630,7 +645,7 @@ class RBACRepository:
     # -- audit log -------------------------------------------------------------
 
     async def create_audit_log_entry(self, **fields: object) -> AuditLogEntry:
-        return await self.audit_log_entries.create(fields)
+        return await self.audit_log_entries.create(_with_impersonator(fields))
 
     async def list_audit_log_entries(
         self, *, entity_type: str | None = None, entity_id: uuid.UUID | None = None

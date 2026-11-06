@@ -22,6 +22,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.logging import user_id_context
 from app.database.redis import get_redis_client
 from app.database.session import get_db_session
 from app.domains.api_keys.dependencies import get_api_key_service
@@ -94,6 +95,9 @@ async def get_current_user(
     masking_ctx = get_masking_context()
     masking_ctx.masking_enabled = auth_user.data_masking_enabled
     masking_ctx.user_id = auth_user.id
+    # Log lines for the rest of this request carry the token's user, never
+    # a client-supplied header (see RequestContextMiddleware).
+    user_id_context.set(str(auth_user.id))
     return auth_user
 
 
@@ -111,6 +115,10 @@ async def _resolve_user_from_jwt(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid or expired token",
         ) from exc
+
+    impersonation = payload.get("impersonation")
+    if isinstance(impersonation, dict) and impersonation.get("actor_user_id"):
+        get_masking_context().impersonator_user_id = str(impersonation["actor_user_id"])
 
     user = await repository.get_user_by_id(uuid.UUID(str(payload["sub"])))
     if user is None or not user.is_active:
