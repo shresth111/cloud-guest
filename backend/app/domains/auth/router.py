@@ -498,11 +498,11 @@ async def list_sessions(
 )
 async def revoke_session(
     request: Request,
-    session_id: str,
+    session_id: uuid.UUID,
     user: AuthUser = Depends(get_current_user),
     auth_service: AuthService = Depends(get_auth_service),
 ):
-    await auth_service.revoke_session(uuid.UUID(session_id))
+    await auth_service.revoke_session(session_id, owner_user_id=uuid.UUID(user.id))
 
     return build_response(
         success=True,

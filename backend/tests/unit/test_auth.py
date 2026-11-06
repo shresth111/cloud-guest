@@ -225,6 +225,12 @@ class FakeAuthRepository:
             if s.user_id == user_id and s.is_active and s.expires_at > datetime.now(UTC)
         ]
 
+    async def get_session_by_id(self, session_id: uuid.UUID) -> Session | None:
+        for session in self.sessions_by_jti.values():
+            if session.id == session_id:
+                return session
+        return None
+
     async def revoke_session(self, session_id: uuid.UUID) -> None:
         for session in self.sessions_by_jti.values():
             if session.id == session_id:

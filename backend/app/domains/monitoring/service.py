@@ -65,6 +65,7 @@ import asyncio
 import dataclasses
 import json
 import os
+import re
 import shutil
 import time
 import uuid
@@ -77,6 +78,7 @@ from typing import Protocol
 import httpx
 from redis.asyncio import Redis
 
+from app.common.outbound_http import BlockedDestinationError
 from app.core.celery_app import CELERY_HEALTH_CHECK_TIMEOUT_SECONDS, ping_celery_workers
 from app.core.config import Settings
 from app.core.email_layout import (
@@ -3537,12 +3539,36 @@ async def _post_json(
             url, json=payload, timeout=HTTP_NOTIFICATION_TIMEOUT_SECONDS
         )
     except httpx.HTTPError as exc:
-        raise NotificationDeliveryError(f"HTTP request failed: {exc}") from exc
+        raise NotificationDeliveryError(_describe_http_failure(exc)) from exc
     if response.status_code >= 400:
         raise NotificationDeliveryError(
-            f"HTTP {response.status_code}: {response.text[:200]}"
+            f"HTTP {response.status_code}{_vendor_error_code(response)}"
         )
     return response
+
+
+_VENDOR_ERROR_CODE_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+
+
+def _vendor_error_code(response: httpx.Response) -> str:
+    """Slack-style incoming webhooks answer a failure with a short machine
+    code (``no_service``, ``invalid_token``, ``channel_not_found``), which is
+    the useful part of a failed test. Only a body of that shape is passed
+    on; anything longer or free-form (an HTML page, a JSON document, an
+    echo of the request) is dropped rather than shown back to the caller."""
+    body = response.text.strip()
+    if _VENDOR_ERROR_CODE_RE.match(body):
+        return f": {body}"
+    return ""
+
+
+def _describe_http_failure(exc: httpx.HTTPError) -> str:
+    if isinstance(exc, BlockedDestinationError):
+        return (
+            "HTTP request refused: the URL points at a private or internal "
+            "network address"
+        )
+    return f"HTTP request failed: {type(exc).__name__}"
 
 
 class SlackNotifier:
@@ -3676,11 +3702,9 @@ class WebhookNotifier:
                 timeout=HTTP_NOTIFICATION_TIMEOUT_SECONDS,
             )
         except httpx.HTTPError as exc:
-            raise NotificationDeliveryError(f"HTTP request failed: {exc}") from exc
+            raise NotificationDeliveryError(_describe_http_failure(exc)) from exc
         if response.status_code >= 400:
-            raise NotificationDeliveryError(
-                f"HTTP {response.status_code}: {response.text[:200]}"
-            )
+            raise NotificationDeliveryError(f"HTTP {response.status_code}")
         return f"HTTP {response.status_code}"
 
 
