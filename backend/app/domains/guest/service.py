@@ -409,6 +409,7 @@ from .exceptions import (
     RadiusNasMissingCredentialsError,
     RadiusNasNotFoundError,
     RadiusNasNotSyncedError,
+    RouterNotAtVenueError,
     RouterNotEligibleForGuestSessionError,
     SessionTerminationCooldownError,
     TooManyDeviceIdsError,
@@ -3719,7 +3720,9 @@ class GuestService:
                 access_tier=access_tier,
             )
 
-        router = await self._get_eligible_router(router_id)
+        router = await self._get_eligible_router(
+            router_id, organization_id=resolved_org_id, location_id=location_id
+        )
 
         try:
             await self.otp_service.verify_otp(
@@ -3924,7 +3927,9 @@ class GuestService:
                 access_tier=access_tier,
             )
 
-        router = await self._get_eligible_router(router_id)
+        router = await self._get_eligible_router(
+            router_id, organization_id=resolved_org_id, location_id=location_id
+        )
 
         source = ip_address or "unknown"
         try:
@@ -4155,7 +4160,9 @@ class GuestService:
                 access_tier=access_tier,
             )
 
-        router = await self._get_eligible_router(router_id)
+        router = await self._get_eligible_router(
+            router_id, organization_id=resolved_org_id, location_id=location_id
+        )
 
         if not self._verify_guest_password(existing_guest, password):
             await self._record_login_failure(
@@ -4451,7 +4458,9 @@ class GuestService:
                 access_tier=access_tier,
             )
 
-        router = await self._get_eligible_router(router_id)
+        router = await self._get_eligible_router(
+            router_id, organization_id=resolved_org_id, location_id=location_id
+        )
 
         # _enforce_device_limit above already fetched this exact MAC's
         # GuestDevice moments earlier (nothing in between writes to
@@ -4717,7 +4726,9 @@ class GuestService:
                 access_tier=access_tier,
             )
 
-        router = await self._get_eligible_router(router_id)
+        router = await self._get_eligible_router(
+            router_id, organization_id=resolved_org_id, location_id=location_id
+        )
 
         guest, is_new = await self._get_or_create_guest(
             existing_guest,
@@ -6794,7 +6805,9 @@ class GuestService:
                 whitelist_only_denied_message=config.whitelist_only_denied_message,
             )
 
-        router = await self._get_eligible_router(router_id)
+        router = await self._get_eligible_router(
+            router_id, organization_id=guest.organization_id, location_id=location_id
+        )
         device: GuestDevice | None = None
         if device_mac:
             device = await self.get_or_create_device(
@@ -7531,11 +7544,51 @@ class GuestService:
         ):
             raise VenueClosedError(config.business_hours_closed_message)
 
-    async def _get_eligible_router(self, router_id: uuid.UUID) -> Router:
+    async def _get_eligible_router(
+        self,
+        router_id: uuid.UUID,
+        *,
+        organization_id: uuid.UUID | None = None,
+        location_id: uuid.UUID | None = None,
+    ) -> Router:
+        """The router a guest session may be put on.
+
+        With a venue given (every login path), the router must also belong to
+        it (QA 2026-11-06, H2): same organization, and -- when the router is
+        assigned to a location -- that location. Before, a guest at a
+        voucher-only or whitelist-only venue B could name a free-OTP venue
+        A's ``location_id`` with B's ``router_id`` and get a session (and a
+        bypass binding) on B under A's rules, recorded in A's tenant.
+        ``guest_login_router_venue_check="log"`` keeps the log line and
+        admits anyway (rollback lever for a router moved between locations
+        whose portal URL still names the old one)."""
         router = await self.router_lookup.get_router(router_id)
         ineligible = {RouterStatus.DECOMMISSIONED.value, RouterStatus.SUSPENDED.value}
         if router.status in ineligible:
             raise RouterNotEligibleForGuestSessionError(router.id, router.status)
+        if organization_id is None and location_id is None:
+            return router
+        org_mismatch = (
+            organization_id is not None and router.organization_id != organization_id
+        )
+        location_mismatch = (
+            location_id is not None
+            and router.location_id is not None
+            and router.location_id != location_id
+        )
+        if org_mismatch or location_mismatch:
+            logger.warning(
+                "guest_login_router_not_at_venue",
+                extra={
+                    "event_router_id": str(router.id),
+                    "event_router_organization_id": str(router.organization_id),
+                    "event_router_location_id": str(router.location_id),
+                    "event_requested_organization_id": str(organization_id),
+                    "event_requested_location_id": str(location_id),
+                },
+            )
+            if get_settings().guest_login_router_venue_check == "enforce":
+                raise RouterNotAtVenueError(router.id)
         return router
 
     def _reject_if_blocked(self, guest: Guest | None) -> None:

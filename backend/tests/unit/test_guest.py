@@ -1744,7 +1744,11 @@ def make_fixture(
         business_hours_schedule=business_hours_schedule,
     )
     captive_portal_service.add_location(location_id, organization_id)
-    router = router_service.add(organization_id=organization_id, status=router_status)
+    router = router_service.add(
+        organization_id=organization_id,
+        location_id=location_id,
+        status=router_status,
+    )
 
     guest_service = GuestService(
         repository,
@@ -7365,7 +7369,9 @@ class TestRadius:
     async def test_accounting_rejects_session_on_different_router(self) -> None:
         fx = make_fixture()
         await self._register_nas(fx)
-        other_router = fx.router_service.add(organization_id=fx.organization_id)
+        other_router = fx.router_service.add(
+            organization_id=fx.organization_id, location_id=fx.location_id
+        )
         # Seeds a live session on the *other* router; the returned object
         # is not needed, only the state it creates.
         await fx.guest_service.login_via_otp(
@@ -7880,7 +7886,9 @@ class TestRadiusAccountingOnOff:
     async def test_accounting_on_never_touches_other_routers_sessions(self) -> None:
         fx = make_fixture()
         await self._register_nas(fx)
-        other_router = fx.router_service.add(organization_id=fx.organization_id)
+        other_router = fx.router_service.add(
+            organization_id=fx.organization_id, location_id=fx.location_id
+        )
         other_session = await fx.guest_service.login_via_otp(
             identifier="+15550004444",
             code="GOOD",
@@ -8664,7 +8672,9 @@ class TestAnalytics:
         fx = make_fixture()
         other_location = uuid.uuid4()
         fx.captive_portal_service.add_location(other_location, fx.organization_id)
-        other_router = fx.router_service.add(organization_id=fx.organization_id)
+        other_router = fx.router_service.add(
+            organization_id=fx.organization_id, location_id=other_location
+        )
 
         await self._login(fx, identifier="+15550004444")
         await self._login(fx, identifier="+15550005555")
@@ -9016,7 +9026,9 @@ class TestTenantIsolation:
         other_location = uuid.uuid4()
         fx.captive_portal_service.register(other_org, otp_sms_enabled=True)
         fx.captive_portal_service.add_location(other_location, other_org)
-        other_router = fx.router_service.add(organization_id=other_org)
+        other_router = fx.router_service.add(
+            organization_id=other_org, location_id=other_location
+        )
         await fx.guest_service.login_via_otp(
             identifier="+15550044444",
             code="GOOD",

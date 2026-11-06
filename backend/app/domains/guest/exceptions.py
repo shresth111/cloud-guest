@@ -241,6 +241,18 @@ class GuestTeamSharedQuotaExceededError(GuestError):
         )
 
 
+class RouterNotAtVenueError(GuestError):
+    """The login named a ``router_id`` that does not belong to the
+    organization/location it also named (QA 2026-11-06, H2)."""
+
+    def __init__(self, router_id: uuid.UUID | str) -> None:
+        super().__init__(
+            "This WiFi network is not part of the venue you are signing in to.",
+            status_code=status.HTTP_403_FORBIDDEN,
+            data={"code": "ROUTER_NOT_AT_VENUE", "router_id": str(router_id)},
+        )
+
+
 class RouterNotEligibleForGuestSessionError(GuestError):
     """The requested router is not in a status that may host a guest
     session (e.g. ``decommissioned``/``suspended``) -- composes with

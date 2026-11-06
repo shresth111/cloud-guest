@@ -3088,6 +3088,17 @@ class Settings(BaseSettings):
             "it once guest_session_token_missing stops appearing."
         ),
     )
+    guest_login_router_venue_check: str = Field(
+        default="enforce",
+        pattern="^(enforce|log)$",
+        description=(
+            "QA 2026-11-06 H2: a guest login's router_id must belong to the "
+            "organization and (when the router has one) the location the "
+            "login names. 'enforce' refuses a mismatch with 403 "
+            "ROUTER_NOT_AT_VENUE; 'log' only writes "
+            "guest_login_router_not_at_venue and admits (rollback lever)."
+        ),
+    )
     radius_authorize_device_binding_all_vendors: bool = Field(
         default=True,
         description=(
