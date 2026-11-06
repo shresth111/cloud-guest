@@ -1105,7 +1105,14 @@ class Ping4SmsProvider:
             response = await client.get(
                 "https://site.ping4sms.com/api/smsapi", params=params
             )
-            response.raise_for_status()
+            # Not ``raise_for_status()``: httpx puts the full request URL in
+            # that exception's message, and this URL carries the API key and
+            # the OTP text. The exception reaches the app's unhandled-error
+            # handler, which logs it with its traceback.
+            if response.is_error:
+                raise RuntimeError(
+                    f"ping4sms send failed: HTTP {response.status_code}"
+                )
             body = response.text.strip()
             if body.isdigit():
                 code = int(body)
