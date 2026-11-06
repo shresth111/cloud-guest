@@ -71,11 +71,16 @@ async def get_current_user(
     credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
     repository: AuthRepositoryProtocol = Depends(get_auth_repository),
     api_key_service: ApiKeyService = Depends(get_api_key_service),
+    db: AsyncSession = Depends(get_db_session),
 ) -> AuthUser:
     x_api_key = request.headers.get(_API_KEY_HEADER)
     if x_api_key:
         user = await _resolve_user_from_api_key(
-            x_api_key, request=request, repository=repository, service=api_key_service
+            x_api_key,
+            request=request,
+            repository=repository,
+            service=api_key_service,
+            db=db if isinstance(db, AsyncSession) else None,
         )
     elif credentials is not None:
         user = await _resolve_user_from_jwt(credentials, repository=repository)
@@ -139,6 +144,7 @@ async def _resolve_user_from_api_key(
     request: Request,
     repository: AuthRepositoryProtocol,
     service: ApiKeyService,
+    db: AsyncSession | None = None,
 ) -> User:
     try:
         api_key = await service.resolve_active_key(plaintext_key)
@@ -154,10 +160,30 @@ async def _resolve_user_from_api_key(
     # silently trust. Absent, CurrentOrganization resolves None exactly as
     # it would for a JWT caller with no header -- no new gap introduced.
     org_header = request.headers.get(_ORG_HEADER)
-    if org_header and uuid.UUID(org_header) != api_key.organization_id:
+    if org_header:
+        try:
+            header_org = uuid.UUID(org_header)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="X-Organization-Id is not a valid UUID",
+            ) from exc
+        if header_org != api_key.organization_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="X-Organization-Id does not match this API key's organization",
+            )
+
+    # The header is not the only way a request names a tenant: the route's
+    # own organization_id/customer_id, or a router/location id that belongs
+    # to an organization, all decide what the permission check and the
+    # handler act on. Resolve the same scope RequirePermission will, and
+    # refuse any request whose organization is not the key's own.
+    named_org = await _request_organization(request, db)
+    if named_org is not None and named_org != api_key.organization_id:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="X-Organization-Id does not match this API key's organization",
+            detail="This API key cannot act on another organization",
         )
 
     user = await repository.get_user_by_id(api_key.user_id)
@@ -167,6 +193,24 @@ async def _resolve_user_from_api_key(
             detail="User is not active",
         )
     return user
+
+
+async def _request_organization(
+    request: Request, db: AsyncSession | None
+) -> uuid.UUID | None:
+    """The organization this request acts on, resolved exactly as
+    ``RequirePermission`` resolves it. Imported lazily:
+    ``app.domains.rbac.dependencies`` imports this module."""
+    from app.domains.rbac.dependencies import _current_scope_context
+    from app.domains.rbac.exceptions import InvalidScopeHeaderError
+
+    try:
+        context = await _current_scope_context(request, db)
+    except InvalidScopeHeaderError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
+        ) from exc
+    return context.organization_id
 
 
 def get_device_info(request: Request) -> DeviceInfo:

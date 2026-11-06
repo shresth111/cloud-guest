@@ -54,6 +54,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             )
         if app_settings.strict_production_secrets:
             app_settings.validate_no_public_secrets()
+        elif not app_settings.is_local_environment:
+            # Not defaulted on: turning it on refuses startup, and a refused
+            # startup takes guest WiFi login down with it. Say so every boot
+            # until an operator has checked the deployment's .env and set
+            # CLOUDGUEST_STRICT_PRODUCTION_SECRETS=true.
+            logger.warning(
+                "strict_production_secrets_disabled",
+                extra={"environment": app_settings.environment},
+            )
         # Guest Marketing own-provider credentials are encrypted under
         # router_encryption_key. Logged loudly rather than raised (a crash
         # loop here would take guest WiFi login down); every write of such

@@ -162,3 +162,103 @@ class TestMfaFailuresCountTowardLockout:
             await service.login(
                 "hal@example.com", STRONG_PASSWORD, make_device_info(), mfa_code="1"
             )
+
+
+# ============================================================================
+# L8: an API key acts on its own organization only, however it is named
+# ============================================================================
+
+
+def _api_request(
+    *,
+    headers: dict[str, str] | None = None,
+    path_params: dict[str, object] | None = None,
+    query_string: str = "",
+):
+    from starlette.requests import Request
+
+    raw = [(k.lower().encode(), v.encode()) for k, v in (headers or {}).items()]
+    return Request(
+        {
+            "type": "http",
+            "method": "GET",
+            "path": "/",
+            "headers": raw,
+            "path_params": path_params or {},
+            "query_string": query_string.encode(),
+        }
+    )
+
+
+class TestApiKeyOrganizationBinding:
+    async def _setup(self):
+        from .test_auth import FakeApiKeyService, FakeAuthRepository, _ResolvedApiKey
+
+        repository = FakeAuthRepository()
+        user = await repository.create_user(
+            first_name="Api",
+            last_name="Caller",
+            email="key@example.com",
+            username="keyuser",
+            password_hash="hashed",
+            is_active=True,
+            is_verified=True,
+        )
+        key_org = uuid.uuid4()
+        service = FakeApiKeyService(
+            resolved=_ResolvedApiKey(organization_id=key_org, user_id=user.id)
+        )
+        return repository, service, key_org
+
+    async def _call(self, request, repository, service):
+        from app.domains.auth.dependencies import get_current_user
+
+        return await get_current_user(
+            request=request,
+            credentials=None,
+            repository=repository,
+            api_key_service=service,
+            db=None,
+        )
+
+    async def test_path_named_other_org_is_refused(self) -> None:
+        from fastapi import HTTPException
+
+        repository, service, key_org = await self._setup()
+        other = uuid.uuid4()
+        for request in (
+            _api_request(
+                headers={"X-API-Key": "k"},
+                path_params={"organization_id": str(other)},
+            ),
+            _api_request(
+                headers={"X-API-Key": "k", "X-Organization-Id": str(key_org)},
+                query_string=f"organization_id={other}",
+            ),
+        ):
+            with pytest.raises(HTTPException) as caught:
+                await self._call(request, repository, service)
+            assert caught.value.status_code == 403
+
+    async def test_own_org_by_path_or_header_is_allowed(self) -> None:
+        repository, service, key_org = await self._setup()
+        for request in (
+            _api_request(
+                headers={"X-API-Key": "k"},
+                path_params={"organization_id": str(key_org)},
+            ),
+            _api_request(headers={"X-API-Key": "k", "X-Organization-Id": str(key_org)}),
+            _api_request(headers={"X-API-Key": "k"}),
+        ):
+            await self._call(request, repository, service)
+
+    async def test_malformed_header_is_400_not_500(self) -> None:
+        from fastapi import HTTPException
+
+        repository, service, _key_org = await self._setup()
+        request = _api_request(
+            headers={"X-API-Key": "k", "X-Organization-Id": "not-a-uuid"}
+        )
+        with pytest.raises(HTTPException) as caught:
+            await self._call(request, repository, service)
+        assert caught.value.status_code == 400

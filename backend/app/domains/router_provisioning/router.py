@@ -60,6 +60,7 @@ from app.domains.rbac.dependencies import (
     CurrentUser,
     RequirePermission,
 )
+from app.domains.rbac.enums import ScopeType
 
 from .constants import ConfigVariableScope
 from .customer_visibility import customer_visible_interface_counters
@@ -829,7 +830,12 @@ async def submit_enrollment(
     "/router-enrollment",
     response_model=ApiResponse[RouterEnrollmentListResponse],
     status_code=status.HTTP_200_OK,
-    dependencies=[Depends(RequirePermission("router_provisioning.read"))],
+    # Pending devices belong to no tenant yet: Master console only.
+    dependencies=[
+        Depends(
+            RequirePermission("router_provisioning.read", scope=ScopeType.GLOBAL)
+        )
+    ],
 )
 async def list_pending_enrollments(
     request: Request,
@@ -855,7 +861,12 @@ async def list_pending_enrollments(
     "/router-enrollment/{enrollment_id}/approve",
     response_model=ApiResponse[RouterEnrollmentApproveResponse],
     status_code=status.HTTP_201_CREATED,
-    dependencies=[Depends(RequirePermission("router_provisioning.approve"))],
+    # Pending devices belong to no tenant yet: Master console only.
+    dependencies=[
+        Depends(
+            RequirePermission("router_provisioning.approve", scope=ScopeType.GLOBAL)
+        )
+    ],
 )
 async def approve_enrollment(
     request: Request,
@@ -889,7 +900,12 @@ async def approve_enrollment(
     "/router-enrollment/{enrollment_id}/reject",
     response_model=ApiResponse[RouterEnrollmentResponse],
     status_code=status.HTTP_200_OK,
-    dependencies=[Depends(RequirePermission("router_provisioning.approve"))],
+    # Pending devices belong to no tenant yet: Master console only.
+    dependencies=[
+        Depends(
+            RequirePermission("router_provisioning.approve", scope=ScopeType.GLOBAL)
+        )
+    ],
 )
 async def reject_enrollment(
     request: Request,

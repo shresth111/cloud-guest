@@ -32,5 +32,5 @@ class SystemVersionResponse(BaseModel):
     version: str
     build: str | None = None
     commit: str | None = None
-    python_version: str
+    python_version: str | None = None
     api_version: str = "v1"

@@ -80,6 +80,13 @@ def test_production_on_default_secrets_still_boots_and_says_so(tmp_path) -> None
     }
     for record in critical:
         assert "aW5zZWN1cmU" not in JsonLogFormatter().format(record)
+    # Strict mode is off by default, and unset payment webhook secrets
+    # (their endpoints refuse every event) are named at startup too.
+    warnings = {
+        r.getMessage() for r in handler.records if r.levelno == logging.WARNING
+    }
+    assert "strict_production_secrets_disabled" in warnings
+    assert "payment_webhook_secret_unset" in warnings
 
 
 def test_local_boot_logs_no_secret_warning(tmp_path) -> None:
@@ -93,3 +100,47 @@ def test_local_boot_logs_no_secret_warning(tmp_path) -> None:
     finally:
         main_logger.removeHandler(handler)
     assert not [r for r in handler.records if r.levelno == logging.CRITICAL]
+
+
+# Security review 2026-11-06, L9: unauthenticated probes answer up/down only.
+
+
+async def test_readiness_reports_status_without_timings_or_errors(
+    monkeypatch,
+) -> None:
+    from app.api.v1.health import routes
+
+    class _Broken:
+        async def __aenter__(self):
+            raise ConnectionRefusedError("db host 10.0.0.5:5432")
+
+        async def __aexit__(self, *exc):
+            return False
+
+    class _Redis:
+        async def ping(self):
+            return True
+
+    monkeypatch.setattr(routes, "SessionLocal", lambda: _Broken())
+    monkeypatch.setattr(routes, "redis_client", _Redis())
+
+    database = await routes._database_status()
+    redis = await routes._redis_status(1.0)
+
+    assert database.model_dump() == {
+        "status": "unavailable",
+        "latency_ms": None,
+        "error": None,
+    }
+    assert redis.model_dump() == {"status": "ok", "latency_ms": None, "error": None}
+
+
+def test_system_version_does_not_disclose_the_interpreter() -> None:
+    client = TestClient(create_app())
+
+    response = client.get("/api/v1/system/version")
+
+    assert response.status_code == 200
+    data = response.json()["data"]
+    assert data["python_version"] is None
+    assert data["api_version"] == "v1"
