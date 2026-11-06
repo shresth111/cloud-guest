@@ -103,6 +103,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         resolve_max_requests=(
             app_settings.captive_portal_resolve_rate_limit_max_requests
         ),
+        # Guest sign-in paths share a venue's NAT address too (QA M4).
+        guest_portal_max_requests=(
+            app_settings.captive_portal_resolve_rate_limit_max_requests
+        ),
     )
     app.add_middleware(
         CORSMiddleware,

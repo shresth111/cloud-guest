@@ -81,8 +81,6 @@ from .schemas import (
     VoucherPlanCreateRequest,
     VoucherPlanListResponse,
     VoucherPlanResponse,
-    VoucherRedeemRequest,
-    VoucherRedeemResponse,
     VoucherResponse,
     VoucherSeriesCreateRequest,
     VoucherSeriesListResponse,
@@ -745,34 +743,10 @@ async def validate_voucher(
     )
 
 
-@router.post(
-    "/vouchers/redeem",
-    response_model=ApiResponse[VoucherRedeemResponse],
-    status_code=status.HTTP_200_OK,
-)
-async def redeem_voucher(
-    request: Request,
-    payload: VoucherRedeemRequest,
-    source: str = Depends(get_redemption_source),
-    service: VoucherService = Depends(get_voucher_service),
-):
-    voucher, batch = await service.redeem_voucher(
-        code=payload.code, identifier=payload.identifier, source=source
-    )
-    response_payload = VoucherRedeemResponse(
-        code=voucher.code,
-        status=voucher.status,
-        use_count=voucher.use_count,
-        max_uses_per_voucher=batch.max_uses_per_voucher,
-        redeemed_at=voucher.redeemed_at,
-        expires_at=voucher.expires_at,
-    )
-    return build_response(
-        success=True,
-        message="Voucher redeemed",
-        data=response_payload.model_dump(),
-        request_id=_request_id(request),
-    )
+# ``POST /vouchers/redeem`` was removed (QA 2026-11-06, M5): it burned a
+# voucher, or started its validity clock, for anyone holding the code, with
+# no venue or session behind it. Nothing called it -- the portal redeems
+# through ``POST /guest/login/voucher``, which is venue-scoped (H3).
 
 
 __all__ = ["router"]

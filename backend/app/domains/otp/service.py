@@ -148,6 +148,7 @@ from .exceptions import (
     OtpAlreadyConsumedError,
     OtpAttemptsExceededError,
     OtpCodeMismatchError,
+    OtpDailyCapReachedError,
     OtpExpiredError,
     OtpNotFoundError,
     OtpRequestRateLimitExceededError,
@@ -339,14 +340,25 @@ class LoggingWhatsAppProvider:
     ``KeyError`` (this provider had the identical bug)."""
 
     async def send(self, phone_number: str, *, code: str, message: str) -> None:
-        logger.info(
-            "otp_whatsapp_would_send",
-            extra={
+        # QA 2026-11-06 L6: this is the default provider, so a deployment
+        # that turns WhatsApp OTP on without configuring a real provider
+        # would write every live code to the logs. Only a local/test
+        # environment (where reading the code back is the point) gets it.
+        from app.core.config import LOCAL_ENVIRONMENTS, get_settings
+
+        if get_settings().environment in LOCAL_ENVIRONMENTS:
+            extra: dict[str, object] = {
                 "phone_number": phone_number,
                 "code": code,
                 "whatsapp_message": message,
-            },
-        )
+            }
+        else:
+            extra = {
+                "phone_number": phone_number,
+                "whatsapp_message_length": len(message),
+                "delivered": False,
+            }
+        logger.info("otp_whatsapp_would_send", extra=extra)
 
 
 # ============================================================================
@@ -1400,6 +1412,9 @@ class OtpService:
         max_requests_per_window: int = 5,
         request_window_minutes: int = 60,
         sms_message_template: str = "",
+        daily_cap_per_location: int = 0,
+        daily_cap_platform: int = 0,
+        daily_cap_enforce: bool = True,
     ) -> None:
         self.repository = repository
         self.redis = redis
@@ -1417,6 +1432,10 @@ class OtpService:
         self.max_requests_per_window = max_requests_per_window
         self.request_window_minutes = request_window_minutes
         self.sms_message_template = sms_message_template
+        # 0 = no cap. Production values come from Settings (QA H4).
+        self.daily_cap_per_location = daily_cap_per_location
+        self.daily_cap_platform = daily_cap_platform
+        self.daily_cap_enforce = daily_cap_enforce
 
     # ========================================================================
     # Request
@@ -1440,6 +1459,7 @@ class OtpService:
             max_requests=self.max_requests_per_window,
             window_minutes=self.request_window_minutes,
         )
+        await self._enforce_daily_caps(location_id)
 
         code = generate_numeric_code(self.code_length)
         now = datetime.now(UTC)
@@ -1469,6 +1489,45 @@ class OtpService:
         # Deliberately not written to audit_log_entries -- see module
         # docstring's audit-volume judgment call.
         return otp_request
+
+    async def _enforce_daily_caps(self, location_id: uuid.UUID | None) -> None:
+        """Per-venue and platform-wide daily send caps (QA 2026-11-06, H4).
+
+        Counted in Redis per UTC day (INCR + a two-day EXPIRE), before a
+        code is generated or a provider is paid. The per-identifier limiter
+        above cannot stop SMS pumping -- a pumper rotates numbers -- and the
+        per-IP middleware limit cannot either, so these are the backstop.
+        A Redis failure here propagates like the identifier limiter's."""
+        day = datetime.now(UTC).strftime("%Y%m%d")
+        checks: list[tuple[str, str, int]] = [
+            ("platform", f"otp:daily:platform:{day}", self.daily_cap_platform)
+        ]
+        if location_id is not None:
+            checks.append(
+                (
+                    "location",
+                    f"otp:daily:location:{location_id}:{day}",
+                    self.daily_cap_per_location,
+                )
+            )
+        for scope, key, cap in checks:
+            if cap <= 0:
+                continue
+            current = await self.redis.incr(key)
+            if current == 1:
+                await self.redis.expire(key, 2 * 24 * 3600)
+            if current > cap:
+                logger.warning(
+                    "otp_daily_cap_reached",
+                    extra={
+                        "event_scope": scope,
+                        "event_cap": cap,
+                        "event_location_id": str(location_id),
+                        "event_enforced": self.daily_cap_enforce,
+                    },
+                )
+                if self.daily_cap_enforce:
+                    raise OtpDailyCapReachedError(scope)
 
     async def _dispatch(
         self,
@@ -1605,19 +1664,37 @@ class OtpService:
             )
             raise OtpExpiredError()
 
-        if not secrets.compare_digest(hash_otp_code(code), otp_request.code_hash):
-            updated = await self.repository.update_otp_request(
-                otp_request, {"attempt_count": otp_request.attempt_count + 1}
-            )
+        # QA 2026-11-06 M1: every verify spends one attempt atomically BEFORE
+        # the code is compared, so parallel guesses share the cap instead of
+        # each reading the same count. A correct code spends one too, which
+        # changes nothing sequentially: 4 misses + a hit still succeeds, 5
+        # misses still lock the code.
+        attempts = await self.repository.reserve_attempt(otp_request)
+        if attempts is None:
+            if otp_request.is_consumed:
+                await self._record_failure(
+                    otp_request, identifier, purpose, reason="already_consumed"
+                )
+                raise OtpAlreadyConsumedError()
             await self._record_failure(
-                updated, identifier, purpose, reason="code_mismatch"
+                otp_request, identifier, purpose, reason="attempts_exceeded"
             )
-            remaining = max(updated.max_attempts - updated.attempt_count, 0)
+            raise OtpAttemptsExceededError()
+
+        if not secrets.compare_digest(hash_otp_code(code), otp_request.code_hash):
+            await self._record_failure(
+                otp_request, identifier, purpose, reason="code_mismatch"
+            )
+            remaining = max(otp_request.max_attempts - attempts, 0)
             raise OtpCodeMismatchError(attempts_remaining=remaining)
 
-        verified = await self.repository.update_otp_request(
-            otp_request, {"is_consumed": True, "verified_at": now}
-        )
+        # Single-use under concurrency: only one caller wins the consume.
+        if not await self.repository.consume(otp_request, verified_at=now):
+            await self._record_failure(
+                otp_request, identifier, purpose, reason="already_consumed"
+            )
+            raise OtpAlreadyConsumedError()
+        verified = otp_request
         event = OtpVerified(
             otp_request_id=verified.id, identifier=identifier, purpose=purpose.value
         )

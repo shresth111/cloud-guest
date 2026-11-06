@@ -277,3 +277,63 @@ def test_other_paths_fail_open_too_and_keep_their_ip_keying() -> None:
     redis.fail = True
     for _ in range(5):
         assert client.get("/api/v1/auth/login").status_code == 200
+
+
+# QA 2026-11-06 M4: guest sign-in paths are venue-sized, like resolve.
+
+
+def _make_portal_client(*, general: int, portal: int | None) -> TestClient:
+    app = FastAPI()
+
+    for path in (
+        "/api/v1/otp/request",
+        "/api/v1/guest/login/otp",
+        "/api/v1/guest/session/active",
+        "/api/v1/auth/login",
+    ):
+        app.add_api_route(path, lambda: {"ok": True}, methods=["GET"])
+
+    app.add_middleware(
+        RateLimitMiddleware,
+        redis=FakeRedis(),
+        max_requests=general,
+        window_seconds=60,
+        guest_portal_max_requests=portal,
+    )
+    return TestClient(app)
+
+
+def test_guest_portal_paths_get_the_venue_sized_cap() -> None:
+    client = _make_portal_client(general=2, portal=5)
+    for path in (
+        "/api/v1/otp/request",
+        "/api/v1/guest/login/otp",
+        "/api/v1/guest/session/active",
+    ):
+        statuses = [client.get(path).status_code for _ in range(6)]
+        assert statuses == [200] * 5 + [429], path
+
+
+def test_other_listed_paths_keep_the_general_cap() -> None:
+    client = _make_portal_client(general=2, portal=5)
+    statuses = [client.get("/api/v1/auth/login").status_code for _ in range(3)]
+    assert statuses == [200, 200, 429]
+
+
+def test_the_portal_cap_can_never_tighten_below_the_general_one() -> None:
+    client = _make_portal_client(general=4, portal=1)
+    statuses = [client.get("/api/v1/otp/request").status_code for _ in range(5)]
+    assert statuses == [200] * 4 + [429]
+
+
+def test_production_wiring_uses_600_for_guest_paths() -> None:
+    from app.core.config import Settings
+
+    assert Settings.model_fields[
+        "captive_portal_resolve_rate_limit_max_requests"
+    ].default == 600
+    import inspect
+
+    import app.main as main_module
+
+    assert "guest_portal_max_requests" in inspect.getsource(main_module.create_app)

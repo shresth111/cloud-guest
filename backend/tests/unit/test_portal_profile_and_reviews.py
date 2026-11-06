@@ -939,15 +939,16 @@ class TestReviewLinkOpened:
         assert guest_has_opened_review_link(updated) is True
 
     def test_the_request_body_cannot_name_a_destination(self) -> None:
-        """Two ids and nothing else. A URL on this request would let an
-        unauthenticated caller name a destination the platform then looks
-        to have recorded as its own -- the venue's link is already on the
-        config."""
+        """Two ids and the session proof, nothing else. A URL on this request
+        would let an unauthenticated caller name a destination the platform
+        then looks to have recorded as its own -- the venue's link is
+        already on the config."""
         from app.domains.guest.schemas import GuestReviewLinkOpenedRequest
 
         assert set(GuestReviewLinkOpenedRequest.model_fields) == {
             "guest_id",
             "session_id",
+            "session_token",
         }
 
 
