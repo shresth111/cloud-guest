@@ -8,11 +8,14 @@ from app.domains.provisioning_engine.planner.constants import (
     SAFETY_REVERT_SCHEDULER_COMMENT,
 )
 
+from .constants import escape_routeros_string as _shared_escape_routeros_string
 from .constants import wyfy_comment
 
 
 def _escape_routeros_string(value: str) -> str:
-    return value.replace("\\", "\\\\").replace('"', '\\"')
+    # One escaper for every renderer: see escape_routeros_string. Values
+    # without RouterOS-special characters render exactly as before.
+    return _shared_escape_routeros_string(value)
 
 
 def render_safety_revert_scheduler(

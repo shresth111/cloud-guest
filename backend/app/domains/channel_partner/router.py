@@ -18,6 +18,7 @@ from fastapi import APIRouter, Depends, Query, Request, status
 from app.common.responses import ApiResponse, build_response
 from app.domains.auth.models import AuthUser
 from app.domains.rbac.dependencies import CurrentUser, RequirePermission
+from app.domains.rbac.enums import ScopeType
 
 from .dependencies import get_channel_partner_service
 from .models import ChannelPartner
@@ -124,7 +125,9 @@ def _build_channel_result(
     "",
     response_model=ApiResponse[ChannelPartnerResponse],
     status_code=status.HTTP_201_CREATED,
-    dependencies=[Depends(RequirePermission("channel_partners.create"))],
+    dependencies=[
+        Depends(RequirePermission("channel_partners.create", scope=ScopeType.GLOBAL))
+    ],
 )
 async def onboard_channel_partner(
     request: Request,
@@ -154,7 +157,9 @@ async def onboard_channel_partner(
     "",
     response_model=ApiResponse[ChannelPartnerListResponse],
     status_code=status.HTTP_200_OK,
-    dependencies=[Depends(RequirePermission("channel_partners.read"))],
+    dependencies=[
+        Depends(RequirePermission("channel_partners.read", scope=ScopeType.GLOBAL))
+    ],
 )
 async def list_channel_partners(
     request: Request,
@@ -188,7 +193,9 @@ async def list_channel_partners(
     "/{channel_partner_id}",
     response_model=ApiResponse[ChannelPartnerResponse],
     status_code=status.HTTP_200_OK,
-    dependencies=[Depends(RequirePermission("channel_partners.read"))],
+    dependencies=[
+        Depends(RequirePermission("channel_partners.read", scope=ScopeType.GLOBAL))
+    ],
 )
 async def get_channel_partner(
     request: Request,
@@ -209,7 +216,9 @@ async def get_channel_partner(
     "/{channel_partner_id}/resend-welcome-message",
     response_model=ApiResponse[ChannelPartnerResendWelcomeResponse],
     status_code=status.HTTP_200_OK,
-    dependencies=[Depends(RequirePermission("channel_partners.manage"))],
+    dependencies=[
+        Depends(RequirePermission("channel_partners.manage", scope=ScopeType.GLOBAL))
+    ],
 )
 async def resend_channel_partner_welcome_message(
     request: Request,
@@ -267,7 +276,9 @@ async def resend_channel_partner_welcome_message(
     "/{channel_partner_id}/revoke",
     response_model=ApiResponse[ChannelPartnerResponse],
     status_code=status.HTTP_200_OK,
-    dependencies=[Depends(RequirePermission("channel_partners.manage"))],
+    dependencies=[
+        Depends(RequirePermission("channel_partners.manage", scope=ScopeType.GLOBAL))
+    ],
 )
 async def revoke_channel_partner(
     request: Request,

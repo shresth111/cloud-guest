@@ -47,6 +47,7 @@ from app.domains.notification.onboarding_slack import (
 )
 from app.domains.notification.tasks import dispatch_onboarding_failure
 from app.domains.rbac.dependencies import CurrentUser, RequirePermission
+from app.domains.rbac.enums import ScopeType
 
 from .dependencies import get_customer_provisioning_service
 from .schemas import OnboardRequest, OnboardResponse
@@ -63,7 +64,9 @@ def _request_id(request: Request) -> str:
     "/customers/onboard",
     response_model=ApiResponse[OnboardResponse],
     status_code=status.HTTP_201_CREATED,
-    dependencies=[Depends(RequirePermission("organizations.create"))],
+    dependencies=[
+        Depends(RequirePermission("organizations.create", scope=ScopeType.GLOBAL))
+    ],
 )
 async def onboard_customer(
     request: Request,

@@ -41,6 +41,7 @@ from app.domains.rbac.dependencies import (
     CurrentUser,
     RequirePermission,
 )
+from app.domains.rbac.enums import ScopeType
 
 from .dependencies import get_organization_service
 from .enums import MembershipStatus, OrganizationStatus, OrganizationType
@@ -174,7 +175,9 @@ async def list_organizations(
     "/organizations",
     response_model=ApiResponse[OrganizationResponse],
     status_code=status.HTTP_201_CREATED,
-    dependencies=[Depends(RequirePermission("organizations.create"))],
+    dependencies=[
+        Depends(RequirePermission("organizations.create", scope=ScopeType.GLOBAL))
+    ],
 )
 async def create_organization(
     request: Request,

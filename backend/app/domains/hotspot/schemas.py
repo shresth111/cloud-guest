@@ -13,6 +13,7 @@ from datetime import datetime
 
 from pydantic import BaseModel, Field
 
+from app.common.routeros_text import RouterOSSafeText
 from app.domains.auth.schemas import MessageResponse
 from app.domains.hotspot.constants import MAX_WALLED_GARDEN_HOSTS
 
@@ -27,7 +28,7 @@ __all__ = [
 
 class HotspotProfileCreateRequest(BaseModel):
     router_id: str
-    name: str
+    name: RouterOSSafeText
     session_timeout_minutes: int | None = Field(default=None, ge=1)
     idle_timeout_minutes: int | None = Field(default=None, ge=1)
     upload_limit_kbps: int | None = Field(default=None, ge=1)
@@ -39,7 +40,7 @@ class HotspotProfileCreateRequest(BaseModel):
 
 
 class HotspotProfileUpdateRequest(BaseModel):
-    name: str | None = None
+    name: RouterOSSafeText | None = None
     session_timeout_minutes: int | None = Field(default=None, ge=1)
     idle_timeout_minutes: int | None = Field(default=None, ge=1)
     upload_limit_kbps: int | None = Field(default=None, ge=1)

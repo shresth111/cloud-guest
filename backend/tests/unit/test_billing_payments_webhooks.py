@@ -53,6 +53,7 @@ from app.domains.billing.exceptions import (
     PaymentNotRetryableError,
     RefundExceedsRefundableAmountError,
     UnsupportedPaymentProviderError,
+    WebhookSecretNotConfiguredError,
     WebhookSignatureInvalidError,
 )
 from app.domains.billing.models import Payment, PaymentMethod, Plan, Subscription
@@ -1254,6 +1255,48 @@ class TestRazorpayWebhookSignature:
             verify_razorpay_signature(
                 payload, signature=signature, secret="secret_wrong"
             )
+
+
+class TestUnconfiguredWebhookSecretRefused:
+    """Security review 2026-11-06, H2: an unset secret means accept nothing.
+    An HMAC keyed with "" is computable by anyone, so a correctly "signed"
+    forged event must still be refused (503, so the provider retries)."""
+
+    @pytest.mark.parametrize("secret", ["", "   "])
+    def test_razorpay_empty_secret_refuses_even_a_matching_signature(
+        self, secret: str
+    ) -> None:
+        payload = b'{"event": "payment.captured"}'
+        forged = _razorpay_signature_header(payload, secret)
+        with pytest.raises(WebhookSecretNotConfiguredError) as caught:
+            verify_razorpay_signature(payload, signature=forged, secret=secret)
+        assert caught.value.status_code == 503
+
+    @pytest.mark.parametrize("secret", ["", "   "])
+    def test_stripe_empty_secret_refused(self, secret: str) -> None:
+        payload = b'{"id": "evt_1", "object": "event"}'
+        with pytest.raises(WebhookSecretNotConfiguredError):
+            verify_stripe_event(
+                payload,
+                signature_header="t=1,v1=00",
+                secret=secret,
+                tolerance_seconds=300,
+            )
+
+    def test_strict_check_and_startup_warning_name_unset_secrets(self) -> None:
+        from app.core.config import Settings
+
+        prod = Settings(
+            environment="production",
+            stripe_webhook_secret="",
+            razorpay_webhook_secret="whsec_real",
+        )
+        assert prod.unset_payment_webhook_secrets() == [
+            "CLOUDGUEST_STRIPE_WEBHOOK_SECRET"
+        ]
+        with pytest.raises(ValueError, match="CLOUDGUEST_STRIPE_WEBHOOK_SECRET"):
+            prod.validate_no_public_secrets()
+        assert Settings(environment="local").unset_payment_webhook_secrets() == []
 
 
 # ============================================================================

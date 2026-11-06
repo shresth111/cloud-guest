@@ -420,6 +420,20 @@ class PaymentProviderError(BillingError):
         super().__init__(message, status_code=status.HTTP_502_BAD_GATEWAY)
 
 
+class WebhookSecretNotConfiguredError(BillingError):
+    """A payment webhook arrived but this deployment has no signing secret
+    for that provider. An HMAC keyed with an empty string is something
+    anyone can compute, so "no secret" must mean "accept nothing", never
+    "verify against nothing". 503 rather than 4xx: the provider retries,
+    and the event is processed once the secret is set."""
+
+    def __init__(self, provider: str) -> None:
+        super().__init__(
+            f"{provider} webhooks are not configured on this deployment",
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        )
+
+
 class WebhookSignatureInvalidError(BillingError):
     """Raised by ``webhooks.py``'s real HMAC-SHA256 signature verification
     (Stripe's timestamped-payload scheme, Razorpay's raw-body scheme) --

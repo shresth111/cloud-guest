@@ -35,6 +35,7 @@ from fastapi import APIRouter, Depends, Query, Request, status
 from app.common.responses import ApiResponse, build_response
 from app.domains.auth.models import AuthUser
 from app.domains.rbac.dependencies import CurrentUser, RequirePermission
+from app.domains.rbac.enums import ScopeType
 
 from .dependencies import get_demo_request_service
 from .models import DemoRequest
@@ -117,7 +118,9 @@ async def submit_demo_request(
     "",
     response_model=ApiResponse[DemoRequestListResponse],
     status_code=status.HTTP_200_OK,
-    dependencies=[Depends(RequirePermission("demo_requests.read"))],
+    dependencies=[
+        Depends(RequirePermission("demo_requests.read", scope=ScopeType.GLOBAL))
+    ],
 )
 async def list_demo_requests(
     request: Request,
@@ -156,7 +159,9 @@ async def list_demo_requests(
     "/{demo_request_id}",
     response_model=ApiResponse[DemoRequestResponse],
     status_code=status.HTTP_200_OK,
-    dependencies=[Depends(RequirePermission("demo_requests.read"))],
+    dependencies=[
+        Depends(RequirePermission("demo_requests.read", scope=ScopeType.GLOBAL))
+    ],
 )
 async def get_demo_request(
     request: Request,
@@ -176,7 +181,9 @@ async def get_demo_request(
     "/{demo_request_id}",
     response_model=ApiResponse[DemoRequestResponse],
     status_code=status.HTTP_200_OK,
-    dependencies=[Depends(RequirePermission("demo_requests.manage"))],
+    dependencies=[
+        Depends(RequirePermission("demo_requests.manage", scope=ScopeType.GLOBAL))
+    ],
 )
 async def update_demo_request(
     request: Request,

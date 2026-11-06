@@ -14,6 +14,7 @@ from datetime import datetime
 
 from pydantic import BaseModel, Field
 
+from app.common.routeros_text import RouterOSSafeText
 from app.domains.auth.schemas import MessageResponse
 
 __all__ = [
@@ -27,7 +28,7 @@ __all__ = [
 
 class PortForwardingRuleCreateRequest(BaseModel):
     router_id: str
-    name: str
+    name: RouterOSSafeText
     protocol: str = "both"
     source_address: str | None = None
     destination_address: str | None = None
@@ -39,7 +40,7 @@ class PortForwardingRuleCreateRequest(BaseModel):
 
 
 class PortForwardingRuleUpdateRequest(BaseModel):
-    name: str | None = None
+    name: RouterOSSafeText | None = None
     protocol: str | None = None
     source_address: str | None = None
     destination_address: str | None = None

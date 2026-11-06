@@ -107,6 +107,7 @@ from .events import WebhookProcessed, WebhookSignatureInvalid
 from .exceptions import (
     InvalidLicenseStatusTransitionError,
     LicenseNotFoundError,
+    WebhookSecretNotConfiguredError,
     WebhookSignatureInvalidError,
 )
 from .models import Payment
@@ -168,6 +169,18 @@ class WebhookAuditWriterProtocol(Protocol):
 # ============================================================================
 
 
+def _require_webhook_secret(provider: str, secret: str | None) -> None:
+    """Refuse to verify against an empty secret (see
+    ``WebhookSecretNotConfiguredError``). Logged at ERROR so an operator
+    who expects payments to flow sees why they are not."""
+    if secret is None or not secret.strip():
+        logger.error(
+            "payment_webhook_secret_missing",
+            extra={"provider": provider},
+        )
+        raise WebhookSecretNotConfiguredError(provider)
+
+
 def verify_stripe_event(
     payload: bytes, *, signature_header: str, secret: str, tolerance_seconds: int
 ) -> stripe.Event:
@@ -175,6 +188,7 @@ def verify_stripe_event(
     exact scheme. Raises ``WebhookSignatureInvalidError`` (never a raw SDK
     exception) on any failure: bad signature, tampered payload, or a
     timestamp outside ``tolerance_seconds``."""
+    _require_webhook_secret("Stripe", secret)
     try:
         return stripe.Webhook.construct_event(
             payload, signature_header, secret, tolerance=tolerance_seconds
@@ -190,6 +204,7 @@ def verify_razorpay_signature(payload: bytes, *, signature: str, secret: str) ->
     the exact scheme (HMAC-SHA256 of the raw body, constant-time compare;
     no timestamp/replay-tolerance component exists in Razorpay's own real
     scheme). Raises ``WebhookSignatureInvalidError`` on mismatch."""
+    _require_webhook_secret("Razorpay", secret)
     utility = razorpay.Utility()
     try:
         utility.verify_webhook_signature(payload.decode("utf-8"), signature, secret)
