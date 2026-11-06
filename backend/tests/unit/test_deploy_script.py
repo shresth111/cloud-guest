@@ -278,9 +278,13 @@ def _run_cloudflare(
     """Extract the real `materialise_cloudflare_env` and run it against a fake
     aws. Returns (file contents, combined output, file path)."""
     source = _script()
-    start = source.index("materialise_cloudflare_env() {")
-    end = source.index("\n}\n", start) + len("\n}\n")
-    (tmp_path / "fn.sh").write_text(source[start:end], encoding="utf-8")
+    # The function plus the two helpers its failure path calls.
+    chunks = []
+    for name in ("aws_error_code", "secret_read_failed", "materialise_cloudflare_env"):
+        start = source.index(f"{name}() {{")
+        end = source.index("\n}\n", start) + len("\n}\n")
+        chunks.append(source[start:end])
+    (tmp_path / "fn.sh").write_text("\n".join(chunks), encoding="utf-8")
 
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
@@ -349,11 +353,22 @@ def test_half_a_cloudflare_pair_writes_nothing(tmp_path: Path) -> None:
 
 
 def test_a_denied_cloudflare_secret_does_not_fail_the_deploy(tmp_path: Path) -> None:
-    written, _, target = _run_cloudflare(
+    written, output, target = _run_cloudflare(
         tmp_path, "An error occurred (AccessDeniedException)", aws_exit=254
     )
     assert written == ""
     assert target.exists(), "compose refuses to start on a missing env_file"
+    # Reported for cd.yml's summary, never silent.
+    assert "DEPLOY-WARNING: AccessDeniedException" in output
+
+
+def test_a_denied_cloudflare_secret_keeps_the_last_good_file(tmp_path: Path) -> None:
+    previous = "CLOUDGUEST_CLOUDFLARE_ACCOUNT_ID=kept\n"
+    (tmp_path / "cloudflare.env").write_text(previous, encoding="utf-8")
+    written, _, _ = _run_cloudflare(
+        tmp_path, "An error occurred (AccessDeniedException)", aws_exit=254
+    )
+    assert written == previous
 
 
 def test_a_cloudflare_secret_that_is_not_json_writes_nothing(tmp_path: Path) -> None:
