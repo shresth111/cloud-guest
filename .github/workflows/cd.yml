@@ -1,7 +1,7 @@
 name: CD
 
 # Continuous deployment of the backend (api + celery-worker + celery-beat) to
-# the app server, i-0cf9b79511abe6000 in ap-south-1.
+# the app server in ap-south-1.
 #
 # HOW A GITHUB RUNNER REACHES A BOX THAT HAS NO INBOUND SSH
 # ---------------------------------------------------------
@@ -41,6 +41,26 @@ name: CD
 # workflow_dispatch and set image_tag to an older commit SHA. Note that
 # rolling the IMAGE back does not roll a MIGRATION back -- that is what the
 # pre-deploy dump is for.
+#
+# A rollback skips CI (the SHA already passed it on main), so the SHA is
+# checked before anything uses it: it must be a full 40-character lowercase
+# hex SHA, and it must be an ancestor of origin/main. Anything else -- a branch
+# name, a short SHA, a commit that only exists on an unmerged branch, or shell
+# metacharacters -- fails the run before checkout. The input only ever reaches
+# a shell through `env:`, never as an inline expression inside `run:`.
+#
+# WHAT THE (PUBLIC) LOG MAY SHOW
+# ------------------------------
+# These logs are world-readable. Every AWS job starts with a step that
+# registers the deploy role ARN, its name, the account id and the instance id
+# with `::add-mask::`, so later lines print *** in their place (that includes
+# the ECR registry host and anything the box prints). The values come from
+# secrets.AWS_DEPLOY_ROLE_ARN / secrets.APP_INSTANCE_ID when set (secrets are
+# masked from the first line) and fall back to the repository variables of the
+# same name; with the variable fallback the mask step's own env header still
+# shows them once. Job outputs carry only the SHA and `repo:tag`, never the
+# registry host: GitHub silently drops a job output that contains a masked
+# value.
 
 on:
   push:
@@ -78,7 +98,6 @@ permissions:
 env:
   AWS_REGION: ap-south-1
   ECR_REPOSITORY: wyfy/api
-  INSTANCE_ID: i-0cf9b79511abe6000
 
 jobs:
   # Gate on the existing CI rather than restating it. ci.yml gained an
@@ -95,53 +114,115 @@ jobs:
     if: always() && (needs.ci.result == 'success' || github.event.inputs.image_tag != '')
     runs-on: ubuntu-latest
     outputs:
-      image: ${{ steps.meta.outputs.image }}
+      # The SHA and repo:tag only. The full ref contains the (masked) account
+      # id, and GitHub drops any job output that contains a masked value.
+      sha: ${{ steps.meta.outputs.sha }}
+      image_name: ${{ steps.meta.outputs.image_name }}
     steps:
-      - uses: actions/checkout@v4
+      - name: Mask infrastructure identifiers
+        env:
+          ROLE_ARN: ${{ secrets.AWS_DEPLOY_ROLE_ARN || vars.AWS_DEPLOY_ROLE_ARN }}
+        run: |
+          set -euo pipefail
+          if [ -z "$ROLE_ARN" ]; then
+            echo "::error::AWS_DEPLOY_ROLE_ARN is set neither as a secret nor as a variable."
+            exit 1
+          fi
+          ACCOUNT_ID="$(cut -d: -f5 <<<"$ROLE_ARN")"
+          echo "::add-mask::$ROLE_ARN"
+          echo "::add-mask::${ROLE_ARN##*/}"
+          echo "::add-mask::$ACCOUNT_ID"
+          echo "masked: deploy role, role name, account id"
+
+      # Runs BEFORE checkout: nothing touches the input until it is proven to
+      # be a bare SHA. Ancestry is checked after checkout, below.
+      - name: Validate the rollback SHA
+        id: sha
+        env:
+          IMAGE_TAG: ${{ github.event.inputs.image_tag }}
+          DEFAULT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [ -z "$IMAGE_TAG" ]; then
+            echo "sha=$DEFAULT_SHA" >> "$GITHUB_OUTPUT"
+            echo "rollback=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if ! [[ "$IMAGE_TAG" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::image_tag must be a full 40-character lowercase commit SHA."
+            exit 1
+          fi
+          echo "sha=$IMAGE_TAG" >> "$GITHUB_OUTPUT"
+          echo "rollback=true" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
-          ref: ${{ github.event.inputs.image_tag || github.sha }}
+          ref: ${{ steps.sha.outputs.sha }}
+          # A rollback needs main's history to prove ancestry; a normal push
+          # does not, and a full clone is slower.
+          fetch-depth: ${{ steps.sha.outputs.rollback == 'true' && '0' || '1' }}
+
+      - name: Require the rollback SHA to be on main
+        if: steps.sha.outputs.rollback == 'true'
+        env:
+          SHA: ${{ steps.sha.outputs.sha }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --quiet origin +refs/heads/main:refs/remotes/origin/main
+          if ! git merge-base --is-ancestor "$SHA" origin/main; then
+            echo "::error::$SHA is not an ancestor of origin/main. Only commits that were merged to main (and so passed CI there) can be redeployed."
+            exit 1
+          fi
+          echo "rollback target $SHA is on main"
 
       - name: Configure AWS credentials (OIDC)
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4.3.1
         with:
-          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN || vars.AWS_DEPLOY_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
+          mask-aws-account-id: true
 
       - name: Log in to ECR
         id: ecr
-        uses: aws-actions/amazon-ecr-login@v2
+        uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2.1.7
 
       - name: Resolve image ref
         id: meta
         env:
           REGISTRY: ${{ steps.ecr.outputs.registry }}
+          SHA: ${{ steps.sha.outputs.sha }}
         run: |
-          SHA="${{ github.event.inputs.image_tag || github.sha }}"
-          echo "image=$REGISTRY/$ECR_REPOSITORY:$SHA" >> "$GITHUB_OUTPUT"
-          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          {
+            echo "image=$REGISTRY/$ECR_REPOSITORY:$SHA"
+            echo "image_name=$ECR_REPOSITORY:$SHA"
+            echo "sha=$SHA"
+          } >> "$GITHUB_OUTPUT"
 
       # A workflow_dispatch rollback names a SHA that was already built and
       # pushed. Rebuilding it would be slower and, if a base image moved,
       # would not even produce the same artifact -- so reuse it if it exists.
       - name: Reuse the existing image if this SHA is already in ECR
         id: exists
+        env:
+          SHA: ${{ steps.meta.outputs.sha }}
+          IMAGE_NAME: ${{ steps.meta.outputs.image_name }}
         run: |
           if aws ecr describe-images --region "$AWS_REGION" \
                --repository-name "$ECR_REPOSITORY" \
-               --image-ids imageTag="${{ steps.meta.outputs.sha }}" >/dev/null 2>&1; then
+               --image-ids imageTag="$SHA" >/dev/null 2>&1; then
             echo "found=true" >> "$GITHUB_OUTPUT"
-            echo "::notice::${{ steps.meta.outputs.image }} already exists; skipping build."
+            echo "::notice::$IMAGE_NAME already exists; skipping build."
           else
             echo "found=false" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Set up Buildx
         if: steps.exists.outputs.found == 'false'
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
 
       - name: Build and push
         if: steps.exists.outputs.found == 'false'
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: backend
           file: backend/Dockerfile
@@ -177,8 +258,10 @@ jobs:
       # rollback path prove the artifact starts, rather than assuming it does
       # because it once got as far as being pushed.
       - name: Smoke-test the image imports
+        env:
+          IMAGE: ${{ steps.meta.outputs.image }}
         run: |
-          docker run --rm --entrypoint python "${{ steps.meta.outputs.image }}" \
+          docker run --rm --entrypoint python "$IMAGE" \
             -c "import app.main; print('app.main imported OK')"
 
   deploy:
@@ -193,17 +276,50 @@ jobs:
       name: production
       url: https://app.wyfyguest.com
     steps:
-      - uses: actions/checkout@v4
+      # Same masking as the build job, plus the instance id. INSTANCE_ID and
+      # ACCOUNT_ID go to GITHUB_ENV only after they are masked, so every later
+      # step header shows ***.
+      - name: Mask infrastructure identifiers
+        env:
+          ROLE_ARN: ${{ secrets.AWS_DEPLOY_ROLE_ARN || vars.AWS_DEPLOY_ROLE_ARN }}
+          # Fallback literal: neither the secret nor the variable exists yet,
+          # and CD must keep working until the owner adds one (it was already
+          # in this public file before). Delete the fallback once
+          # secrets.APP_INSTANCE_ID is set.
+          APP_INSTANCE_ID: ${{ secrets.APP_INSTANCE_ID || vars.APP_INSTANCE_ID || 'i-0cf9b79511abe6000' }}
+        run: |
+          set -euo pipefail
+          if [ -z "$ROLE_ARN" ]; then
+            echo "::error::AWS_DEPLOY_ROLE_ARN is set neither as a secret nor as a variable."
+            exit 1
+          fi
+          if [ -z "$APP_INSTANCE_ID" ]; then
+            echo "::error::No app instance id (secret/variable APP_INSTANCE_ID)."
+            exit 1
+          fi
+          ACCOUNT_ID="$(cut -d: -f5 <<<"$ROLE_ARN")"
+          echo "::add-mask::$ROLE_ARN"
+          echo "::add-mask::${ROLE_ARN##*/}"
+          echo "::add-mask::$ACCOUNT_ID"
+          echo "::add-mask::$APP_INSTANCE_ID"
+          echo "INSTANCE_ID=$APP_INSTANCE_ID" >> "$GITHUB_ENV"
+          echo "ACCOUNT_ID=$ACCOUNT_ID" >> "$GITHUB_ENV"
+          echo "masked: deploy role, role name, account id, instance id"
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       - name: Configure AWS credentials (OIDC)
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4.3.1
         with:
-          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN || vars.AWS_DEPLOY_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
+          mask-aws-account-id: true
 
       # Fail with a sentence a human can act on, rather than with a 60-second
       # SendCommand timeout, when the instance is not registered with SSM.
-      # (It was not, on 2026-08-27: the agent runs, but wyfy-app-ec2-role had
+      # (It was not, on 2026-08-27: the agent runs, but the instance role had
       # no ssm:UpdateInstanceInformation. See the enable-list.)
       - name: Check the instance is registered with SSM
         run: |
@@ -212,9 +328,9 @@ jobs:
             --filters "Key=InstanceIds,Values=$INSTANCE_ID" \
             --query 'length(InstanceInformationList)' --output text)
           if [ "$COUNT" != "1" ]; then
-            echo "::error::$INSTANCE_ID is not registered with SSM."
+            echo "::error::The app instance is not registered with SSM."
             echo "The agent is installed and running on the box; what it needs is"
-            echo "AmazonSSMManagedInstanceCore attached to wyfy-app-ec2-role."
+            echo "AmazonSSMManagedInstanceCore attached to the instance role."
             exit 1
           fi
           aws ssm describe-instance-information --region "$AWS_REGION" \
@@ -224,9 +340,13 @@ jobs:
       - name: Send deploy command
         id: send
         env:
-          IMAGE: ${{ needs.build.outputs.image }}
+          SHA: ${{ needs.build.outputs.sha }}
         run: |
           set -euo pipefail
+          # Rebuilt here rather than passed from the build job: the registry
+          # host contains the masked account id, and a job output containing a
+          # masked value is dropped.
+          IMAGE="$ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPOSITORY:$SHA"
           # The script is shipped inside the command payload rather than kept
           # on the box, so the version that runs is always the version in this
           # commit and there is no bootstrap step to forget. base64 keeps the
@@ -258,6 +378,7 @@ jobs:
           echo "SSM command: $CMD_ID"
 
       - name: Wait for the deploy to finish
+        id: wait
         env:
           CMD_ID: ${{ steps.send.outputs.command_id }}
         run: |
@@ -280,7 +401,8 @@ jobs:
           echo "----- stdout -----"
           aws ssm get-command-invocation --region "$AWS_REGION" \
             --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" \
-            --query 'StandardOutputContent' --output text || true
+            --query 'StandardOutputContent' --output text > deploy-stdout.txt || true
+          cat deploy-stdout.txt
           echo "----- stderr -----"
           aws ssm get-command-invocation --region "$AWS_REGION" \
             --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" \
@@ -290,6 +412,27 @@ jobs:
           # is being debugged from a truncated log, add an S3 output config to
           # send-command above rather than guessing.
           echo "----- status: $STATUS -----"
+
+          # remote-deploy.sh prints `DEPLOY-WARNING: ...` when it could not
+          # read a secret (e.g. AccessDenied on the Slack webhook secret). The
+          # deploy itself goes ahead -- an unreadable optional secret must not
+          # block shipping -- but it must not be silent either: surface each
+          # one as an annotation and in the job summary. The last step of this
+          # job turns the run red only when CD_FAIL_ON_SECRET_WARNINGS=true.
+          WARNINGS="$(grep -o 'DEPLOY-WARNING: .*' deploy-stdout.txt || true)"
+          if [ -n "$WARNINGS" ]; then
+            {
+              echo "### Deploy finished with secret warnings"
+              echo
+              echo "The image shipped, but the box could not read one or more secrets, so the feature each one configures is OFF:"
+              echo
+              while IFS= read -r line; do echo "- ${line#DEPLOY-WARNING: }"; done <<<"$WARNINGS"
+            } >> "$GITHUB_STEP_SUMMARY"
+            while IFS= read -r line; do echo "::warning title=Secret not read on the box::${line#DEPLOY-WARNING: }"; done <<<"$WARNINGS"
+            echo "secret_warnings=$(grep -c . <<<"$WARNINGS")" >> "$GITHUB_OUTPUT"
+          else
+            echo "secret_warnings=0" >> "$GITHUB_OUTPUT"
+          fi
           [ "$STATUS" = "Success" ] || exit 1
 
       # Independent of the box's own healthcheck: proves the deployed API is
@@ -310,6 +453,25 @@ jobs:
           echo "The container passed its own healthcheck, so suspect nginx or TLS"
           echo "rather than the image. The previous image is still in ECR:"
           echo "  gh workflow run cd.yml -f image_tag=<previous-sha>"
+          exit 1
+
+      # Last, so it can only fire after the deploy and the public check have
+      # both passed: the new image IS live. What it reports is that a secret
+      # the box needed could not be read (today: the Slack webhook secret, an
+      # IAM grant missing on the instance role).
+      #
+      # Opt-in, not the default. Until that grant exists every run would be
+      # red after a deploy that worked, and a run that is always red hides the
+      # run that is red for a real reason (and invites rolling back a good
+      # deploy). The warning annotations and the job summary above always
+      # appear. Set the repository variable CD_FAIL_ON_SECRET_WARNINGS=true
+      # once the instance role can read every secret.
+      - name: Fail if the box could not read a secret
+        if: steps.wait.outputs.secret_warnings != '0' && vars.CD_FAIL_ON_SECRET_WARNINGS == 'true'
+        env:
+          COUNT: ${{ steps.wait.outputs.secret_warnings }}
+        run: |
+          echo "::error::$COUNT secret(s) could not be read on the box; see the job summary. The deploy itself succeeded and is live."
           exit 1
 
   # ---------------------------------------------------------------------------
@@ -345,7 +507,7 @@ jobs:
       # can be used. Sparse-checked-out: this job wants one action.yml, not a
       # backend, a node_modules-sized frontend, or a vendored gateway.
       - name: Check out the composite action
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           sparse-checkout: .github/actions
           sparse-checkout-cone-mode: false
@@ -359,7 +521,10 @@ jobs:
           environment: production
           # Empty when the build job was skipped, which the action handles by
           # leaving the field out rather than printing an empty one.
-          image: ${{ needs.build.outputs.image }}
+          # repo:tag, not the registry host (see the masking note at the top).
+          image: ${{ needs.build.outputs.image_name }}
           # On a workflow_dispatch rollback the thing that shipped is an older
           # commit than the ref this run is on; say which one it actually was.
-          commit_sha: ${{ github.event.inputs.image_tag || github.sha }}
+          # The validated SHA from the build job; github.sha if build never
+          # got that far.
+          commit_sha: ${{ needs.build.outputs.sha || github.sha }}

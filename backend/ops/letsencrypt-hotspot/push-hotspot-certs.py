@@ -16,10 +16,10 @@ its Fernet key to decrypt each router's own API credential -- and because the
 router's fetch URL must be minted on a host that is actually on the WireGuard
 tunnel.
 
-    docker compose exec -T api python /opt/wyfy/push-hotspot-certs.py \\
-        --fullchain /etc/letsencrypt/live/wyfy-hotspot-fleet/fullchain.pem \\
-        --privkey   /etc/letsencrypt/live/wyfy-hotspot-fleet/privkey.pem \\
-        --bind-host <this host's WireGuard tunnel address>
+    # normally via renew-hotspot-certs.sh, which runs this in a throwaway
+    # container of the api image with --network host; by hand:
+    sudo ./renew-hotspot-certs.sh --dry-run
+    sudo ONLY_ROUTER=<name> ./renew-hotspot-certs.sh --push-only
 
 ``--bind-host`` is not optional and is not guessed. It decides which interface
 the fleet private key is briefly readable on, and that must be a decision
@@ -102,6 +102,15 @@ async def _main(args: argparse.Namespace) -> int:
     )
     for skip in skipped:
         _err(f"SKIP\t{skip.name}\t{skip.reason}")
+    if args.only:
+        wanted = set(args.only)
+        for target in targets:
+            if target.name not in wanted:
+                _err(f"SKIP\t{target.name}\tnot named by --only")
+        targets = [t for t in targets if t.name in wanted]
+        missing = wanted - {t.name for t in targets}
+        for name in sorted(missing):
+            _err(f"SKIP\t{name}\tnamed by --only but not pushable (see above)")
     _err(f"INVENTORY\t{len(targets)} pushable of {len(routers)} router(s)")
 
     if args.dry_run:
@@ -172,6 +181,15 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--cert-name", default=DEFAULT_CERT_NAME)
     parser.add_argument("--hotspot-profile", default=DEFAULT_HOTSPOT_PROFILE)
+    parser.add_argument(
+        "--only",
+        action="append",
+        metavar="ROUTER_NAME",
+        help=(
+            "push to this router only (repeatable). For the supervised "
+            "single-router test before the first fleet-wide run."
+        ),
+    )
     parser.add_argument(
         "--dry-run",
         action="store_true",

@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 #
-# On-box half of the CD pipeline. Runs on the app server (i-0cf9b79511abe6000)
-# as `ubuntu`, delivered by SSM SendCommand from GitHub Actions -- the whole
+# On-box half of the CD pipeline. Runs on the app server as `ubuntu`, delivered by SSM SendCommand from GitHub Actions -- the whole
 # file is base64'd into the command payload, so there is nothing to bootstrap
 # on the box and the version that runs is always the version in the repo that
 # triggered the deploy.
@@ -51,7 +50,11 @@
 #     `image: ${FRONTEND_IMAGE}` instead of `build:` stanzas -- the version
 #     committed alongside this file at deploy/docker-compose.prod.yml.
 #   * The instance role can pull from ECR and (for api) write to
-#     s3://wyfy-guest-app-storage-1787805585.
+#     s3://$BACKUP_BUCKET (default below; override in the environment).
+#
+# EVERYTHING THIS SCRIPT PRINTS ENDS UP IN A PUBLIC ACTIONS LOG. Print status,
+# key names and S3 *keys*; never bucket names, ARNs, or raw AWS error text
+# (which embeds the caller's role ARN and account id) -- see aws_error_code.
 #
 set -euo pipefail
 
@@ -204,14 +207,14 @@ docker pull "$IMAGE" >/dev/null || die "docker pull $IMAGE failed; nothing chang
 if [[ "$SERVICE" == "api" && "$DB_BACKUP" == "1" ]]; then
   STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
   KEY="db-backups/pre-deploy-$STAMP.sql.gz"
-  log "dumping database to s3://$BACKUP_BUCKET/$KEY"
+  log "dumping database to the backup bucket: $KEY"
   if docker exec deploy-postgres-1 pg_dump -U cloudguest -d cloudguest \
        | gzip -9 \
        | aws s3 cp - "s3://$BACKUP_BUCKET/$KEY" --region "$REGION" >/dev/null; then
-    log "backup ok: s3://$BACKUP_BUCKET/$KEY"
+    log "backup ok: $KEY"
   else
     die "pre-deploy database backup FAILED. Refusing to run migrations without one.
-     Fix the backup path (instance role s3:PutObject on $BACKUP_BUCKET) or
+     Fix the backup path (instance role s3:PutObject on the backup bucket) or
      re-run with DB_BACKUP=0 if you have a dump from elsewhere."
   fi
 fi
@@ -223,6 +226,46 @@ set_var() {
   grep -vE "^$name=" "$ENV_FILE" > "$tmp" || true
   printf '%s=%s\n' "$name" "$value" >> "$tmp"
   mv "$tmp" "$ENV_FILE"
+}
+
+# --- secret reads ------------------------------------------------------------
+# The AWS CLI's error text names the calling role's ARN (account id included),
+# and this script's output is printed in a public Actions log. Print the error
+# CODE only.
+aws_error_code() {
+  local code
+  code="$(sed -n 's/.*An error occurred (\([A-Za-z]*\)).*/\1/p' <<<"$1" | head -1)"
+  echo "${code:-UnknownError}"
+}
+
+# A Secrets Manager read failed. Two different situations, handled differently:
+#
+#   * ResourceNotFoundException -- the secret does not exist. That is the
+#     documented "not configured" state of every optional feature here, so the
+#     env file is emptied and the feature is inert, exactly as before.
+#   * anything else (AccessDenied above all, but also throttling or a network
+#     blip) -- the secret exists and SHOULD be read. The env file is left with
+#     its previous contents (last known good) instead of being emptied, and a
+#     `DEPLOY-WARNING:` line is printed. cd.yml turns each of those into a
+#     ::warning:: annotation and a job-summary entry (and fails the run after
+#     the deploy has completed when the repository variable
+#     CD_FAIL_ON_SECRET_WARNINGS=true). The deploy itself is not blocked: an optional
+#     feature's secret must never stop the API from shipping.
+#
+# Before this, AccessDenied on the Slack secret emptied slack.env on six CD
+# runs in a row while every run went green.
+secret_read_failed() {
+  local id="$1" file="$2" raw="$3" feature="$4" code name
+  code="$(aws_error_code "$raw")"
+  name="$(basename "$file")"
+  if [[ "$code" == "ResourceNotFoundException" ]]; then
+    : > "$file"; chmod 600 "$file"
+    log "secret '$id' does not exist -- $feature not configured ($name emptied)"
+    return 0
+  fi
+  touch "$file"; chmod 600 "$file"
+  log "WARNING: could not read secret '$id' ($code) -- $name keeps its previous contents"
+  log "DEPLOY-WARNING: $code reading secret '$id' -- $feature may be off ($name left as it was)"
 }
 
 # --- mail.env, from Secrets Manager ---------------------------------------
@@ -238,9 +281,10 @@ set_var() {
 #     password to authenticate it -- that turns "not configured yet" into "tries
 #     and fails on every send". Blank password = that mailbox is left exactly as
 #     the box has it today.
-#   * Every failure is fail-open: a missing secret, a denied GetSecretValue, a
-#     broken JSON or a box without python3 all log a WARNING and write an empty
-#     file. Mail configuration is not what a deploy is for, and a deploy that
+#   * Every failure is fail-open: a missing secret, a broken JSON or a box
+#     without python3 all log a WARNING and write an empty file; a secret that
+#     exists but cannot be read (AccessDenied) keeps the previous file and is
+#     reported loudly -- see secret_read_failed. Mail configuration is not what a deploy is for, and a deploy that
 #     refuses to ship an image because a secret could not be read is a worse
 #     outage than an unfilled mailbox.
 #
@@ -251,15 +295,13 @@ materialise_mail_env() {
     log "MAIL_SECRET_ID is empty -- leaving $MAIL_ENV_FILE alone"
     return 0
   fi
-  : > "$MAIL_ENV_FILE"; chmod 600 "$MAIL_ENV_FILE"
-
   local raw summary
   if ! raw="$(aws secretsmanager get-secret-value --region "$REGION" \
                 --secret-id "$MAIL_SECRET_ID" --query SecretString --output text 2>&1)"; then
-    log "WARNING: could not read secret '$MAIL_SECRET_ID' ($raw)"
-    log "WARNING: continuing with no mail overrides -- mail behaviour is unchanged"
+    secret_read_failed "$MAIL_SECRET_ID" "$MAIL_ENV_FILE" "$raw" "outgoing-mail overrides"
     return 0
   fi
+  : > "$MAIL_ENV_FILE"; chmod 600 "$MAIL_ENV_FILE"
 
   # The JSON arrives on STDIN, so the program cannot also come from stdin
   # (`python3 -` would consume it and hand json.load an empty string -- the
@@ -332,9 +374,10 @@ PY
 # with CLOUDGUEST_SLACK_, so a stray key added to the secret cannot become
 # backend configuration by accident.
 #
-# Every failure path is "continue with no webhook", never "fail the deploy". An
-# unreadable secret must not take the API down, and the feature it configures
-# is optional by design.
+# Every failure path is "continue", never "fail the deploy". An unreadable
+# secret must not take the API down, and the feature it configures is optional
+# by design. But an AccessDenied is reported loudly (secret_read_failed), not
+# folded into "not configured".
 #
 # Nothing here prints a value: the log names which keys were written.
 materialise_slack_env() {
@@ -342,15 +385,13 @@ materialise_slack_env() {
     log "SLACK_SECRET_ID is empty -- leaving $SLACK_ENV_FILE alone"
     return 0
   fi
-  : > "$SLACK_ENV_FILE"; chmod 600 "$SLACK_ENV_FILE"
-
   local raw summary
   if ! raw="$(aws secretsmanager get-secret-value --region "$REGION" \
                 --secret-id "$SLACK_SECRET_ID" --query SecretString --output text 2>&1)"; then
-    log "WARNING: could not read secret '$SLACK_SECRET_ID' ($raw)"
-    log "WARNING: continuing with no webhook -- onboarding notifications stay off"
+    secret_read_failed "$SLACK_SECRET_ID" "$SLACK_ENV_FILE" "$raw" "Slack onboarding notifications"
     return 0
   fi
+  : > "$SLACK_ENV_FILE"; chmod 600 "$SLACK_ENV_FILE"
 
   # Same stdin/temp-file dance as materialise_mail_env, for the same reason
   # written out there: the JSON arrives on STDIN, so the program cannot also
@@ -409,15 +450,13 @@ materialise_cloudflare_env() {
     log "CLOUDFLARE_SECRET_ID is empty -- leaving $CLOUDFLARE_ENV_FILE alone"
     return 0
   fi
-  : > "$CLOUDFLARE_ENV_FILE"; chmod 600 "$CLOUDFLARE_ENV_FILE"
-
   local raw summary
   if ! raw="$(aws secretsmanager get-secret-value --region "$REGION" \
                 --secret-id "$CLOUDFLARE_SECRET_ID" --query SecretString --output text 2>&1)"; then
-    log "WARNING: could not read secret '$CLOUDFLARE_SECRET_ID' ($raw)"
-    log "WARNING: continuing with no Cloudflare config -- DNS filtering endpoints stay 503"
+    secret_read_failed "$CLOUDFLARE_SECRET_ID" "$CLOUDFLARE_ENV_FILE" "$raw" "Cloudflare DNS filtering"
     return 0
   fi
+  : > "$CLOUDFLARE_ENV_FILE"; chmod 600 "$CLOUDFLARE_ENV_FILE"
 
   # Same stdin/temp-file dance as materialise_mail_env: the JSON arrives on
   # STDIN, so the program cannot also come from stdin.

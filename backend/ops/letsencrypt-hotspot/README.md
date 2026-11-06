@@ -17,6 +17,20 @@
 >    "Current state (2026-09-06)" and "The transport is the blocker".
 >    Nothing below describes a renewal that is running today.
 
+> **Update 2026-11-06 (code only, nothing installed or run).**
+> `renew-hotspot-certs.sh` no longer uses ssh/scp/sshpass. It calls
+> `push-hotspot-certs.py` (RouterOS API, 8728/8729, per-router stored
+> credentials, router pulls the PEMs with `/tool fetch` from a one-shot
+> peer-bound listener) in a throwaway container of the running api image with
+> `--network host`. New: `--dry-run` (no certbot, no router contact),
+> `ONLY_ROUTER=<name>` for a single-router test, `/etc/wyfy/hotspot-push.env`
+> (`HOTSPOT_PUSH_BIND_HOST`, `HOTSPOT_PUSH_BIND_PORT`), and
+> `check-hotspot-cert-expiry.sh` (exit 1 under 21 days, 2 expired/missing,
+> optional CloudWatch metric) with its own daily timer. Install path is
+> `/opt/wyfy/scripts/letsencrypt-hotspot/`. The "still unproven" items under
+> "The transport is the blocker" stay unproven until the supervised
+> single-router run; sections below that describe the ssh/scp push are history.
+
 Real infrastructure notes for how the MikroTik hotspot login page's TLS
 certificate went from a self-signed cert (browser interstitial on every
 guest, and on Safari a query-string-losing click-through into
@@ -247,7 +261,7 @@ certificate object that's mid-deletion.
 ## Systemd timer
 
 `wyfy-hotspot-cert-renew.timer` runs `wyfy-hotspot-cert-renew.service`
-(-> `/opt/wyfy/renew-hotspot-certs.sh`) twice a day (`03:00`/`15:00` UTC,
+(-> `/opt/wyfy/scripts/letsencrypt-hotspot/renew-hotspot-certs.sh`) twice a day (`03:00`/`15:00` UTC,
 30min random jitter) -- mirrors this VM's own `certbot.timer` cadence for
 its other certs. `certbot renew`'s own 30-day-before-expiry window means
 this has ~60 attempts before a cert would actually lapse; a single bad run
@@ -556,13 +570,19 @@ aws ec2-instance-connect send-ssh-public-key --region ap-south-1 \
   --ssh-public-key file://~/.ssh/id_rsa.pub
 ssh ubuntu@"$IP"
 
+D=/opt/wyfy/scripts/letsencrypt-hotspot
+# Inventory + SANs/expiry, no certbot, no router contact:
+sudo $D/renew-hotspot-certs.sh --dry-run
+# Days left (exit 1 under 21 days, 2 expired/missing):
+$D/check-hotspot-cert-expiry.sh
+
 # Normal unattended path (what the timer runs; no-ops outside the 30-day
 # renewal window):
-sudo /opt/wyfy/renew-hotspot-certs.sh
+sudo $D/renew-hotspot-certs.sh
 
 # Force a real renewal right now regardless of the 30-day window (this is
 # what proved the router-side rebind path above, and is safe to re-run):
-sudo FORCE_RENEW=1 /opt/wyfy/renew-hotspot-certs.sh
+sudo FORCE_RENEW=1 $D/renew-hotspot-certs.sh
 
 # Recent renewal history/failures:
 journalctl -t wyfy-hotspot-cert-renew --since -7d
