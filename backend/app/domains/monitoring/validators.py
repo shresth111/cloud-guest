@@ -10,7 +10,9 @@ filesystem.
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from urllib.parse import urlsplit
 
+from app.common.outbound_http import host_is_literal_non_public
 from app.domains.router.enums import RouterReachabilityState, RouterStatus
 from app.domains.router.models import Router
 from app.domains.router_provisioning.constants import (
@@ -308,6 +310,18 @@ def compare_threshold(
 # ============================================================================
 
 
+def _refuse_internal_host(url: str) -> None:
+    """Refuse a URL whose host is plainly internal (``localhost`` or a
+    private/loopback/link-local IP literal) when the channel is saved. The
+    send path re-checks the resolved address on every request
+    (``app.common.outbound_http``), which also covers hostnames."""
+    host = urlsplit(url).hostname
+    if not host or host_is_literal_non_public(host):
+        raise InvalidNotificationChannelConfigError(
+            "webhook URL must point at a public internet address"
+        )
+
+
 def validate_notification_channel_config(
     channel_type: NotificationChannelType, config: dict[str, object]
 ) -> None:
@@ -340,13 +354,14 @@ def validate_notification_channel_config(
                 f"{channel_type.value} channel config requires a "
                 "'webhook_url' starting with https://"
             )
+        _refuse_internal_host(webhook_url)
     elif channel_type == NotificationChannelType.WEBHOOK:
         url = config.get("url")
-        if not isinstance(url, str) or not url.startswith(("https://", "http://")):
+        if not isinstance(url, str) or not url.startswith("https://"):
             raise InvalidNotificationChannelConfigError(
-                "webhook channel config requires a 'url' starting with "
-                "http:// or https://"
+                "webhook channel config requires a 'url' starting with https://"
             )
+        _refuse_internal_host(url)
         auth_header_name = config.get("auth_header_name")
         auth_header_value = config.get("auth_header_value")
         if (auth_header_name is None) != (auth_header_value is None):

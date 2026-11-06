@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import logging
 import os
-import sys
 import time
 
 from app.core.config import get_settings
@@ -73,7 +72,9 @@ class SystemService:
             version=self._get_version(),
             build=os.environ.get("CLOUDGUEST_BUILD", None),
             commit=os.environ.get("CLOUDGUEST_COMMIT", None),
-            python_version=sys.version.split()[0],
+            # Not disclosed: this endpoint is unauthenticated, and the
+            # interpreter version only helps someone match known CVEs.
+            python_version=None,
             api_version="v1",
         )
 

@@ -14,6 +14,7 @@ from fastapi import Depends
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.common.outbound_http import public_only_client
 from app.core.config import Settings, get_settings
 from app.database.redis import get_redis_client
 from app.database.session import get_db_session
@@ -69,7 +70,13 @@ def get_monitoring_service(
 # ``app.database.redis``'s own module-level ``redis_client`` singleton
 # (one pooled client reused across requests, not a fresh connection per
 # notification).
-_http_client = httpx.AsyncClient()
+#
+# Public addresses only: tenants choose these URLs, so the client refuses
+# private/internal destinations (see app.common.outbound_http). The
+# platform's own alert webhook is configured by us and trusted as set.
+_http_client = public_only_client(
+    trusted_urls=[get_settings().platform_alert_slack_webhook_url]
+)
 
 
 def get_notification_http_client() -> httpx.AsyncClient:

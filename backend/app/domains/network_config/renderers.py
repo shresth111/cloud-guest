@@ -630,6 +630,10 @@ from app.domains.hotspot.models import HotspotProfile
 from app.domains.isp.constants import IspConnectionMode
 from app.domains.isp.models import IspLink
 from app.domains.mac_authorization.models import MacAuthorizationEntry
+from app.domains.network_config.profiles.constants import (
+    escape_routeros_string as _esc,
+)
+from app.domains.network_config.profiles.constants import routeros_value
 from app.domains.network_config.wan.renderers import (
     DISCOVERED_NAT_COMMENT,
     DISCOVERED_WAN_LIST_COMMENT,
@@ -1200,7 +1204,7 @@ def render_port_forwarding_rule(rule: PortForwardingRule) -> list[str]:
     parts.append("action=dst-nat")
     parts.append(f"to-addresses={rule.internal_address}")
     parts.append(f"to-ports={rule.internal_port}")
-    parts.append(f'comment="{rule.name}"')
+    parts.append(f'comment="{_esc(rule.name)}"')
     return [" ".join(parts)]
 
 
@@ -1275,12 +1279,13 @@ def render_hotspot_profile(profile: HotspotProfile) -> list[str]:
         f"do={{ /ip hotspot user profile add name={identifier} {body} }} "
         f"else={{ /ip hotspot user profile set {found} {body} }}"
     ]
+    profile_comment = _esc(profile.name)
     for host in profile.walled_garden_hosts:
         lines.append(
             f":if ([:len [/ip hotspot walled-garden find where "
-            f'dst-host="{host}" && comment="{profile.name}"]] = 0) '
-            f"do={{ /ip hotspot walled-garden add dst-host={host} action=allow "
-            f'comment="{profile.name}" }}'
+            f'dst-host="{_esc(host)}" && comment="{profile_comment}"]] = 0) '
+            f"do={{ /ip hotspot walled-garden add dst-host={routeros_value(host)} "
+            f'action=allow comment="{profile_comment}" }}'
         )
     return lines
 
@@ -1301,20 +1306,23 @@ def render_qos_traffic_rule(rule: QosTrafficRule) -> list[str]:
     parts.append("action=mark-packet")
     parts.append(f"new-packet-mark={identifier}")
     parts.append("passthrough=no")
-    parts.append(f'comment="{rule.name} (priority={rule.priority})"')
+    parts.append(f'comment="{_esc(rule.name)} (priority={rule.priority})"')
     return [" ".join(parts)]
 
 
 def render_dns_record(record: DnsRecord) -> list[str]:
     """Renders one enabled ``DnsRecord`` row -- see module docstring for
     why the RouterOS parameter name depends on ``record_type``."""
-    parts = [f"/ip dns static add name={record.name} ttl={record.ttl_seconds}s"]
+    parts = [
+        f"/ip dns static add name={routeros_value(record.name)} "
+        f"ttl={record.ttl_seconds}s"
+    ]
     if record.record_type == DnsRecordType.CNAME.value:
-        parts.append(f"cname={record.address} type=CNAME")
+        parts.append(f"cname={routeros_value(record.address)} type=CNAME")
     else:
-        parts.append(f"address={record.address}")
+        parts.append(f"address={routeros_value(record.address)}")
     if record.comment:
-        parts.append(f'comment="{record.comment}"')
+        parts.append(f'comment="{_esc(record.comment)}"')
     return [" ".join(parts)]
 
 
@@ -1337,7 +1345,7 @@ def render_firewall_rule(rule: FirewallRule) -> list[str]:
         parts.append(f"in-interface={rule.in_interface}")
     parts.append(f"action={rule.action}")
     comment = rule.comment or rule.name
-    parts.append(f'comment="{comment} (priority={rule.priority})"')
+    parts.append(f'comment="{_esc(comment)} (priority={rule.priority})"')
     return [" ".join(parts)]
 
 
@@ -1383,7 +1391,7 @@ def render_content_filter_rule(rule: ContentFilterRule) -> list[str]:
     makes IP/CIDR blocking take effect is rendered once per push by
     :func:`render_content_filter_enforcement`, not repeated here per
     rule."""
-    label = f"{rule.category or 'custom'}: {rule.name}"
+    label = _esc(f"{rule.category or 'custom'}: {rule.name}")
     if rule.value_type == ContentFilterValueType.IP_CIDR.value:
         return [
             f"/ip firewall address-list add list={CONTENT_FILTER_ADDRESS_LIST_NAME} "

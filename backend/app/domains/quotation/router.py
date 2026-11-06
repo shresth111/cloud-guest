@@ -79,7 +79,9 @@ def _build_quotation_response(
     "",
     response_model=ApiResponse[QuotationResponse],
     status_code=status.HTTP_201_CREATED,
-    dependencies=[Depends(RequirePermission("quotations.create"))],
+    dependencies=[
+        Depends(RequirePermission("quotations.create", scope=ScopeType.GLOBAL))
+    ],
 )
 async def create_and_send_quotation(
     request: Request,
@@ -131,7 +133,9 @@ async def create_and_send_quotation(
     "",
     response_model=ApiResponse[QuotationListResponse],
     status_code=status.HTTP_200_OK,
-    dependencies=[Depends(RequirePermission("quotations.read"))],
+    dependencies=[
+        Depends(RequirePermission("quotations.read", scope=ScopeType.GLOBAL))
+    ],
 )
 async def list_quotations(
     request: Request,
@@ -169,7 +173,9 @@ async def list_quotations(
     "/{quotation_id}",
     response_model=ApiResponse[QuotationResponse],
     status_code=status.HTTP_200_OK,
-    dependencies=[Depends(RequirePermission("quotations.read"))],
+    dependencies=[
+        Depends(RequirePermission("quotations.read", scope=ScopeType.GLOBAL))
+    ],
 )
 async def get_quotation(
     request: Request,
@@ -189,7 +195,9 @@ async def get_quotation(
 @router.get(
     "/{quotation_id}/pdf",
     status_code=status.HTTP_200_OK,
-    dependencies=[Depends(RequirePermission("quotations.read"))],
+    dependencies=[
+        Depends(RequirePermission("quotations.read", scope=ScopeType.GLOBAL))
+    ],
 )
 async def download_quotation_pdf(
     quotation_id: uuid.UUID,

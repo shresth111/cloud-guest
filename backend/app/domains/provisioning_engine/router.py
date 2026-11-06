@@ -35,6 +35,7 @@ from app.domains.rbac.dependencies import (
     CurrentUser,
     RequirePermission,
 )
+from app.domains.rbac.enums import ScopeType
 
 from .constants import ProvisionJobStatus
 from .dependencies import get_provisioning_engine_service
@@ -326,7 +327,9 @@ async def generate_configuration_preview(
     "/console",
     response_model=ApiResponse[ConsoleCommandResponse],
     status_code=status.HTTP_200_OK,
-    dependencies=[Depends(RequirePermission("device_console.execute"))],
+    dependencies=[
+        Depends(RequirePermission("device_console.execute", scope=ScopeType.GLOBAL))
+    ],
 )
 async def execute_console_command(
     request: Request,

@@ -28,6 +28,18 @@ PUBLIC_DEFAULT_SECRET_FIELDS = (
     "mfa_encryption_key",
 )
 
+# Payment webhook signing secrets. Empty by default, and an empty secret makes
+# the provider's HMAC computable by anyone, so the webhook endpoints refuse
+# every event while one is unset (see billing.webhooks). Kept apart from
+# PUBLIC_DEFAULT_SECRET_FIELDS because a deployment that takes no payments
+# through a provider legitimately leaves its secret empty: that is logged as a
+# warning at startup, and only refuses startup when strict_production_secrets
+# is on.
+PAYMENT_WEBHOOK_SECRET_FIELDS = (
+    "stripe_webhook_secret",
+    "razorpay_webhook_secret",
+)
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -3141,6 +3153,18 @@ class Settings(BaseSettings):
             if getattr(self, name) == fields[name].default
         ]
 
+    def unset_payment_webhook_secrets(self) -> list[str]:
+        """Env var names of payment webhook secrets left empty, in a
+        non-local environment. Names only; never raises (see
+        :meth:`secrets_at_public_default`)."""
+        if self.is_local_environment:
+            return []
+        return [
+            f"CLOUDGUEST_{name.upper()}"
+            for name in PAYMENT_WEBHOOK_SECRET_FIELDS
+            if not str(getattr(self, name) or "").strip()
+        ]
+
     def alerting_delivery_gaps(self) -> list[str]:
         """Env var names of alerting settings whose *unset* value silently
         delivers nothing, in a non-local environment. Empty on a developer
@@ -3212,6 +3236,11 @@ class Settings(BaseSettings):
         environment. Used when strict_production_secrets is enabled."""
         if self.is_local_environment:
             return
+        # Unset payment webhook secrets are NOT part of this. A deployment
+        # that does not take Stripe (or Razorpay) payments leaves that secret
+        # empty on purpose; refusing to boot over it would take guest WiFi
+        # login down with the API. The webhook itself refuses (503) and
+        # startup logs payment_webhook_secret_unset instead.
         defaulted = self.secrets_at_public_default()
         if defaulted:
             raise ValueError(
