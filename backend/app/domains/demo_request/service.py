@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import logging
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from typing import Protocol
 
 from app.core.email_layout import esc, heading, info_box, paragraph, render_email
@@ -80,8 +82,15 @@ class DemoRequestService:
         notification_service: NotificationEnqueuer | None = None,
         notify_email: str = "",
         sales_webhook: SalesWebhookPublisherProtocol | None = None,
+        dedupe_minutes: int = 10,
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         self.repository = repository
+        # Double-submit window -- see submit_demo_request. 0 disables.
+        self.dedupe_minutes = dedupe_minutes
+        # Injected so tests can pin "now" without patching a module clock;
+        # same posture as DemoBookingService.
+        self._clock = clock or (lambda: datetime.now(UTC))
         # Both default to inert (None/"") so every existing unit test that
         # builds a DemoRequestService directly keeps working unchanged --
         # mirrors app.domains.support_tickets.service.TicketService's own
@@ -114,17 +123,39 @@ class DemoRequestService:
         fields -- validated/bounded already by ``schemas
         .DemoRequestCreateRequest`` before this method is ever called, so
         no further normalization is needed here beyond the same
-        strip()-on-strings posture every other field already gets."""
-        demo_request = await self.repository.create(
-            full_name=full_name.strip(),
-            email=str(email).strip().lower(),
-            phone=phone.strip() if phone else None,
-            company_name=company_name.strip(),
-            message=message.strip() if message else None,
-            property_type=property_type,
-            location_count=location_count,
-            router_count=router_count,
-        )
+        strip()-on-strings posture every other field already gets.
+
+        **Double-submit dedupe.** The marketing site's forms abort a POST
+        after 20 s and show "try again"; a visitor on a slow mobile link
+        whose first request the server *did* store then submits the very
+        same lead a second time, and a fast double click can beat the
+        button's disabled state. Within ``dedupe_minutes``, a submission
+        identical in every field to the newest stored lead from the same
+        address is answered with that stored lead -- no second row, no
+        second team email, no second webhook event. Anything that differs
+        in any field is a new lead: a prospect writing back with a changed
+        message or a second property is exactly who sales wants to see
+        twice."""
+        fields: dict[str, object] = {
+            "full_name": full_name.strip(),
+            "email": str(email).strip().lower(),
+            "phone": phone.strip() if phone else None,
+            "company_name": company_name.strip(),
+            "message": message.strip() if message else None,
+            "property_type": property_type,
+            "location_count": location_count,
+            "router_count": router_count,
+        }
+
+        duplicate_of = await self._find_duplicate(fields)
+        if duplicate_of is not None:
+            logger.info(
+                "demo_request_duplicate_suppressed",
+                extra={"demo_request_id": str(duplicate_of.id)},
+            )
+            return duplicate_of
+
+        demo_request = await self.repository.create(**fields)
         # The lead is committed BEFORE either side effect below runs. Both
         # the team email and the sales webhook are enqueued through
         # NotificationService.enqueue on this same request-scoped session,
@@ -147,6 +178,21 @@ class DemoRequestService:
                 "demo_request.created", {"lead": lead_webhook_payload(demo_request)}
             )
         return demo_request
+
+    async def _find_duplicate(self, fields: dict[str, object]) -> DemoRequest | None:
+        """The newest lead from the same address inside the dedupe window,
+        if -- and only if -- every submitted field matches it exactly."""
+        if self.dedupe_minutes <= 0:
+            return None
+        since = self._clock() - timedelta(minutes=self.dedupe_minutes)
+        existing = await self.repository.find_recent_by_email(
+            str(fields["email"]), since=since
+        )
+        if existing is None:
+            return None
+        if all(getattr(existing, key) == value for key, value in fields.items()):
+            return existing
+        return None
 
     async def _notify_team(self, demo_request: DemoRequest) -> None:
         """Best-effort internal-team email on every new submission --

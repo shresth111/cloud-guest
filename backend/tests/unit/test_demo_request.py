@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from pydantic import ValidationError
@@ -85,6 +85,17 @@ class FakeDemoRequestRepository:
 
     async def commit(self) -> None:
         self.commits += 1
+
+    async def find_recent_by_email(
+        self, email: str, *, since: datetime
+    ) -> DemoRequest | None:
+        candidates = [
+            r
+            for r in self.requests.values()
+            if r.email == email and not r.is_deleted and r.created_at >= since
+        ]
+        candidates.sort(key=lambda r: r.created_at, reverse=True)
+        return candidates[0] if candidates else None
 
     async def list_records(
         self,
@@ -428,6 +439,96 @@ class TestLeadIsCommittedBeforeSideEffects:
         )
 
         assert events == ["commit", "notify", "webhook:demo_request.created"]
+
+
+# ============================================================================
+# Service: double-submit dedupe
+# ============================================================================
+
+
+class _CountingNotifier:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def enqueue(self, **fields: object) -> object:
+        self.calls += 1
+        return object()
+
+
+_LEAD = {
+    "full_name": "Alice Anderson",
+    "email": "alice@example.com",
+    "phone": "+91 98765 43210",
+    "company_name": "Lakeside Hotel",
+    "message": "Two properties in Goa",
+    "property_type": "hotel",
+    "location_count": 2,
+    "router_count": 4,
+}
+
+
+class TestDoubleSubmitDedupe:
+    def _service(
+        self, *, dedupe_minutes: int = 10, clock=None
+    ) -> tuple[DemoRequestService, FakeDemoRequestRepository, _CountingNotifier]:
+        repository = FakeDemoRequestRepository()
+        notifier = _CountingNotifier()
+        service = DemoRequestService(
+            repository,
+            notification_service=notifier,
+            notify_email="sales@example.com",
+            dedupe_minutes=dedupe_minutes,
+            clock=clock,
+        )
+        return service, repository, notifier
+
+    async def test_identical_resubmit_returns_the_stored_lead_once(self) -> None:
+        service, repository, notifier = self._service()
+
+        first = await service.submit_demo_request(**_LEAD)
+        # The form sends the same values; whitespace/case drift on the
+        # email must not defeat the match either.
+        resent = {**_LEAD, "email": "  Alice@Example.com ", "full_name": " Alice  "}
+        resent["full_name"] = " Alice Anderson "
+        second = await service.submit_demo_request(**resent)
+
+        assert second.id == first.id
+        assert len(repository.requests) == 1
+        assert notifier.calls == 1
+        assert repository.commits == 1
+
+    async def test_any_changed_field_is_a_new_lead(self) -> None:
+        service, repository, notifier = self._service()
+
+        await service.submit_demo_request(**_LEAD)
+        await service.submit_demo_request(**{**_LEAD, "message": "Three properties"})
+        await service.submit_demo_request(**{**_LEAD, "router_count": None})
+
+        assert len(repository.requests) == 3
+        assert notifier.calls == 3
+
+    async def test_window_zero_disables_dedupe(self) -> None:
+        service, repository, _notifier = self._service(dedupe_minutes=0)
+
+        await service.submit_demo_request(**_LEAD)
+        await service.submit_demo_request(**_LEAD)
+
+        assert len(repository.requests) == 2
+
+    async def test_same_lead_after_the_window_is_a_new_lead(self) -> None:
+        now = datetime(2026, 11, 7, 10, 0, tzinfo=UTC)
+        service, repository, _notifier = self._service(
+            dedupe_minutes=10, clock=lambda: now
+        )
+
+        first = await service.submit_demo_request(**_LEAD)
+        # The fake stamps created_at with the real wall clock; pin it so
+        # the window arithmetic is deterministic.
+        first.created_at = now - timedelta(minutes=11)
+        second = await service.submit_demo_request(**_LEAD)
+
+        assert second.id != first.id
+        assert len(repository.requests) == 2
 
 
 # ============================================================================
