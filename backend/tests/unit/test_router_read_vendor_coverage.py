@@ -578,6 +578,18 @@ VENDOR_NEUTRAL: dict[str, str] = {
         "why' instead of 404 at such a venue. Wrapping it in "
         "`agent_managed_only` would make it find nothing, by definition."
     ),
+    "app/domains/guest/ssid_tier_instant_on.py::nas_only_router_at": (
+        "Narrowed to `Router.vendor IN NAS_ONLY_VENDORS` (Aruba Instant On) "
+        "in the WHERE, plus organization and location (and, when given, the "
+        "cloud-control target's router id), so it is vendor-scoped by "
+        "construction: it can only ever match a controller-managed, NAS-only "
+        "row, which is exactly what it exists to find. It is a yes/no gate "
+        "that keeps the customer SSID-tier apply route away from every "
+        "MikroTik/Omada venue; it feeds no device work (the write goes "
+        "through Instant On cloud control, never the agent). Wrapping it in "
+        "`agent_managed_only` would make it find nothing, by definition, and "
+        "close the gate everywhere."
+    ),
     "app/domains/network_integration/instant_on_repository.py::"
     "InstantOnRepository.list_sites": (
         "Joins `routers` only to drop `instant_on_sites` rows whose fleet router "
