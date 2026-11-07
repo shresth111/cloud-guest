@@ -43,6 +43,8 @@ class DemoRequestRepositoryProtocol(Protocol):
         property_type: str | None = None,
     ) -> tuple[list[DemoRequest], PaginationMeta]: ...
 
+    async def commit(self) -> None: ...
+
 
 class DemoRequestRepository:
     """Concrete, SQLAlchemy-backed implementation of
@@ -62,6 +64,15 @@ class DemoRequestRepository:
         self, demo_request: DemoRequest, data: dict[str, object]
     ) -> DemoRequest:
         return await self.demo_requests.update(demo_request, data)
+
+    async def commit(self) -> None:
+        """Make the lead durable *now*, before any best-effort side effect
+        runs -- see ``service.DemoRequestService.submit_demo_request``.
+        The request-scoped session still commits again at the end of the
+        request (``app.database.session.get_db_session``); a second commit
+        of an already-committed transaction is a no-op, exactly as
+        ``app.domains.demo_booking.repository`` already relies on."""
+        await self.session.commit()
 
     def _list_filters(
         self,

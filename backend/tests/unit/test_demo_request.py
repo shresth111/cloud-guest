@@ -65,6 +65,7 @@ def _base_fields(**overrides: object) -> dict[str, object]:
 @dataclass
 class FakeDemoRequestRepository:
     requests: dict[uuid.UUID, DemoRequest] = field(default_factory=dict)
+    commits: int = 0
 
     async def create(self, **fields: object) -> DemoRequest:
         demo_request = DemoRequest(**_base_fields(**fields))
@@ -81,6 +82,9 @@ class FakeDemoRequestRepository:
             setattr(demo_request, key, value)
         demo_request.version += 1
         return demo_request
+
+    async def commit(self) -> None:
+        self.commits += 1
 
     async def list_records(
         self,
@@ -321,6 +325,109 @@ class TestSubmitDemoRequest:
         )
 
         assert "status" not in captured
+
+
+# ============================================================================
+# Service: the lead is durable before any best-effort side effect runs
+# ============================================================================
+
+
+@dataclass
+class _RollingBackRepository(FakeDemoRequestRepository):
+    """Models the real session: ``create`` only *flushes* (the row sits in
+    ``pending``), ``commit`` makes it durable, and a failing flush anywhere
+    on the same session -- which is what ``GenericRepository
+    ._flush_or_raise`` turns into ``session.rollback()`` -- discards every
+    pending row."""
+
+    pending: dict[uuid.UUID, DemoRequest] = field(default_factory=dict)
+
+    async def create(self, **fields: object) -> DemoRequest:  # type: ignore[override]
+        demo_request = DemoRequest(**_base_fields(**fields))
+        self.pending[demo_request.id] = demo_request
+        return demo_request
+
+    async def commit(self) -> None:
+        self.requests.update(self.pending)
+        self.pending.clear()
+        self.commits += 1
+
+    def rollback(self) -> None:
+        self.pending.clear()
+
+
+class _EnqueueFailsAndRollsBack:
+    """A NotificationService whose enqueue hits a DB error: the flush fails,
+    the shared session is rolled back, and the error propagates (to be
+    swallowed by the caller's best-effort guard)."""
+
+    def __init__(self, repository: _RollingBackRepository) -> None:
+        self.repository = repository
+        self.calls = 0
+
+    async def enqueue(self, **fields: object) -> object:
+        self.calls += 1
+        self.repository.rollback()
+        raise RuntimeError("simulated flush failure on notification_deliveries")
+
+
+class TestLeadIsCommittedBeforeSideEffects:
+    async def test_lead_survives_a_notification_db_failure(self) -> None:
+        repository = _RollingBackRepository()
+        notifier = _EnqueueFailsAndRollsBack(repository)
+        service = DemoRequestService(
+            repository,
+            notification_service=notifier,
+            notify_email="sales@example.com",
+        )
+
+        demo_request = await service.submit_demo_request(
+            full_name="Alice Anderson",
+            email="alice@example.com",
+            phone=None,
+            company_name="Lakeside Hotel",
+            message=None,
+        )
+
+        # The notification was attempted and failed; the submission still
+        # succeeded (never raises) AND the lead is durable.
+        assert notifier.calls == 1
+        assert demo_request.id in repository.requests
+        assert repository.pending == {}
+
+    async def test_commit_happens_before_notification_and_webhook(self) -> None:
+        events: list[str] = []
+
+        @dataclass
+        class _OrderedRepository(FakeDemoRequestRepository):
+            async def commit(self) -> None:
+                events.append("commit")
+                await super().commit()
+
+        class _Notifier:
+            async def enqueue(self, **fields: object) -> object:
+                events.append("notify")
+                return object()
+
+        class _Webhook:
+            async def publish(self, event: str, data: dict[str, object]) -> None:
+                events.append(f"webhook:{event}")
+
+        service = DemoRequestService(
+            _OrderedRepository(),
+            notification_service=_Notifier(),
+            notify_email="sales@example.com",
+            sales_webhook=_Webhook(),
+        )
+        await service.submit_demo_request(
+            full_name="Alice Anderson",
+            email="alice@example.com",
+            phone=None,
+            company_name="Lakeside Hotel",
+            message=None,
+        )
+
+        assert events == ["commit", "notify", "webhook:demo_request.created"]
 
 
 # ============================================================================

@@ -125,6 +125,18 @@ class DemoRequestService:
             location_count=location_count,
             router_count=router_count,
         )
+        # The lead is committed BEFORE either side effect below runs. Both
+        # the team email and the sales webhook are enqueued through
+        # NotificationService.enqueue on this same request-scoped session,
+        # and GenericRepository._flush_or_raise answers any flush-time
+        # SQLAlchemyError with session.rollback() -- which, with the lead
+        # still only flushed, discarded the lead INSERT along with the
+        # delivery row. _notify_team/publish then swallowed the error (by
+        # design: a notification must never fail a submission) and the
+        # request went on to return 201 for a lead that no longer existed.
+        # Same ordering, for the same reason, as
+        # app.domains.demo_booking.service.DemoBookingService.book_slot.
+        await self.repository.commit()
         logger.info(
             "demo_request_submitted",
             extra={"demo_request_id": str(demo_request.id)},
