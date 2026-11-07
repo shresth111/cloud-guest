@@ -936,3 +936,113 @@ class TestVenueGuestSpeed:
         assert response["data"]["status"] == "failed"
         assert response["data"]["reason"] == "network_wide_limit_set"
         assert site.writes() == []
+
+
+# ============================================================================
+# A deleted fleet router never resolves; end_nas_only_session never raises
+# ============================================================================
+
+
+class _CapturingSession:
+    """Answers every query with the given rows and records the statement."""
+
+    def __init__(self, rows: list) -> None:  # noqa: ANN001
+        self.rows = rows
+        self.statements: list = []
+
+    async def execute(self, statement):  # noqa: ANN001, ANN201
+        self.statements.append(statement)
+        rows = self.rows
+
+        class _Result:
+            def scalars(self):  # noqa: ANN202
+                class _S:
+                    def all(self):  # noqa: ANN202
+                        return rows
+
+                    def first(self):  # noqa: ANN202
+                        return rows[0] if rows else None
+
+                return _S()
+
+        return _Result()
+
+
+def _sql(statement) -> str:  # noqa: ANN001
+    return str(statement.compile(compile_kwargs={"literal_binds": True}))
+
+
+class TestDeletedRouterNeverResolves:
+    async def test_control_target_query_excludes_deleted_routers(self) -> None:
+        """The SQL itself joins routers and requires is_deleted false, so a
+        site row whose fleet router was deleted cannot come back."""
+        db = _CapturingSession([])
+        assert (
+            await control.resolve_control_target(
+                db,  # type: ignore[arg-type]
+                organization_id=uuid.uuid4(),
+                router_id=ROUTER,
+                settings=_settings(),
+            )
+            is None
+        )
+        sql = _sql(db.statements[0])
+        assert "JOIN routers ON routers.id = instant_on_sites.router_id" in sql
+        assert "routers.is_deleted IS false" in sql
+        assert "instant_on_sites.is_deleted IS false" in sql
+
+    async def test_location_lookup_excludes_deleted_routers(self) -> None:
+        from app.domains.network_integration.instant_on_repository import (
+            InstantOnRepository,
+        )
+
+        db = _CapturingSession([])
+        repo = InstantOnRepository(db)  # type: ignore[arg-type]
+        assert (
+            await repo.get_site_for_location(
+                location_id=uuid.uuid4(), organization_id=uuid.uuid4()
+            )
+            is None
+        )
+        sql = _sql(db.statements[0])
+        assert "JOIN routers ON routers.id = instant_on_sites.router_id" in sql
+        assert "routers.is_deleted IS false" in sql
+
+
+class TestEndNasOnlySessionNeverRaises:
+    @pytest.mark.parametrize("error", [RuntimeError("db gone"), ConnectionError()])
+    async def test_resolve_failure_is_could_not(self, monkeypatch, error) -> None:  # noqa: ANN001
+        async def boom(session, **kwargs):  # noqa: ANN001, ANN003, ANN202
+            raise error
+
+        monkeypatch.setattr(control, "resolve_control_target", boom)
+        assert (
+            await control.end_nas_only_session(
+                None,  # type: ignore[arg-type]
+                router_id=ROUTER,
+                organization_id=uuid.uuid4(),
+                client_mac=MAC,
+                settings=_settings(),
+            )
+            is False
+        )
+
+    async def test_redis_failure_after_resolve_is_could_not(
+        self, wired, monkeypatch
+    ) -> None:  # noqa: ANN001
+        _, _, _, target = wired
+
+        async def with_client(t, settings, action):  # noqa: ANN001, ANN202
+            raise OSError("redis connection refused")
+
+        monkeypatch.setattr(control, "_with_client", with_client)
+        assert (
+            await control.end_nas_only_session(
+                None,  # type: ignore[arg-type]
+                router_id=ROUTER,
+                organization_id=target.organization_id,
+                client_mac=MAC,
+                settings=_settings(),
+            )
+            is False
+        )

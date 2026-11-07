@@ -386,8 +386,9 @@ def wired(monkeypatch):  # noqa: ANN001, ANN201
         calls_kw.append(kw)
         return {"control:Auth-Type": "Accept"}
 
-    async def _accounting(payload, nas_client, service):  # noqa: ANN001, ANN202
+    async def _accounting(payload, nas_client, service, **kw):  # noqa: ANN001, ANN003, ANN202
         calls.append(("accounting", nas_client))
+        calls_kw.append(kw)
         return "acct-ok"
 
     monkeypatch.setattr(guest_router, "_radius_authorize_reply", _authorize_reply)
@@ -500,6 +501,8 @@ class TestRadiusRoutes:
                 service=service,
             )
         assert calls == [("accounting", service.nas)]
+        # The shared listener (Aruba only) asks for per-NAS-session baselines.
+        assert {"track_nas_session": True} in guest_router._test_calls_kw
 
     @pytest.mark.parametrize("status_type", ["accounting-on", "accounting-off"])
     async def test_accounting_on_off_closes_nothing_on_the_shared_listener(

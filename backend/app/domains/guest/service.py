@@ -10321,9 +10321,14 @@ class RadiusService:
         nas_client: RadiusNasClient,
         username: str,
         calling_station_id: str | None = None,
+        nas_session_id: str | None = None,
     ) -> GuestSession:
         """See module docstring for why this confirms an existing session
         rather than fabricating one.
+
+        ``nas_session_id`` (the NAS's ``Acct-Session-Id``, passed only by the
+        shared Aruba listener) starts that NAS session's byte baseline at 0
+        on a NAS-only row; see ``nas_session_counters``.
 
         Also the strongest "internet confirmed" reading this platform gets:
         a NAS opens an accounting session only for a device it has let
@@ -10335,7 +10340,35 @@ class RadiusService:
         await self._confirm_internet(
             session, InternetConfirmationSource.RADIUS_ACCOUNTING_START
         )
+        tracked_id = await self._tracked_nas_session_id(nas_client, nas_session_id)
+        if tracked_id is not None:
+            from .nas_session_counters import start_nas_session
+
+            counters = start_nas_session(
+                getattr(session, "nas_counters", None), tracked_id
+            )
+            if counters != getattr(session, "nas_counters", None):
+                session = await self.repository.update_session(
+                    session, {"nas_counters": counters}
+                )
         return session
+
+    async def _tracked_nas_session_id(
+        self, nas_client: RadiusNasClient, nas_session_id: str | None
+    ) -> str | None:
+        """The ``Acct-Session-Id`` to baseline against, or ``None`` for the
+        old lifetime-total behaviour. Only for a NAS-only (Aruba Instant On)
+        router: MikroTik and Omada never reach the per-NAS-session path, and
+        a packet without the attribute keeps the old behaviour too."""
+        from .nas_session_counters import clean_nas_session_id
+
+        cleaned = clean_nas_session_id(nas_session_id)
+        if cleaned is None:
+            return None
+        router = await self.router_lookup.get_router(
+            nas_client.router_id, include_deleted=True
+        )
+        return cleaned if is_nas_only(router) else None
 
     async def _confirm_internet(
         self, session: GuestSession, source: InternetConfirmationSource
@@ -10365,6 +10398,7 @@ class RadiusService:
         bytes_uploaded_total: int | None = None,
         bytes_downloaded_total: int | None = None,
         calling_station_id: str | None = None,
+        nas_session_id: str | None = None,
     ) -> GuestSession:
         """Prefers the NAS's cumulative counters over caller-supplied
         deltas, converting them to a delta against what this session has
@@ -10395,6 +10429,13 @@ class RadiusService:
         ``GuestSession``). Clamping at 0 keeps usage monotonic rather than
         crediting a guest back their quota, which is the safer direction
         to be wrong in for a cap that exists to be enforced.
+
+        NAS-only rows with an ``Acct-Session-Id`` (``nas_session_id``, from the
+        shared Aruba listener): that clamp loses a reconnect's bytes, because
+        the AP's counters restart per NAS session while the ``GuestSession``
+        is reused. There the delta is taken against that NAS session's own
+        last-seen totals instead (``nas_session_counters``); retransmits
+        still add nothing.
         """
         session = await self._get_session_for_nas(
             nas_client, username, calling_station_id=calling_station_id
@@ -10404,12 +10445,38 @@ class RadiusService:
         await self._confirm_internet(
             session, InternetConfirmationSource.RADIUS_ACCOUNTING_INTERIM
         )
-        if bytes_uploaded_total is not None:
-            bytes_uploaded_delta = max(0, bytes_uploaded_total - session.bytes_uploaded)
-        if bytes_downloaded_total is not None:
-            bytes_downloaded_delta = max(
-                0, bytes_downloaded_total - session.bytes_downloaded
+        tracked_id = (
+            await self._tracked_nas_session_id(nas_client, nas_session_id)
+            if bytes_uploaded_total is not None or bytes_downloaded_total is not None
+            else None
+        )
+        if tracked_id is not None:
+            from .nas_session_counters import nas_session_delta
+
+            delta = nas_session_delta(
+                getattr(session, "nas_counters", None),
+                tracked_id,
+                bytes_uploaded_total=bytes_uploaded_total,
+                bytes_downloaded_total=bytes_downloaded_total,
+                recorded_uploaded=session.bytes_uploaded,
+                recorded_downloaded=session.bytes_downloaded,
             )
+            session = await self.repository.update_session(
+                session, {"nas_counters": delta.counters}
+            )
+            if bytes_uploaded_total is not None:
+                bytes_uploaded_delta = delta.bytes_uploaded_delta
+            if bytes_downloaded_total is not None:
+                bytes_downloaded_delta = delta.bytes_downloaded_delta
+        else:
+            if bytes_uploaded_total is not None:
+                bytes_uploaded_delta = max(
+                    0, bytes_uploaded_total - session.bytes_uploaded
+                )
+            if bytes_downloaded_total is not None:
+                bytes_downloaded_delta = max(
+                    0, bytes_downloaded_total - session.bytes_downloaded
+                )
         return await self.guest_service.record_usage(
             session_id=session.id,
             bytes_uploaded_delta=bytes_uploaded_delta,
@@ -10425,12 +10492,46 @@ class RadiusService:
         bytes_downloaded_total: int | None = None,
         disconnect_reason: str | None = None,
         calling_station_id: str | None = None,
+        nas_session_id: str | None = None,
     ) -> GuestSession:
         session = await self._get_session_for_nas(
             nas_client, username, calling_station_id=calling_station_id
         )
 
-        if bytes_uploaded_total is not None or bytes_downloaded_total is not None:
+        has_totals = (
+            bytes_uploaded_total is not None or bytes_downloaded_total is not None
+        )
+        tracked_id = (
+            await self._tracked_nas_session_id(nas_client, nas_session_id)
+            if has_totals
+            else None
+        )
+        if tracked_id is not None:
+            # NAS-only with an Acct-Session-Id: the Stop's totals are this NAS
+            # session's own, so add what it moved since its last report on
+            # top of the recorded bytes (a reconnect's usage is kept, a 0 or
+            # repeated total adds nothing). See ``nas_session_counters``.
+            from .nas_session_counters import nas_session_delta
+
+            delta = nas_session_delta(
+                getattr(session, "nas_counters", None),
+                tracked_id,
+                bytes_uploaded_total=bytes_uploaded_total,
+                bytes_downloaded_total=bytes_downloaded_total,
+                recorded_uploaded=session.bytes_uploaded,
+                recorded_downloaded=session.bytes_downloaded,
+            )
+            session = await self.repository.update_session(
+                session,
+                {
+                    "bytes_uploaded": session.bytes_uploaded
+                    + delta.bytes_uploaded_delta,
+                    "bytes_downloaded": session.bytes_downloaded
+                    + delta.bytes_downloaded_delta,
+                    "nas_counters": delta.counters,
+                },
+            )
+        elif has_totals:
             # NAS-only: a Stop total is never below what is recorded. The AP's
             # counters restart on a reconnect onto a reused session, and the
             # shared listener sends 0 for a Stop without octets; either would

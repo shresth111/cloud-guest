@@ -3723,9 +3723,17 @@ async def _radius_accounting(
     payload: RadiusAccountingRequest,
     nas_client,  # noqa: ANN001 -- RadiusNasClient
     service: RadiusService,
+    *,
+    track_nas_session: bool = False,
 ) -> RadiusAccountingResponse:
     """``radius_accounting``'s whole body, shared verbatim with the shared
-    Aruba listener's ``radius_aruba_shared_accounting``."""
+    Aruba listener's ``radius_aruba_shared_accounting``.
+
+    ``track_nas_session`` (the shared Aruba listener only) hands the NAS's
+    ``Acct-Session-Id`` to the service for per-NAS-session byte baselines;
+    the service further limits that to NAS-only routers. The generic
+    ``/radius/accounting`` (MikroTik, Omada) never passes it."""
+    nas_session_id = payload.session_id if track_nas_session else None
     # Accounting-On/Accounting-Off (RFC 2866 §5.13) are NAS-level events --
     # no single session to report on, handled entirely separately from the
     # three session-scoped status types below. See
@@ -3752,6 +3760,7 @@ async def _radius_accounting(
             nas_client=nas_client,
             username=payload.username,
             calling_station_id=payload.calling_station_id,
+            **({"nas_session_id": nas_session_id} if nas_session_id else {}),
         )
     elif payload.status_type == RADIUS_ACCT_STATUS_INTERIM_UPDATE:
         session = await service.accounting_interim_update(
@@ -3771,6 +3780,7 @@ async def _radius_accounting(
             # ``RadiusAccountingRequest``'s own docstring for the production
             # measurement.
             calling_station_id=payload.calling_station_id,
+            **({"nas_session_id": nas_session_id} if nas_session_id else {}),
         )
     elif payload.status_type == RADIUS_ACCT_STATUS_STOP:
         session = await service.accounting_stop(
@@ -3780,6 +3790,7 @@ async def _radius_accounting(
             bytes_downloaded_total=payload.bytes_downloaded_total,
             disconnect_reason=payload.disconnect_reason,
             calling_station_id=payload.calling_station_id,
+            **({"nas_session_id": nas_session_id} if nas_session_id else {}),
         )
     else:
         # Previously: silently treated as "stop". Any status_type this
@@ -4012,7 +4023,9 @@ async def radius_aruba_shared_accounting(
         return RadiusAccountingResponse(
             session_id=None, status=payload.status_type, closed_session_count=0
         )
-    response = await _radius_accounting(payload, nas_client, service)
+    response = await _radius_accounting(
+        payload, nas_client, service, track_nas_session=True
+    )
     await _record_session_ap(request, service, response)
     await _dispatch_aruba_hybrid_speed(payload, nas_client, response, service)
     return response
