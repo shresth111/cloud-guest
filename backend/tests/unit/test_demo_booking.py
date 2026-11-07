@@ -403,9 +403,9 @@ class TestTimezoneConvention:
             router_count=5,
             slot_id=encode_slot_id(SLOT, secret=SECRET),
         )
-        # All eight lead fields the plain demo-request form collects, plus
-        # the slot -- inherited from DemoRequestCreateRequest so the two
-        # forms cannot drift apart.
+        # All eight lead fields the plain demo-request form collects (plus
+        # its honeypot), plus the slot -- inherited from
+        # DemoRequestCreateRequest so the two forms cannot drift apart.
         assert set(BookingCreateRequest.model_fields) == {
             "full_name",
             "email",
@@ -415,6 +415,7 @@ class TestTimezoneConvention:
             "property_type",
             "location_count",
             "router_count",
+            "website",
             "slot_id",
         }
         assert decode_slot_id(request.slot_id, secret=SECRET) == SLOT

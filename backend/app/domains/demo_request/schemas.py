@@ -150,6 +150,21 @@ class DemoRequestCreateRequest(BaseModel):
         ),
     )
 
+    website: str | None = Field(
+        default=None,
+        max_length=255,
+        description=(
+            "Honeypot. The public forms render this as a visually hidden, "
+            "tab-skipped, autocomplete-off input that a person never sees "
+            "and never fills; form-filling bots fill every field. A "
+            "non-empty value is rejected as a validation error rather than "
+            "silently accepted-and-dropped: a real person who somehow "
+            "trips it (an aggressive autofill extension) sees the usual "
+            "field error and can resend, instead of losing their lead "
+            "without a trace. Omit it or send an empty string."
+        ),
+    )
+
     @field_validator("property_type")
     @classmethod
     def validate_property_type(cls, value: str | None) -> str | None:
@@ -158,6 +173,15 @@ class DemoRequestCreateRequest(BaseModel):
                 f"property_type must be one of {sorted(_ALLOWED_PROPERTY_TYPES)}"
             )
         return value
+
+    @field_validator("website")
+    @classmethod
+    def honeypot_must_be_empty(cls, value: str | None) -> str | None:
+        if value is not None and value.strip():
+            raise ValueError("Leave this field empty.")
+        # Normalize "" (what an HTML form posts for an untouched input) to
+        # None so callers never see the field at all.
+        return None
 
 
 class DemoRequestUpdateRequest(BaseModel):

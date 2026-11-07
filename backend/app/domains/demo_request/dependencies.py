@@ -41,6 +41,7 @@ def get_demo_request_service(
         notification_service=notification_service,
         notify_email=settings.demo_request_notify_email,
         sales_webhook=sales_webhook,
+        dedupe_minutes=settings.demo_request_dedupe_minutes,
     )
 
 

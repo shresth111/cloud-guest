@@ -1855,6 +1855,23 @@ class Settings(BaseSettings):
             "an arbitrary address."
         ),
     )
+    demo_request_dedupe_minutes: int = Field(
+        default=10,
+        ge=0,
+        le=1440,
+        description=(
+            "A public 'Book a Demo' submission that is byte-for-byte the "
+            "same lead (same normalized email, name, phone, company, "
+            "message and qualification fields) as one stored within this "
+            "many minutes is treated as a double-submit -- the stored row "
+            "is returned, no second row is written and no second team "
+            "email/webhook goes out. Covers the real case of a visitor "
+            "whose first POST timed out client-side (the form aborts at "
+            "20 s) after the server had already stored it, and a double "
+            "click that beats the button's disabled state. Anything that "
+            "differs in any field is a new lead. 0 disables."
+        ),
+    )
 
     platform_alert_emails: str = Field(
         default="",

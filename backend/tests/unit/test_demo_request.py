@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from pydantic import ValidationError
@@ -65,6 +65,7 @@ def _base_fields(**overrides: object) -> dict[str, object]:
 @dataclass
 class FakeDemoRequestRepository:
     requests: dict[uuid.UUID, DemoRequest] = field(default_factory=dict)
+    commits: int = 0
 
     async def create(self, **fields: object) -> DemoRequest:
         demo_request = DemoRequest(**_base_fields(**fields))
@@ -81,6 +82,20 @@ class FakeDemoRequestRepository:
             setattr(demo_request, key, value)
         demo_request.version += 1
         return demo_request
+
+    async def commit(self) -> None:
+        self.commits += 1
+
+    async def find_recent_by_email(
+        self, email: str, *, since: datetime
+    ) -> DemoRequest | None:
+        candidates = [
+            r
+            for r in self.requests.values()
+            if r.email == email and not r.is_deleted and r.created_at >= since
+        ]
+        candidates.sort(key=lambda r: r.created_at, reverse=True)
+        return candidates[0] if candidates else None
 
     async def list_records(
         self,
@@ -173,6 +188,33 @@ class TestDemoRequestCreateRequestValidation:
         request = _make_request(location_count=20, router_count=45)
         assert request.location_count == 20
         assert request.router_count == 45
+
+
+class TestHoneypot:
+    def test_omitted_or_empty_is_fine(self) -> None:
+        assert _make_request().website is None
+        assert _make_request(website="").website is None
+        assert _make_request(website="   ").website is None
+
+    def test_filled_honeypot_is_a_validation_error_not_a_silent_drop(self) -> None:
+        with pytest.raises(ValidationError) as excinfo:
+            _make_request(website="https://spam.example")
+        (error,) = excinfo.value.errors()
+        assert error["loc"] == ("website",)
+        assert "Leave this field empty" in error["msg"]
+
+    def test_indian_phone_formats_pass_unchanged(self) -> None:
+        # The site's <input type="tel"> sends whatever the visitor typed;
+        # none of the common Indian spellings may be refused.
+        for phone in (
+            "9876543210",
+            "09876543210",
+            "+91 98765 43210",
+            "+91-98765-43210",
+            "+919876543210",
+            "(011) 2345 6789",
+        ):
+            assert _make_request(phone=phone).phone == phone
 
 
 class TestDemoRequestUpdateRequestValidation:
@@ -321,6 +363,199 @@ class TestSubmitDemoRequest:
         )
 
         assert "status" not in captured
+
+
+# ============================================================================
+# Service: the lead is durable before any best-effort side effect runs
+# ============================================================================
+
+
+@dataclass
+class _RollingBackRepository(FakeDemoRequestRepository):
+    """Models the real session: ``create`` only *flushes* (the row sits in
+    ``pending``), ``commit`` makes it durable, and a failing flush anywhere
+    on the same session -- which is what ``GenericRepository
+    ._flush_or_raise`` turns into ``session.rollback()`` -- discards every
+    pending row."""
+
+    pending: dict[uuid.UUID, DemoRequest] = field(default_factory=dict)
+
+    async def create(self, **fields: object) -> DemoRequest:  # type: ignore[override]
+        demo_request = DemoRequest(**_base_fields(**fields))
+        self.pending[demo_request.id] = demo_request
+        return demo_request
+
+    async def commit(self) -> None:
+        self.requests.update(self.pending)
+        self.pending.clear()
+        self.commits += 1
+
+    def rollback(self) -> None:
+        self.pending.clear()
+
+
+class _EnqueueFailsAndRollsBack:
+    """A NotificationService whose enqueue hits a DB error: the flush fails,
+    the shared session is rolled back, and the error propagates (to be
+    swallowed by the caller's best-effort guard)."""
+
+    def __init__(self, repository: _RollingBackRepository) -> None:
+        self.repository = repository
+        self.calls = 0
+
+    async def enqueue(self, **fields: object) -> object:
+        self.calls += 1
+        self.repository.rollback()
+        raise RuntimeError("simulated flush failure on notification_deliveries")
+
+
+class TestLeadIsCommittedBeforeSideEffects:
+    async def test_lead_survives_a_notification_db_failure(self) -> None:
+        repository = _RollingBackRepository()
+        notifier = _EnqueueFailsAndRollsBack(repository)
+        service = DemoRequestService(
+            repository,
+            notification_service=notifier,
+            notify_email="sales@example.com",
+        )
+
+        demo_request = await service.submit_demo_request(
+            full_name="Alice Anderson",
+            email="alice@example.com",
+            phone=None,
+            company_name="Lakeside Hotel",
+            message=None,
+        )
+
+        # The notification was attempted and failed; the submission still
+        # succeeded (never raises) AND the lead is durable.
+        assert notifier.calls == 1
+        assert demo_request.id in repository.requests
+        assert repository.pending == {}
+
+    async def test_commit_happens_before_notification_and_webhook(self) -> None:
+        events: list[str] = []
+
+        @dataclass
+        class _OrderedRepository(FakeDemoRequestRepository):
+            async def commit(self) -> None:
+                events.append("commit")
+                await super().commit()
+
+        class _Notifier:
+            async def enqueue(self, **fields: object) -> object:
+                events.append("notify")
+                return object()
+
+        class _Webhook:
+            async def publish(self, event: str, data: dict[str, object]) -> None:
+                events.append(f"webhook:{event}")
+
+        service = DemoRequestService(
+            _OrderedRepository(),
+            notification_service=_Notifier(),
+            notify_email="sales@example.com",
+            sales_webhook=_Webhook(),
+        )
+        await service.submit_demo_request(
+            full_name="Alice Anderson",
+            email="alice@example.com",
+            phone=None,
+            company_name="Lakeside Hotel",
+            message=None,
+        )
+
+        assert events == ["commit", "notify", "webhook:demo_request.created"]
+
+
+# ============================================================================
+# Service: double-submit dedupe
+# ============================================================================
+
+
+class _CountingNotifier:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def enqueue(self, **fields: object) -> object:
+        self.calls += 1
+        return object()
+
+
+_LEAD = {
+    "full_name": "Alice Anderson",
+    "email": "alice@example.com",
+    "phone": "+91 98765 43210",
+    "company_name": "Lakeside Hotel",
+    "message": "Two properties in Goa",
+    "property_type": "hotel",
+    "location_count": 2,
+    "router_count": 4,
+}
+
+
+class TestDoubleSubmitDedupe:
+    def _service(
+        self, *, dedupe_minutes: int = 10, clock=None
+    ) -> tuple[DemoRequestService, FakeDemoRequestRepository, _CountingNotifier]:
+        repository = FakeDemoRequestRepository()
+        notifier = _CountingNotifier()
+        service = DemoRequestService(
+            repository,
+            notification_service=notifier,
+            notify_email="sales@example.com",
+            dedupe_minutes=dedupe_minutes,
+            clock=clock,
+        )
+        return service, repository, notifier
+
+    async def test_identical_resubmit_returns_the_stored_lead_once(self) -> None:
+        service, repository, notifier = self._service()
+
+        first = await service.submit_demo_request(**_LEAD)
+        # The form sends the same values; whitespace/case drift on the
+        # email must not defeat the match either.
+        resent = {**_LEAD, "email": "  Alice@Example.com ", "full_name": " Alice  "}
+        resent["full_name"] = " Alice Anderson "
+        second = await service.submit_demo_request(**resent)
+
+        assert second.id == first.id
+        assert len(repository.requests) == 1
+        assert notifier.calls == 1
+        assert repository.commits == 1
+
+    async def test_any_changed_field_is_a_new_lead(self) -> None:
+        service, repository, notifier = self._service()
+
+        await service.submit_demo_request(**_LEAD)
+        await service.submit_demo_request(**{**_LEAD, "message": "Three properties"})
+        await service.submit_demo_request(**{**_LEAD, "router_count": None})
+
+        assert len(repository.requests) == 3
+        assert notifier.calls == 3
+
+    async def test_window_zero_disables_dedupe(self) -> None:
+        service, repository, _notifier = self._service(dedupe_minutes=0)
+
+        await service.submit_demo_request(**_LEAD)
+        await service.submit_demo_request(**_LEAD)
+
+        assert len(repository.requests) == 2
+
+    async def test_same_lead_after_the_window_is_a_new_lead(self) -> None:
+        now = datetime(2026, 11, 7, 10, 0, tzinfo=UTC)
+        service, repository, _notifier = self._service(
+            dedupe_minutes=10, clock=lambda: now
+        )
+
+        first = await service.submit_demo_request(**_LEAD)
+        # The fake stamps created_at with the real wall clock; pin it so
+        # the window arithmetic is deterministic.
+        first.created_at = now - timedelta(minutes=11)
+        second = await service.submit_demo_request(**_LEAD)
+
+        assert second.id != first.id
+        assert len(repository.requests) == 2
 
 
 # ============================================================================

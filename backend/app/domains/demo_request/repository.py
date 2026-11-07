@@ -13,6 +13,7 @@ own module docstring), so this is a thinner wrapper than
 from __future__ import annotations
 
 import uuid
+from datetime import datetime
 from typing import Protocol
 
 from sqlalchemy import func, or_, select
@@ -43,6 +44,12 @@ class DemoRequestRepositoryProtocol(Protocol):
         property_type: str | None = None,
     ) -> tuple[list[DemoRequest], PaginationMeta]: ...
 
+    async def commit(self) -> None: ...
+
+    async def find_recent_by_email(
+        self, email: str, *, since: datetime
+    ) -> DemoRequest | None: ...
+
 
 class DemoRequestRepository:
     """Concrete, SQLAlchemy-backed implementation of
@@ -62,6 +69,37 @@ class DemoRequestRepository:
         self, demo_request: DemoRequest, data: dict[str, object]
     ) -> DemoRequest:
         return await self.demo_requests.update(demo_request, data)
+
+    async def commit(self) -> None:
+        """Make the lead durable *now*, before any best-effort side effect
+        runs -- see ``service.DemoRequestService.submit_demo_request``.
+        The request-scoped session still commits again at the end of the
+        request (``app.database.session.get_db_session``); a second commit
+        of an already-committed transaction is a no-op, exactly as
+        ``app.domains.demo_booking.repository`` already relies on."""
+        await self.session.commit()
+
+    async def find_recent_by_email(
+        self, email: str, *, since: datetime
+    ) -> DemoRequest | None:
+        """The newest live lead from ``email`` created at or after
+        ``since`` -- the double-submit check's candidate (see
+        ``service.DemoRequestService.submit_demo_request``). A plain
+        ``SELECT`` on the existing ``ix_demo_requests_email`` index; under
+        concurrency the worst case is one duplicate row, which is the
+        status quo, never a lost lead."""
+        statement = (
+            select(DemoRequest)
+            .where(
+                DemoRequest.email == email,
+                DemoRequest.is_deleted.is_(False),
+                DemoRequest.created_at >= since,
+            )
+            .order_by(DemoRequest.created_at.desc())
+            .limit(1)
+        )
+        result = await self.session.execute(statement)
+        return result.scalars().first()
 
     def _list_filters(
         self,
