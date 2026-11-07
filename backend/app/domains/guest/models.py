@@ -114,6 +114,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
+from typing import Any
 
 from sqlalchemy import (
     BigInteger,
@@ -536,6 +537,13 @@ class GuestSession(BaseModel):
     #: this column existed.
     ap_mac: Mapped[str | None] = mapped_column(String(17), nullable=True)
     ap_ssid: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    #: NAS-only (Aruba Instant On) only: the last-seen octet totals of the
+    #: few most recent NAS sessions (``Acct-Session-Id``) mapped onto this
+    #: row, ``{acct_session_id: [uploaded, downloaded]}``. The AP's counters
+    #: restart per NAS session, so accounting deltas are taken against these,
+    #: not the row's lifetime bytes. See ``nas_session_counters``. Written
+    #: only by the shared Aruba listener's accounting; NULL everywhere else.
+    nas_counters: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
 
     __table_args__ = (
         Index("ix_guest_sessions_guest_id", "guest_id"),

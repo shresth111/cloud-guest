@@ -105,13 +105,20 @@ class InstantOnRepository:
         self, *, location_id: uuid.UUID, organization_id: uuid.UUID
     ) -> InstantOnSite | None:
         """Tenant-scoped in the query: another tenant's location id finds
-        nothing, exactly like a location of the caller's own with no site."""
+        nothing, exactly like a location of the caller's own with no site.
+        A site whose fleet router was deleted finds nothing too (the join
+        ``list_sites`` already uses): deleting a router leaves its site row
+        behind, and it must not keep serving the venue."""
+        from app.domains.router.models import Router
+
         statement = (
             select(InstantOnSite)
+            .join(Router, Router.id == InstantOnSite.router_id)
             .where(
                 InstantOnSite.location_id == location_id,
                 InstantOnSite.organization_id == organization_id,
                 InstantOnSite.is_deleted.is_(False),
+                Router.is_deleted.is_(False),
             )
             .order_by(InstantOnSite.created_at.asc())
             .limit(1)

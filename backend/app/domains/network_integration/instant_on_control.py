@@ -116,9 +116,18 @@ async def resolve_control_target(
         return None
     if router_id is None and location_id is None:
         return None
-    statement = select(InstantOnSite).where(
-        InstantOnSite.organization_id == organization_id,
-        InstantOnSite.is_deleted.is_(False),
+    from app.domains.router.models import Router
+
+    # A deleted fleet router leaves its site row behind; it must never
+    # resolve as a write target (same join as ``list_sites`` and the poller).
+    statement = (
+        select(InstantOnSite)
+        .join(Router, Router.id == InstantOnSite.router_id)
+        .where(
+            InstantOnSite.organization_id == organization_id,
+            InstantOnSite.is_deleted.is_(False),
+            Router.is_deleted.is_(False),
+        )
     )
     if router_id is not None:
         statement = statement.where(InstantOnSite.router_id == router_id)
@@ -261,7 +270,38 @@ async def end_nas_only_session(
     """Take ``client_mac`` off the venue now. ``True`` only when Instant On's
     blocked list, read back, shows the device (the AP then drops it). Never
     raises: ``False`` means "could not", and the caller keeps the NAS-only
-    behaviour it had before this existed."""
+    behaviour it had before this existed. That includes a database or Redis
+    failure, or any other unexpected error -- none may escape into the
+    enforcement path that called this."""
+    try:
+        return await _end_nas_only_session(
+            session,
+            router_id=router_id,
+            organization_id=organization_id,
+            client_mac=client_mac,
+            settings=settings,
+        )
+    except Exception as error:  # noqa: BLE001 -- see docstring: never raises
+        logger.error(
+            "instant_on_disconnect_unexpected_error",
+            extra={
+                "router_id": str(router_id),
+                "organization_id": str(organization_id) if organization_id else None,
+                "error_type": type(error).__name__,
+                "enforcement_delivered": False,
+            },
+        )
+        return False
+
+
+async def _end_nas_only_session(
+    session: AsyncSession,
+    *,
+    router_id: uuid.UUID,
+    organization_id: uuid.UUID | None,
+    client_mac: str,
+    settings: Settings | None = None,
+) -> bool:
     settings = settings or get_settings()
     target = await resolve_control_target(
         session,

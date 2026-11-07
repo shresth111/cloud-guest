@@ -590,6 +590,24 @@ VENDOR_NEUTRAL: dict[str, str] = {
         "`agent_managed_only` would make it find nothing, by definition, and "
         "close the gate everywhere."
     ),
+    "app/domains/network_integration/instant_on_control.py::"
+    "resolve_control_target": (
+        "Joins `routers` only to drop `instant_on_sites` rows whose fleet "
+        "router was deleted (`Router.is_deleted IS FALSE`), the same join "
+        "`list_sites` uses: a deleted AP must never resolve as an Instant On "
+        "write target. Every row it can return is an Instant On site, so a "
+        "NAS-only router by construction; the router allowlist "
+        "(`cloud_control_allowed`) then gates the write. Wrapping it in "
+        "`agent_managed_only` would make it find nothing, by definition."
+    ),
+    "app/domains/network_integration/instant_on_repository.py::"
+    "InstantOnRepository.get_site_for_location": (
+        "Joins `routers` only to drop a site row whose fleet router was "
+        "deleted, so a removed AP stops serving its venue's customer reads. "
+        "Every row it can return is an Instant On site, i.e. a NAS-only "
+        "router by construction; it feeds no device work. Wrapping it in "
+        "`agent_managed_only` would make it find nothing, by definition."
+    ),
     "app/domains/network_integration/instant_on_repository.py::"
     "InstantOnRepository.list_sites": (
         "Joins `routers` only to drop `instant_on_sites` rows whose fleet router "
