@@ -830,7 +830,7 @@ class TestCustomerSpeedStatus:
 
     async def test_push_flag_off_is_pending_without_steps(self, nas_only) -> None:  # noqa: ANN001
         result = await self._run(_settings())
-        assert (result.status, result.reason) == ("pending", "awaiting_setup")
+        assert (result.status, result.reason) == ("pending", "push_off")
         assert result.cloud_apply_available is False and result.items == []
         _no_vendor_steps(result.as_dict())
 
@@ -848,7 +848,7 @@ class TestCustomerSpeedStatus:
             lambda: SimpleNamespace(resolve_control_target=_none),
         )
         result = await self._run(_settings(instant_on_ssid_tier_push_enabled=True))
-        assert (result.status, result.reason) == ("pending", "awaiting_setup")
+        assert (result.status, result.reason) == ("pending", "cloud_control_off")
         _no_vendor_steps(result.as_dict())
 
     async def test_cloud_control_router_not_nas_only_writes_nothing(
@@ -967,6 +967,32 @@ class TestCustomerSpeedStatus:
         assert "Instant On app > Networks > WYFY_FREE" in result.manual_steps[0]
 
 
+class FakeRedis:
+    def __init__(self, fail: bool = False) -> None:
+        self.store: dict[str, str] = {}
+        self.ttl: dict[str, int] = {}
+        self.fail = fail
+
+    async def get(self, key: str):  # noqa: ANN201
+        if self.fail:
+            raise ConnectionError("redis down")
+        return self.store.get(key)
+
+    async def set(self, key: str, value: str, ex: int | None = None) -> None:
+        if self.fail:
+            raise ConnectionError("redis down")
+        self.store[key] = value
+        self.ttl[key] = ex
+
+
+class FakeAudit:
+    def __init__(self) -> None:
+        self.entries: list[dict[str, Any]] = []
+
+    async def create_audit_log_entry(self, **fields: Any) -> None:
+        self.entries.append(fields)
+
+
 class _Locations:
     def __init__(self, location) -> None:  # noqa: ANN001
         self.location = location
@@ -1052,6 +1078,7 @@ class TestCustomerRoutes:
             location_service=_Locations(location),
             service=_Tiers(),
             db=None,
+            redis=FakeRedis(),
         )
         data = body["data"]
         assert "instant_on_manual_steps" not in data
@@ -1078,6 +1105,7 @@ class TestCustomerRoutes:
             location_service=_Locations(SimpleNamespace(id=loc, organization_id=org)),
             service=_Tiers(),
             db=None,
+            redis=FakeRedis(),
         )
         assert body["data"]["speed_status"]["status"] == "not_applicable"
 
@@ -1095,6 +1123,7 @@ class TestCustomerRoutes:
             return CustomerSpeedStatus("applied", None, True, [])
 
         monkeypatch.setattr(mod, "customer_apply_ssid_tier_speeds", _apply)
+        audit = FakeAudit()
         row_org, loc = uuid.uuid4(), uuid.uuid4()
         body = await mod.apply_ssid_tier_speeds(
             _request(),
@@ -1108,11 +1137,15 @@ class TestCustomerRoutes:
             ),
             service=_Tiers(),
             db=None,
+            redis=FakeRedis(),
+            audit_writer=audit,
         )
         assert seen["organization_id"] == row_org and seen["location_id"] == loc
         assert seen["dry_run"] is False
         assert body["data"]["status"] == "applied"
         _no_vendor_steps(body["data"])
+        assert isinstance(seen["cache"], mod.SpeedStatusCache)
+        assert [e["action"] for e in audit.entries] == ["ssid_tier_speeds.apply"]
 
     async def test_apply_route_refuses_a_sibling_location(self) -> None:
         from app.domains.guest import ssid_tier_router as mod
@@ -1133,6 +1166,8 @@ class TestCustomerRoutes:
                 location_service=_NoLocations(),
                 service=_Tiers(),
                 db=None,
+                redis=FakeRedis(),
+                audit_writer=FakeAudit(),
             )
 
 
@@ -1165,3 +1200,286 @@ class TestNasOnlyRouterQuery:
         vendors = next(v for v in params.values() if isinstance(v, list))
         assert "mikrotik" not in vendors and "omada" not in vendors
         assert "aruba_instant_on" in vendors
+
+
+# ============================================================================
+# GET/PUT never call Instant On; cache; distinct gate reasons
+# ============================================================================
+
+
+@pytest.fixture
+def no_instant_on_client(monkeypatch):  # noqa: ANN001, ANN201
+    """Any attempt to build or use an Instant On client fails the test."""
+    from app.domains.guest import ssid_tier_instant_on as mod
+
+    def _boom(*a, **kw):  # noqa: ANN002, ANN003, ANN202
+        raise AssertionError("GET/PUT must not construct an Instant On client")
+
+    monkeypatch.setattr(mod, "_live_client_factory", _boom)
+    monkeypatch.setattr(mod, "_list_networks", _boom)
+    monkeypatch.setattr(mod, "sync_ssid_tiers_to_instant_on", _boom)
+
+
+def _cached(**over: Any):  # noqa: ANN202
+    from app.domains.guest.ssid_tier_instant_on import customer_cached_speed_status
+
+    kw: dict[str, Any] = {
+        "organization_id": uuid.uuid4(),
+        "location_id": uuid.uuid4(),
+        "rules": RULES,
+        "settings": _settings(instant_on_ssid_tier_push_enabled=True),
+        "cache": None,
+    }
+    kw.update(over)
+    return customer_cached_speed_status(None, **kw)
+
+
+class TestCachedSpeedStatus:
+    async def test_gates_open_cache_miss_is_not_checked_without_a_client(
+        self, nas_only, aruba_control_open, no_instant_on_client
+    ) -> None:  # noqa: ANN001
+        from app.domains.guest.ssid_tier_instant_on import SpeedStatusCache
+
+        result = await _cached(cache=SpeedStatusCache(FakeRedis()))
+        assert (result.status, result.reason) == ("pending", "not_checked")
+        assert result.cloud_apply_available is True
+
+    async def test_apply_stores_and_get_serves_the_cache(
+        self, nas_only, aruba_control_open, monkeypatch
+    ) -> None:  # noqa: ANN001
+        from app.domains.guest import ssid_tier_instant_on as mod
+        from app.domains.guest.ssid_tier_instant_on import (
+            SPEED_STATUS_CACHE_TTL_SECONDS,
+            SpeedStatusCache,
+            customer_apply_ssid_tier_speeds,
+        )
+
+        redis = FakeRedis()
+        cache = SpeedStatusCache(redis)
+        org, loc = uuid.uuid4(), uuid.uuid4()
+        client = _two_networks(_Limit(None, None), _Limit(None, None))
+        applied = await customer_apply_ssid_tier_speeds(
+            None,
+            organization_id=org,
+            location_id=loc,
+            rules=RULES,
+            dry_run=False,
+            settings=_settings(instant_on_ssid_tier_push_enabled=True),
+            client_factory=_factory(client),
+            cache=cache,
+        )
+        assert applied.status == "applied"
+        key = SpeedStatusCache.key(loc)
+        assert redis.ttl[key] == SPEED_STATUS_CACHE_TTL_SECONDS
+
+        def _boom(*a, **kw):  # noqa: ANN002, ANN003, ANN202
+            raise AssertionError("cache hit must not call Instant On")
+
+        monkeypatch.setattr(mod, "sync_ssid_tiers_to_instant_on", _boom)
+        monkeypatch.setattr(mod, "_live_client_factory", _boom)
+        hit = await _cached(organization_id=org, location_id=loc, cache=cache)
+        assert hit.as_dict() == applied.as_dict()
+
+    async def test_changed_tiers_miss_the_cache(
+        self, nas_only, aruba_control_open, no_instant_on_client
+    ) -> None:  # noqa: ANN001
+        from app.domains.guest.ssid_tier_instant_on import (
+            CustomerSpeedStatus,
+            SpeedStatusCache,
+            rules_fingerprint,
+        )
+
+        cache = SpeedStatusCache(FakeRedis())
+        loc = uuid.uuid4()
+        await cache.set(
+            loc, rules_fingerprint(RULES), CustomerSpeedStatus("applied", None, True)
+        )
+        changed = [FREE, SsidTierRule("WYFY_PREMIUM", "Premium", True, None, (), 80)]
+        result = await _cached(location_id=loc, rules=changed, cache=cache)
+        assert result.reason == "not_checked"
+
+    async def test_redis_down_is_a_miss_not_an_error(
+        self, nas_only, aruba_control_open, no_instant_on_client
+    ) -> None:  # noqa: ANN001
+        from app.domains.guest.ssid_tier_instant_on import SpeedStatusCache
+
+        result = await _cached(cache=SpeedStatusCache(FakeRedis(fail=True)))
+        assert result.reason == "not_checked"
+
+    async def test_cache_is_ignored_once_a_gate_closes(
+        self, nas_only, aruba_control_open
+    ) -> None:  # noqa: ANN001
+        from app.domains.guest.ssid_tier_instant_on import (
+            CustomerSpeedStatus,
+            SpeedStatusCache,
+            rules_fingerprint,
+        )
+
+        cache = SpeedStatusCache(FakeRedis())
+        loc = uuid.uuid4()
+        await cache.set(
+            loc, rules_fingerprint(RULES), CustomerSpeedStatus("applied", None, True)
+        )
+        result = await _cached(location_id=loc, cache=cache, settings=_settings())
+        assert (result.status, result.reason) == ("pending", "push_off")
+
+    async def test_preview_failure_is_not_cached_as_applied(
+        self, nas_only, aruba_control_open
+    ) -> None:  # noqa: ANN001
+        from app.domains.guest.ssid_tier_instant_on import (
+            SpeedStatusCache,
+            customer_apply_ssid_tier_speeds,
+            rules_fingerprint,
+        )
+
+        @asynccontextmanager
+        async def _broken(target):  # noqa: ANN001, ANN202
+            raise RuntimeError("boom")
+            yield  # pragma: no cover
+
+        cache = SpeedStatusCache(FakeRedis())
+        loc = uuid.uuid4()
+        await customer_apply_ssid_tier_speeds(
+            None,
+            organization_id=uuid.uuid4(),
+            location_id=loc,
+            rules=RULES,
+            dry_run=True,
+            settings=_settings(instant_on_ssid_tier_push_enabled=True),
+            client_factory=_broken,
+            cache=cache,
+        )
+        cached = await cache.get(loc, rules_fingerprint(RULES))
+        assert cached is not None and cached.status == "pending"
+        assert cached.reason == "apply_failed"
+
+    async def test_get_and_put_handlers_build_no_client(
+        self, nas_only, aruba_control_open, no_instant_on_client, monkeypatch
+    ) -> None:  # noqa: ANN001
+        from app.domains.guest import ssid_tier_router as mod
+
+        org, loc = uuid.uuid4(), uuid.uuid4()
+        location = SimpleNamespace(id=loc, organization_id=org)
+
+        class _SavingTiers(_Tiers):
+            async def replace(self, **kw):  # noqa: ANN003, ANN201
+                return list(RULES)
+
+        common = {
+            "requesting_organization_id": org,
+            "scope_location_id": loc,
+            "location_service": _Locations(location),
+            "service": _SavingTiers(),
+            "db": None,
+            "redis": FakeRedis(),
+        }
+        settings = SimpleNamespace(
+            instant_on_ssid_tier_push_enabled=True,
+            instant_on_cloud_control_enabled=True,
+        )
+        monkeypatch.setattr(mod, "get_settings", lambda: settings)
+        got = await mod.list_ssid_tiers(_request(), loc, **common)
+        put = await mod.replace_ssid_tiers(
+            _request(),
+            loc,
+            mod.SsidTierReplaceRequest(items=[]),
+            user=SimpleNamespace(id=str(uuid.uuid4())),
+            **common,
+        )
+        for body in (got, put):
+            assert body["data"]["speed_status"]["reason"] == "not_checked"
+            _no_vendor_steps(body["data"])
+
+
+class TestDistinctGateReasons:
+    async def test_push_off(self, nas_only) -> None:  # noqa: ANN001
+        result = await _cached(settings=_settings())
+        assert result.reason == "push_off"
+
+    async def test_cloud_control_not_in_build(self, nas_only, monkeypatch) -> None:  # noqa: ANN001
+        from app.domains.guest import ssid_tier_instant_on as mod
+
+        monkeypatch.setattr(mod, "_control_module", lambda: None)
+        result = await _cached()
+        assert (result.status, result.reason) == ("pending", "cloud_control_off")
+
+    def _no_target(self, monkeypatch, *, site_mapped: bool):  # noqa: ANN001, ANN202
+        from app.domains.guest import ssid_tier_instant_on as mod
+
+        async def _none(db, **kw):  # noqa: ANN001, ANN003, ANN202
+            return None
+
+        async def _mapped(db, **kw):  # noqa: ANN001, ANN003, ANN202
+            return site_mapped
+
+        monkeypatch.setattr(
+            mod,
+            "_control_module",
+            lambda: SimpleNamespace(resolve_control_target=_none),
+        )
+        monkeypatch.setattr(mod, "instant_on_site_mapped", _mapped)
+
+    async def test_cloud_control_switched_off(self, nas_only, monkeypatch) -> None:  # noqa: ANN001
+        self._no_target(monkeypatch, site_mapped=True)
+        result = await _cached(
+            settings=_settings(
+                instant_on_ssid_tier_push_enabled=True,
+                instant_on_cloud_control_enabled=False,
+            )
+        )
+        assert result.reason == "cloud_control_off"
+
+    async def test_router_not_allowed_is_cloud_control_off(
+        self, nas_only, monkeypatch
+    ) -> None:  # noqa: ANN001
+        self._no_target(monkeypatch, site_mapped=True)
+        result = await _cached(
+            settings=_settings(
+                instant_on_ssid_tier_push_enabled=True,
+                instant_on_cloud_control_enabled=True,
+            )
+        )
+        assert result.reason == "cloud_control_off"
+
+    async def test_no_site_mapping_is_awaiting_setup(
+        self, nas_only, monkeypatch
+    ) -> None:  # noqa: ANN001
+        self._no_target(monkeypatch, site_mapped=False)
+        settings = _settings(
+            instant_on_ssid_tier_push_enabled=True,
+            instant_on_cloud_control_enabled=True,
+        )
+        assert (await _cached(settings=settings)).reason == "awaiting_setup"
+        from app.domains.guest.ssid_tier_instant_on import (
+            customer_apply_ssid_tier_speeds,
+        )
+
+        applied = await customer_apply_ssid_tier_speeds(
+            None,
+            organization_id=uuid.uuid4(),
+            location_id=uuid.uuid4(),
+            rules=RULES,
+            dry_run=False,
+            settings=settings,
+        )
+        assert (applied.status, applied.reason) == ("pending", "awaiting_setup")
+
+    async def test_site_mapped_query_is_tenant_scoped(self) -> None:
+        from app.domains.guest.ssid_tier_instant_on import instant_on_site_mapped
+
+        captured: list[Any] = []
+
+        class _Db:
+            async def execute(self, statement):  # noqa: ANN001, ANN201
+                captured.append(statement)
+                return SimpleNamespace(
+                    scalars=lambda: SimpleNamespace(first=lambda: uuid.uuid4())
+                )
+
+        org, loc = uuid.uuid4(), uuid.uuid4()
+        assert await instant_on_site_mapped(_Db(), organization_id=org, location_id=loc)
+        sql = str(captured[0])
+        params = captured[0].compile().params
+        assert "instant_on_sites.organization_id" in sql
+        assert "instant_on_sites.location_id" in sql
+        assert org in params.values() and loc in params.values()

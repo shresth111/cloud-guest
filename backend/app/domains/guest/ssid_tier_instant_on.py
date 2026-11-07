@@ -265,7 +265,16 @@ class CustomerSpeedState:
 class CustomerSpeedReason:
     NO_TIERS = "no_ssid_tiers"
     NOT_SUPPORTED = "not_supported_at_this_venue"
-    AWAITING_SETUP = "awaiting_setup"  # cloud apply not switched on (yet)
+    PUSH_OFF = "push_off"  # instant_on_ssid_tier_push_enabled is off
+    #: Cloud control is not in this build, switched off, or not allowed for
+    #: this venue's router (allowlist / write account).
+    CLOUD_CONTROL_OFF = "cloud_control_off"
+    #: Genuinely not configured yet: cloud control is on, but this venue has
+    #: no Instant On site mapping.
+    AWAITING_SETUP = "awaiting_setup"
+    #: Gates open, but no recent live check is cached; POST apply-speeds
+    #: (``dry_run: true``) runs one.
+    NOT_CHECKED = "not_checked"
     NOT_YET_APPLIED = "not_yet_applied"
     NOT_ALL_APPLIED = "not_all_applied"
     APPLY_FAILED = "apply_failed"
@@ -332,8 +341,14 @@ def customer_speed_status(result: SsidSyncResult) -> CustomerSpeedStatus:
             return CustomerSpeedStatus(
                 CustomerSpeedState.NOT_APPLICABLE, CustomerSpeedReason.NOT_SUPPORTED
             )
+        if result.reason == SyncReason.PUSH_DISABLED:
+            return CustomerSpeedStatus(
+                CustomerSpeedState.PENDING, CustomerSpeedReason.PUSH_OFF
+            )
+        # CLOUD_CONTROL_UNAVAILABLE / CLOUD_CONTROL_NOT_ENABLED. The caller
+        # refines NOT_ENABLED into AWAITING_SETUP when no site is mapped.
         return CustomerSpeedStatus(
-            CustomerSpeedState.PENDING, CustomerSpeedReason.AWAITING_SETUP
+            CustomerSpeedState.PENDING, CustomerSpeedReason.CLOUD_CONTROL_OFF
         )
     items = [_customer_item(i) for i in result.items]
     if result.status == SyncStatus.FAILED:
@@ -388,23 +403,124 @@ async def nas_only_router_at(
     return (await db.execute(statement.limit(1))).scalars().first() is not None
 
 
-async def customer_apply_ssid_tier_speeds(
+async def instant_on_site_mapped(
+    db: Any, *, organization_id: uuid.UUID, location_id: uuid.UUID
+) -> bool:
+    """True when this venue has a live Instant On site mapping (the Master
+    has set it up). Tenant-scoped in the WHERE clause."""
+    from sqlalchemy import select
+
+    from app.domains.network_integration.models import InstantOnSite
+
+    statement = select(InstantOnSite.id).where(
+        InstantOnSite.organization_id == organization_id,
+        InstantOnSite.location_id == location_id,
+        InstantOnSite.is_deleted.is_(False),
+    )
+    return (await db.execute(statement.limit(1))).scalars().first() is not None
+
+
+async def _no_target_reason(
+    db: Any, *, organization_id: uuid.UUID, location_id: uuid.UUID, settings: Any
+) -> str:
+    """Why no cloud-control target resolved: switched off / not allowed
+    (``cloud_control_off``) or genuinely not configured (``awaiting_setup``)."""
+    if not getattr(settings, "instant_on_cloud_control_enabled", False):
+        return CustomerSpeedReason.CLOUD_CONTROL_OFF
+    if not await instant_on_site_mapped(
+        db, organization_id=organization_id, location_id=location_id
+    ):
+        return CustomerSpeedReason.AWAITING_SETUP
+    return CustomerSpeedReason.CLOUD_CONTROL_OFF
+
+
+def rules_fingerprint(rules: Sequence[SsidTierRule]) -> str:
+    """Changes whenever the saved SSID -> speed mapping changes, so a cached
+    check never vouches for speeds it did not see."""
+    import hashlib
+    import json
+
+    material = sorted((ssid_key(r.ssid), r.download_mbps, r.upload_mbps) for r in rules)
+    return hashlib.sha256(json.dumps(material).encode()).hexdigest()[:32]
+
+
+#: How long a live check answers the customer GET/PUT.
+SPEED_STATUS_CACHE_TTL_SECONDS = 300
+
+
+class SpeedStatusCache:
+    """The last live check per location, in Redis, short TTL.
+
+    Written only by POST apply-speeds (the one customer path that talks to
+    Instant On); read by GET/PUT, which never talk to Instant On. Every
+    Redis failure is a miss (read) or a no-op (write), never an error."""
+
+    def __init__(
+        self, redis: Any, *, ttl_seconds: int = SPEED_STATUS_CACHE_TTL_SECONDS
+    ) -> None:
+        self.redis = redis
+        self.ttl_seconds = ttl_seconds
+
+    @staticmethod
+    def key(location_id: uuid.UUID) -> str:
+        return f"ssid_tier:speed_status:{location_id}"
+
+    async def get(
+        self, location_id: uuid.UUID, fingerprint: str
+    ) -> CustomerSpeedStatus | None:
+        import json
+
+        try:
+            raw = await self.redis.get(self.key(location_id))
+            if raw is None:
+                return None
+            payload = json.loads(raw)
+            if payload.get("fp") != fingerprint:
+                return None
+            data = payload["status"]
+            return CustomerSpeedStatus(
+                status=data["status"],
+                reason=data.get("reason"),
+                cloud_apply_available=bool(data.get("cloud_apply_available")),
+                items=[CustomerSpeedItem(**i) for i in data.get("items") or []],
+            )
+        except Exception as exc:  # noqa: BLE001 -- a cache miss, never an error
+            logger.warning(
+                "ssid_tier_speed_status_cache_read_failed",
+                extra={"location_id": str(location_id), "error": str(exc)[:200]},
+            )
+            return None
+
+    async def set(
+        self,
+        location_id: uuid.UUID,
+        fingerprint: str,
+        status: CustomerSpeedStatus,
+    ) -> None:
+        import json
+
+        try:
+            await self.redis.set(
+                self.key(location_id),
+                json.dumps({"fp": fingerprint, "status": status.as_dict()}),
+                ex=self.ttl_seconds,
+            )
+        except Exception as exc:  # noqa: BLE001 -- best effort
+            logger.warning(
+                "ssid_tier_speed_status_cache_write_failed",
+                extra={"location_id": str(location_id), "error": str(exc)[:200]},
+            )
+
+
+async def _venue_gate(
     db: Any,
     *,
     organization_id: uuid.UUID,
     location_id: uuid.UUID,
     rules: Sequence[SsidTierRule],
-    dry_run: bool,
-    settings: Settings,
-    client_factory: Any = None,
-) -> CustomerSpeedStatus:
-    """The customer's path to the same sync the Master runs.
-
-    Only ever acts at a NAS-only venue whose cloud-control router is itself
-    NAS-only: any other venue (MikroTik, Omada, anything else) answers
-    ``not_applicable`` before a single Instant On read, so their behaviour
-    is untouched. ``dry_run=True`` is a read-only check (what the GET uses
-    to say ``applied`` vs ``pending``)."""
+) -> CustomerSpeedStatus | None:
+    """``not_applicable`` for no tiers or a venue without a NAS-only router
+    (every MikroTik / Omada venue), else ``None``."""
     if not rules:
         return CustomerSpeedStatus(
             CustomerSpeedState.NOT_APPLICABLE, CustomerSpeedReason.NO_TIERS
@@ -415,6 +531,95 @@ async def customer_apply_ssid_tier_speeds(
         return CustomerSpeedStatus(
             CustomerSpeedState.NOT_APPLICABLE, CustomerSpeedReason.NOT_SUPPORTED
         )
+    return None
+
+
+async def customer_cached_speed_status(
+    db: Any,
+    *,
+    organization_id: uuid.UUID,
+    location_id: uuid.UUID,
+    rules: Sequence[SsidTierRule],
+    settings: Settings,
+    cache: SpeedStatusCache | None,
+) -> CustomerSpeedStatus:
+    """The customer GET/PUT answer. Never constructs an Instant On client
+    and never calls Instant On: gates are evaluated from settings and the
+    database, and ``applied`` / per-SSID detail only ever comes from the
+    last live check POST apply-speeds cached (``not_checked`` otherwise)."""
+    closed = await _venue_gate(
+        db, organization_id=organization_id, location_id=location_id, rules=rules
+    )
+    if closed is not None:
+        return closed
+    if not settings.instant_on_ssid_tier_push_enabled:
+        return CustomerSpeedStatus(
+            CustomerSpeedState.PENDING, CustomerSpeedReason.PUSH_OFF
+        )
+    control = _control_module()
+    if control is None:
+        return CustomerSpeedStatus(
+            CustomerSpeedState.PENDING, CustomerSpeedReason.CLOUD_CONTROL_OFF
+        )
+    target = await control.resolve_control_target(
+        db,
+        organization_id=organization_id,
+        location_id=location_id,
+        settings=settings,
+    )
+    if target is None:
+        return CustomerSpeedStatus(
+            CustomerSpeedState.PENDING,
+            await _no_target_reason(
+                db,
+                organization_id=organization_id,
+                location_id=location_id,
+                settings=settings,
+            ),
+        )
+    router_id = getattr(target, "router_id", None)
+    if router_id is None or not await nas_only_router_at(
+        db,
+        organization_id=organization_id,
+        location_id=location_id,
+        router_id=router_id,
+    ):
+        return CustomerSpeedStatus(
+            CustomerSpeedState.NOT_APPLICABLE, CustomerSpeedReason.NOT_SUPPORTED
+        )
+    if cache is not None:
+        cached = await cache.get(location_id, rules_fingerprint(rules))
+        if cached is not None:
+            return cached
+    return CustomerSpeedStatus(
+        CustomerSpeedState.PENDING, CustomerSpeedReason.NOT_CHECKED, True
+    )
+
+
+async def customer_apply_ssid_tier_speeds(
+    db: Any,
+    *,
+    organization_id: uuid.UUID,
+    location_id: uuid.UUID,
+    rules: Sequence[SsidTierRule],
+    dry_run: bool,
+    settings: Settings,
+    client_factory: Any = None,
+    cache: SpeedStatusCache | None = None,
+) -> CustomerSpeedStatus:
+    """The customer's path to the same sync the Master runs -- and the only
+    customer path that talks to Instant On.
+
+    Only ever acts at a NAS-only venue whose cloud-control router is itself
+    NAS-only: any other venue (MikroTik, Omada, anything else) answers
+    ``not_applicable`` before a single Instant On read, so their behaviour
+    is untouched. ``dry_run=True`` is a read-only check. A live answer
+    (preview or apply) is stored in ``cache`` for the GET/PUT to serve."""
+    closed = await _venue_gate(
+        db, organization_id=organization_id, location_id=location_id, rules=rules
+    )
+    if closed is not None:
+        return closed
 
     async def _target_is_nas_only(target: Any) -> bool:
         router_id = getattr(target, "router_id", None)
@@ -437,7 +642,17 @@ async def customer_apply_ssid_tier_speeds(
         client_factory=client_factory,
         target_check=_target_is_nas_only,
     )
-    return customer_speed_status(result)
+    status_ = customer_speed_status(result)
+    if result.reason == SyncReason.CLOUD_CONTROL_NOT_ENABLED:
+        status_.reason = await _no_target_reason(
+            db,
+            organization_id=organization_id,
+            location_id=location_id,
+            settings=settings,
+        )
+    if status_.cloud_apply_available and cache is not None:
+        await cache.set(location_id, rules_fingerprint(rules), status_)
+    return status_
 
 
 def _live_client_factory(control: Any, settings: Settings) -> Any:
@@ -466,9 +681,14 @@ __all__ = [
     "SsidSyncResult",
     "SyncReason",
     "SyncStatus",
+    "SPEED_STATUS_CACHE_TTL_SECONDS",
+    "SpeedStatusCache",
     "customer_apply_ssid_tier_speeds",
+    "customer_cached_speed_status",
     "customer_speed_status",
     "match_network_ids",
+    "instant_on_site_mapped",
     "nas_only_router_at",
+    "rules_fingerprint",
     "sync_ssid_tiers_to_instant_on",
 ]

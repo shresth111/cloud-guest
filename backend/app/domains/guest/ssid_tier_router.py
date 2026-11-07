@@ -2,7 +2,8 @@
 
 * ``GET  /locations/{location_id}/ssid-tiers`` -- the venue's SSID -> tier
   mapping, plus a neutral ``speed_status`` (applied / pending /
-  not_applicable). Customer-facing: never carries vendor-app steps.
+  not_applicable). Customer-facing: never carries vendor-app steps and
+  never calls Instant On (status comes from the last cached live check).
 * ``PUT  /locations/{location_id}/ssid-tiers`` -- replace the mapping.
 * ``POST /locations/{location_id}/ssid-tiers/apply-speeds`` -- the customer
   (``bandwidth.update`` at ORGANIZATION, like the Usage Limits guest-speed
@@ -34,6 +35,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.common.responses import build_response
 from app.core.config import get_settings
+from app.database.redis import get_redis_client
 from app.database.session import get_db_session
 from app.domains.auth.models import AuthUser
 from app.domains.location.dependencies import get_location_service
@@ -44,12 +46,16 @@ from app.domains.rbac.dependencies import (
     CurrentOrganization,
     CurrentUser,
     RequirePermission,
+    get_rbac_repository,
 )
 from app.domains.rbac.enums import ScopeType
 
 from .dependencies import get_ssid_tier_service
 from .ssid_tier_instant_on import (
+    CustomerSpeedStatus,
+    SpeedStatusCache,
     customer_apply_ssid_tier_speeds,
+    customer_cached_speed_status,
     sync_ssid_tiers_to_instant_on,
 )
 from .ssid_tier_service import SsidTierInput, SsidTierService
@@ -129,18 +135,53 @@ def _payload(rules: list[SsidTierRule], speed_status: dict[str, Any]) -> dict[st
 
 
 async def _speed_status(
-    db: AsyncSession, location: Any, rules: list[SsidTierRule]
+    db: AsyncSession, location: Any, rules: list[SsidTierRule], redis: Any
 ) -> dict[str, Any]:
-    """Read-only (dry-run) check of whether the saved speeds are live."""
-    status_ = await customer_apply_ssid_tier_speeds(
+    """Settings + database + the cached last live check. Never an Instant On
+    call: a page load must not spend Instant On's rate budget or token
+    refreshes (those are shared with the Master's block/unblock)."""
+    status_ = await customer_cached_speed_status(
         db,
         organization_id=location.organization_id,
         location_id=location.id,
         rules=rules,
-        dry_run=True,
         settings=get_settings(),
+        cache=SpeedStatusCache(redis),
     )
     return status_.as_dict()
+
+
+async def _audit_apply(
+    audit_writer: Any,
+    *,
+    user: AuthUser,
+    location: Any,
+    result: CustomerSpeedStatus,
+) -> None:
+    """Same shape as the other customer-visible writes' audit rows."""
+    await audit_writer.create_audit_log_entry(
+        actor_user_id=uuid.UUID(str(user.id)),
+        action="ssid_tier_speeds.apply",
+        entity_type="location",
+        entity_id=location.id,
+        description=f"Speeds by WiFi network applied: {result.status}",
+        organization_id=location.organization_id,
+        location_id=location.id,
+        event_metadata={
+            "status": result.status,
+            "reason": result.reason,
+            "items": [
+                {
+                    "ssid": i.ssid,
+                    "download_mbps": i.download_mbps,
+                    "upload_mbps": i.upload_mbps,
+                    "status": i.status,
+                    "reason": i.reason,
+                }
+                for i in result.items
+            ],
+        },
+    )
 
 
 def _request_id(request: Request) -> str:
@@ -176,6 +217,7 @@ async def list_ssid_tiers(
     location_service: LocationService = Depends(get_location_service),
     service: SsidTierService = Depends(get_ssid_tier_service),
     db: AsyncSession = Depends(get_db_session),
+    redis: Any = Depends(get_redis_client),
 ):
     location = await _scoped_location(
         location_id, requesting_organization_id, scope_location_id, location_service
@@ -186,7 +228,7 @@ async def list_ssid_tiers(
     return build_response(
         success=True,
         message="Speed tiers by WiFi network",
-        data=_payload(rules, await _speed_status(db, location, rules)),
+        data=_payload(rules, await _speed_status(db, location, rules, redis)),
         request_id=_request_id(request),
     )
 
@@ -206,6 +248,7 @@ async def replace_ssid_tiers(
     location_service: LocationService = Depends(get_location_service),
     service: SsidTierService = Depends(get_ssid_tier_service),
     db: AsyncSession = Depends(get_db_session),
+    redis: Any = Depends(get_redis_client),
 ):
     location = await _scoped_location(
         location_id, requesting_organization_id, scope_location_id, location_service
@@ -230,7 +273,7 @@ async def replace_ssid_tiers(
     return build_response(
         success=True,
         message="Speed tiers by WiFi network saved",
-        data=_payload(rules, await _speed_status(db, location, rules)),
+        data=_payload(rules, await _speed_status(db, location, rules, redis)),
         request_id=_request_id(request),
     )
 
@@ -250,6 +293,8 @@ async def apply_ssid_tier_speeds(
     location_service: LocationService = Depends(get_location_service),
     service: SsidTierService = Depends(get_ssid_tier_service),
     db: AsyncSession = Depends(get_db_session),
+    redis: Any = Depends(get_redis_client),
+    audit_writer: Any = Depends(get_rbac_repository),
 ):
     """Customer: preview (default) or, with ``dry_run: false``, apply the
     venue's per-network speeds through cloud control -- the same sync the
@@ -257,7 +302,9 @@ async def apply_ssid_tier_speeds(
     ``not_applicable`` and never vendor-app steps. ``not_applicable`` (and
     nothing read or written) unless the venue is NAS-only and its
     cloud-control router is NAS-only; ``pending`` / ``awaiting_setup`` while
-    the push flag or the router's cloud control is off."""
+    the push flag or the router's cloud control is off. The only customer
+    path that talks to Instant On; its live answer is cached for GET/PUT.
+    ``dry_run: false`` writes an audit row."""
     location = await _scoped_location(
         location_id, requesting_organization_id, scope_location_id, location_service
     )
@@ -271,8 +318,10 @@ async def apply_ssid_tier_speeds(
         rules=rules,
         dry_run=payload.dry_run,
         settings=get_settings(),
+        cache=SpeedStatusCache(redis),
     )
     if not payload.dry_run:
+        await _audit_apply(audit_writer, user=user, location=location, result=result)
         logger.info(
             "ssid_tier_customer_apply",
             extra={
