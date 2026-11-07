@@ -1,10 +1,17 @@
 """HTTP surface of speed tiers by WiFi network (SSID).
 
 * ``GET  /locations/{location_id}/ssid-tiers`` -- the venue's SSID -> tier
-  mapping, plus what to set in Instant On by hand.
+  mapping, plus a neutral ``speed_status`` (applied / pending /
+  not_applicable). Customer-facing: never carries vendor-app steps.
 * ``PUT  /locations/{location_id}/ssid-tiers`` -- replace the mapping.
+* ``POST /locations/{location_id}/ssid-tiers/apply-speeds`` -- the customer
+  (``bandwidth.update`` at ORGANIZATION, like the Usage Limits guest-speed
+  write): preview (default) or apply the per-SSID speeds through cloud
+  control. Acts only at a NAS-only venue whose cloud-control router is
+  NAS-only; every other venue answers ``not_applicable``.
 * ``POST /locations/{location_id}/ssid-tiers/instant-on-sync`` -- Master only
   (GLOBAL): preview (default) or push the per-SSID speed caps to Instant On.
+  The only response that carries the by-hand steps (``manual_steps``).
 * ``POST /guest/ssid-access`` -- the guest portal's question for one session
   on one SSID (unauthenticated, keyed on the session id).
 
@@ -17,6 +24,7 @@ with the LOCATION ROW's organization, never a header or body value.
 
 from __future__ import annotations
 
+import logging
 import uuid
 from typing import Any
 
@@ -40,17 +48,29 @@ from app.domains.rbac.dependencies import (
 from app.domains.rbac.enums import ScopeType
 
 from .dependencies import get_ssid_tier_service
-from .ssid_tier_instant_on import sync_ssid_tiers_to_instant_on
-from .ssid_tier_service import (
-    SsidTierInput,
-    SsidTierService,
-    instant_on_manual_steps,
+from .ssid_tier_instant_on import (
+    customer_apply_ssid_tier_speeds,
+    sync_ssid_tiers_to_instant_on,
 )
+from .ssid_tier_service import SsidTierInput, SsidTierService
 from .ssid_tiers import MAX_SSID_LENGTH, MAX_TIER_MBPS, MIN_TIER_MBPS, SsidTierRule
 
 _PLATFORM_UPDATE = RequirePermission(
     "network_integrations.update", scope=ScopeType.GLOBAL
 )
+# Scopes pinned, never inferred from the caller's headers (the scope-inference
+# trap). LOCATION: an organization grant covers it for that organization, a
+# location grant for that location; ``_scoped_location`` then holds the path
+# id to the header location.
+_TIERS_READ = RequirePermission("policy.read", scope=ScopeType.LOCATION)
+_TIERS_UPDATE = RequirePermission("policy.update", scope=ScopeType.LOCATION)
+# Same key and scope as the customer Usage Limits Instant On speed write
+# (``instant_on_router._CUSTOMER_SPEED_UPDATE``).
+_CUSTOMER_SPEED_UPDATE = RequirePermission(
+    "bandwidth.update", scope=ScopeType.ORGANIZATION
+)
+
+logger = logging.getLogger(__name__)
 
 ssid_tier_router = APIRouter(tags=["Speed tiers by WiFi network"])
 ssid_tier_guest_router = APIRouter(prefix="/guest", tags=["Guest"])
@@ -97,13 +117,30 @@ def _item(rule: SsidTierRule) -> dict[str, Any]:
     }
 
 
-def _payload(rules: list[SsidTierRule]) -> dict[str, Any]:
+def _payload(rules: list[SsidTierRule], speed_status: dict[str, Any]) -> dict[str, Any]:
+    """Customer payload. No ``instant_on_manual_steps``: the by-hand steps
+    live on the Master sync response only (owner rule 2026-11-07)."""
     return {
         "items": [_item(rule) for rule in rules],
         "note": ONE_SPEED_PER_NETWORK,
-        "instant_on_manual_steps": instant_on_manual_steps(rules),
+        "speed_status": speed_status,
         "instant_on_push_enabled": get_settings().instant_on_ssid_tier_push_enabled,
     }
+
+
+async def _speed_status(
+    db: AsyncSession, location: Any, rules: list[SsidTierRule]
+) -> dict[str, Any]:
+    """Read-only (dry-run) check of whether the saved speeds are live."""
+    status_ = await customer_apply_ssid_tier_speeds(
+        db,
+        organization_id=location.organization_id,
+        location_id=location.id,
+        rules=rules,
+        dry_run=True,
+        settings=get_settings(),
+    )
+    return status_.as_dict()
 
 
 def _request_id(request: Request) -> str:
@@ -129,7 +166,7 @@ async def _scoped_location(
 @ssid_tier_router.get(
     "/locations/{location_id}/ssid-tiers",
     status_code=status.HTTP_200_OK,
-    dependencies=[Depends(RequirePermission("policy.read"))],
+    dependencies=[Depends(_TIERS_READ)],
 )
 async def list_ssid_tiers(
     request: Request,
@@ -138,6 +175,7 @@ async def list_ssid_tiers(
     scope_location_id: uuid.UUID | None = Depends(CurrentLocation),
     location_service: LocationService = Depends(get_location_service),
     service: SsidTierService = Depends(get_ssid_tier_service),
+    db: AsyncSession = Depends(get_db_session),
 ):
     location = await _scoped_location(
         location_id, requesting_organization_id, scope_location_id, location_service
@@ -148,7 +186,7 @@ async def list_ssid_tiers(
     return build_response(
         success=True,
         message="Speed tiers by WiFi network",
-        data=_payload(rules),
+        data=_payload(rules, await _speed_status(db, location, rules)),
         request_id=_request_id(request),
     )
 
@@ -156,7 +194,7 @@ async def list_ssid_tiers(
 @ssid_tier_router.put(
     "/locations/{location_id}/ssid-tiers",
     status_code=status.HTTP_200_OK,
-    dependencies=[Depends(RequirePermission("policy.update"))],
+    dependencies=[Depends(_TIERS_UPDATE)],
 )
 async def replace_ssid_tiers(
     request: Request,
@@ -167,6 +205,7 @@ async def replace_ssid_tiers(
     scope_location_id: uuid.UUID | None = Depends(CurrentLocation),
     location_service: LocationService = Depends(get_location_service),
     service: SsidTierService = Depends(get_ssid_tier_service),
+    db: AsyncSession = Depends(get_db_session),
 ):
     location = await _scoped_location(
         location_id, requesting_organization_id, scope_location_id, location_service
@@ -191,7 +230,63 @@ async def replace_ssid_tiers(
     return build_response(
         success=True,
         message="Speed tiers by WiFi network saved",
-        data=_payload(rules),
+        data=_payload(rules, await _speed_status(db, location, rules)),
+        request_id=_request_id(request),
+    )
+
+
+@ssid_tier_router.post(
+    "/locations/{location_id}/ssid-tiers/apply-speeds",
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(_CUSTOMER_SPEED_UPDATE)],
+)
+async def apply_ssid_tier_speeds(
+    request: Request,
+    location_id: uuid.UUID,
+    payload: SsidTierSyncRequest,
+    user: AuthUser = Depends(CurrentUser),
+    requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
+    scope_location_id: uuid.UUID | None = Depends(CurrentLocation),
+    location_service: LocationService = Depends(get_location_service),
+    service: SsidTierService = Depends(get_ssid_tier_service),
+    db: AsyncSession = Depends(get_db_session),
+):
+    """Customer: preview (default) or, with ``dry_run: false``, apply the
+    venue's per-network speeds through cloud control -- the same sync the
+    Master runs. Answers a neutral ``applied`` / ``pending`` /
+    ``not_applicable`` and never vendor-app steps. ``not_applicable`` (and
+    nothing read or written) unless the venue is NAS-only and its
+    cloud-control router is NAS-only; ``pending`` / ``awaiting_setup`` while
+    the push flag or the router's cloud control is off."""
+    location = await _scoped_location(
+        location_id, requesting_organization_id, scope_location_id, location_service
+    )
+    rules = await service.list_rules(
+        organization_id=location.organization_id, location_id=location.id
+    )
+    result = await customer_apply_ssid_tier_speeds(
+        db,
+        organization_id=location.organization_id,
+        location_id=location.id,
+        rules=rules,
+        dry_run=payload.dry_run,
+        settings=get_settings(),
+    )
+    if not payload.dry_run:
+        logger.info(
+            "ssid_tier_customer_apply",
+            extra={
+                "organization_id": str(location.organization_id),
+                "location_id": str(location.id),
+                "actor_user_id": str(user.id),
+                "status": result.status,
+                "reason": result.reason,
+            },
+        )
+    return build_response(
+        success=True,
+        message="Speeds by WiFi network",
+        data=result.as_dict(),
         request_id=_request_id(request),
     )
 

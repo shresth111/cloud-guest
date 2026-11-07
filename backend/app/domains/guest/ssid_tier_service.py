@@ -376,8 +376,13 @@ class GuestSsidAccess:
 
 
 def instant_on_manual_steps(rules: Sequence[SsidTierRule]) -> list[str]:
-    """What the owner sets in the Instant On app when cloud control is off.
-    One sentence per SSID, in Instant On's own words."""
+    """What ops set in the Instant On app when cloud control is off.
+    One sentence per SSID, in Instant On's own words.
+
+    MASTER ONLY: returned on the Master sync response
+    (``SsidSyncResult.manual_steps``) and never on a customer-facing payload
+    -- the customer dashboard must not send an owner to another vendor's app
+    (owner rule 2026-11-07)."""
     steps: list[str] = []
     for rule in rules:
         if rule.download_mbps is None and rule.upload_mbps is None:
