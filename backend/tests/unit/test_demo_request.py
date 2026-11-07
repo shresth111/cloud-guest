@@ -190,6 +190,33 @@ class TestDemoRequestCreateRequestValidation:
         assert request.router_count == 45
 
 
+class TestHoneypot:
+    def test_omitted_or_empty_is_fine(self) -> None:
+        assert _make_request().website is None
+        assert _make_request(website="").website is None
+        assert _make_request(website="   ").website is None
+
+    def test_filled_honeypot_is_a_validation_error_not_a_silent_drop(self) -> None:
+        with pytest.raises(ValidationError) as excinfo:
+            _make_request(website="https://spam.example")
+        (error,) = excinfo.value.errors()
+        assert error["loc"] == ("website",)
+        assert "Leave this field empty" in error["msg"]
+
+    def test_indian_phone_formats_pass_unchanged(self) -> None:
+        # The site's <input type="tel"> sends whatever the visitor typed;
+        # none of the common Indian spellings may be refused.
+        for phone in (
+            "9876543210",
+            "09876543210",
+            "+91 98765 43210",
+            "+91-98765-43210",
+            "+919876543210",
+            "(011) 2345 6789",
+        ):
+            assert _make_request(phone=phone).phone == phone
+
+
 class TestDemoRequestUpdateRequestValidation:
     def test_valid_status_accepted(self) -> None:
         update = DemoRequestUpdateRequest(status=DemoRequestStatus.CONTACTED.value)
