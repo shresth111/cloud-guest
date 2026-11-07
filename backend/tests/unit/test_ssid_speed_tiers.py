@@ -178,9 +178,7 @@ class TestEntitlementMatrix:
         assert [r.ssid for r in hint] == ["WYFY_PREMIUM"]
         assert upgrade_networks(rules, FREE_GUEST, current_ssid="WYFY_FREE") == []
         # never "join the network you are on"
-        assert (
-            upgrade_networks(rules, VOUCHER_ANY, current_ssid="WYFY_PREMIUM") == []
-        )
+        assert upgrade_networks(rules, VOUCHER_ANY, current_ssid="WYFY_PREMIUM") == []
 
 
 # ============================================================================
@@ -488,7 +486,12 @@ class FakeControlClient:
         return self.limits[network_id]
 
     async def set_guest_network_rate_limit(  # noqa: ANN201
-        self, site_id: str, network_id: str, *, download_mbps, upload_mbps  # noqa: ANN001
+        self,
+        site_id: str,
+        network_id: str,
+        *,
+        download_mbps,
+        upload_mbps,  # noqa: ANN001
     ):
         self.writes.append((site_id, network_id, download_mbps, upload_mbps))
         self.limits[network_id] = _Limit(download_mbps, upload_mbps)
@@ -713,3 +716,452 @@ class TestRoutes:
             await mod._scoped_location(
                 uuid.uuid4(), uuid.uuid4(), uuid.uuid4(), _NoLocations()
             )
+
+
+# ============================================================================
+# Customer answer: neutral status, never vendor-app steps (owner rule
+# 2026-11-07), and the customer apply route (P1-1)
+# ============================================================================
+
+#: Phrases that would send an owner to another vendor's app.
+_VENDOR_APP_PHRASES = ("Instant On app", "Networks >", "Show advanced settings")
+
+
+def _no_vendor_steps(payload: Any) -> None:
+    import json
+
+    text = json.dumps(payload)
+    assert "manual_steps" not in text
+    for phrase in _VENDOR_APP_PHRASES:
+        assert phrase not in text, phrase
+
+
+@pytest.fixture
+def nas_only(monkeypatch):  # noqa: ANN001, ANN201
+    """Controls the NAS-only router lookup. ``state.venue`` answers the
+    venue-level question, ``state.router`` the cloud-control router's."""
+    from app.domains.guest import ssid_tier_instant_on as mod
+
+    state = SimpleNamespace(venue=True, router=True, calls=[])
+
+    async def _lookup(db, *, organization_id, location_id, router_id=None):  # noqa: ANN001, ANN202
+        state.calls.append(router_id)
+        return state.venue if router_id is None else state.router
+
+    monkeypatch.setattr(mod, "nas_only_router_at", _lookup)
+    return state
+
+
+@pytest.fixture
+def aruba_control_open(monkeypatch):  # noqa: ANN001, ANN201
+    """All cloud-control gates open, target names an (Aruba) router."""
+    from app.domains.guest import ssid_tier_instant_on as mod
+
+    target = SimpleNamespace(site_id="site-1", secret_arn="arn", router_id=uuid.uuid4())
+
+    async def _resolve(db, **kw):  # noqa: ANN001, ANN003, ANN202
+        return target
+
+    monkeypatch.setattr(
+        mod,
+        "_control_module",
+        lambda: SimpleNamespace(resolve_control_target=_resolve),
+    )
+    return target
+
+
+def _two_networks(free: _Limit, prem: _Limit) -> FakeControlClient:
+    return FakeControlClient(
+        [
+            {"id": "n-free", "networkName": "WYFY_FREE"},
+            {"id": "n-prem", "networkName": "WYFY_PREMIUM"},
+        ],
+        {"n-free": free, "n-prem": prem},
+    )
+
+
+class TestCustomerSpeedStatus:
+    async def _run(  # noqa: ANN202
+        self,
+        settings,
+        *,
+        dry_run=True,
+        client=None,
+        rules=RULES,
+        factory=None,  # noqa: ANN001
+    ):
+        from app.domains.guest.ssid_tier_instant_on import (
+            customer_apply_ssid_tier_speeds,
+        )
+
+        return await customer_apply_ssid_tier_speeds(
+            None,
+            organization_id=uuid.uuid4(),
+            location_id=uuid.uuid4(),
+            rules=rules,
+            dry_run=dry_run,
+            settings=settings,
+            client_factory=factory or (_factory(client) if client else None),
+        )
+
+    async def test_non_nas_only_venue_is_not_applicable_and_reads_nothing(
+        self, nas_only, monkeypatch
+    ) -> None:  # noqa: ANN001
+        """MikroTik / Omada venue: nothing resolved, nothing read or written."""
+        from app.domains.guest import ssid_tier_instant_on as mod
+
+        def _boom():  # noqa: ANN202
+            raise AssertionError("cloud control must not be consulted")
+
+        monkeypatch.setattr(mod, "_control_module", _boom)
+        nas_only.venue = False
+        result = await self._run(_settings(instant_on_ssid_tier_push_enabled=True))
+        assert (result.status, result.reason) == (
+            "not_applicable",
+            "not_supported_at_this_venue",
+        )
+        assert result.cloud_apply_available is False
+        _no_vendor_steps(result.as_dict())
+
+    async def test_no_tiers_is_not_applicable(self, nas_only) -> None:  # noqa: ANN001
+        result = await self._run(_settings(), rules=[])
+        assert (result.status, result.reason) == ("not_applicable", "no_ssid_tiers")
+        assert nas_only.calls == []
+
+    async def test_push_flag_off_is_pending_without_steps(self, nas_only) -> None:  # noqa: ANN001
+        result = await self._run(_settings())
+        assert (result.status, result.reason) == ("pending", "awaiting_setup")
+        assert result.cloud_apply_available is False and result.items == []
+        _no_vendor_steps(result.as_dict())
+
+    async def test_cloud_control_off_for_router_is_pending_without_steps(
+        self, nas_only, monkeypatch
+    ) -> None:  # noqa: ANN001
+        from app.domains.guest import ssid_tier_instant_on as mod
+
+        async def _none(db, **kw):  # noqa: ANN001, ANN003, ANN202
+            return None
+
+        monkeypatch.setattr(
+            mod,
+            "_control_module",
+            lambda: SimpleNamespace(resolve_control_target=_none),
+        )
+        result = await self._run(_settings(instant_on_ssid_tier_push_enabled=True))
+        assert (result.status, result.reason) == ("pending", "awaiting_setup")
+        _no_vendor_steps(result.as_dict())
+
+    async def test_cloud_control_router_not_nas_only_writes_nothing(
+        self, nas_only, aruba_control_open
+    ) -> None:  # noqa: ANN001
+        nas_only.router = False
+        client = _two_networks(_Limit(None, None), _Limit(None, None))
+        result = await self._run(
+            _settings(instant_on_ssid_tier_push_enabled=True),
+            dry_run=False,
+            client=client,
+        )
+        assert result.status == "not_applicable"
+        assert client.writes == []
+        assert aruba_control_open.router_id in nas_only.calls
+
+    async def test_target_without_router_id_writes_nothing(
+        self, nas_only, control_open
+    ) -> None:  # noqa: ANN001
+        client = _two_networks(_Limit(None, None), _Limit(None, None))
+        result = await self._run(
+            _settings(instant_on_ssid_tier_push_enabled=True),
+            dry_run=False,
+            client=client,
+        )
+        assert result.status == "not_applicable" and client.writes == []
+
+    async def test_preview_is_pending_and_writes_nothing(
+        self, nas_only, aruba_control_open
+    ) -> None:  # noqa: ANN001
+        client = _two_networks(_Limit(None, None), _Limit(50, 20))
+        result = await self._run(
+            _settings(instant_on_ssid_tier_push_enabled=True), client=client
+        )
+        assert (result.status, result.reason) == ("pending", "not_yet_applied")
+        assert result.cloud_apply_available is True
+        assert [(i.ssid, i.status, i.reason) for i in result.items] == [
+            ("WYFY_FREE", "pending", "not_yet_applied"),
+            ("WYFY_PREMIUM", "applied", None),
+        ]
+        assert client.writes == []
+
+    async def test_preview_with_everything_live_is_applied(
+        self, nas_only, aruba_control_open
+    ) -> None:  # noqa: ANN001
+        client = _two_networks(_Limit(5, 2), _Limit(50, 20))
+        result = await self._run(
+            _settings(instant_on_ssid_tier_push_enabled=True), client=client
+        )
+        assert (result.status, result.reason) == ("applied", None)
+        assert client.writes == []
+
+    async def test_apply_writes_and_answers_applied(
+        self, nas_only, aruba_control_open
+    ) -> None:  # noqa: ANN001
+        client = _two_networks(_Limit(None, None), _Limit(None, None))
+        result = await self._run(
+            _settings(instant_on_ssid_tier_push_enabled=True),
+            dry_run=False,
+            client=client,
+        )
+        assert result.status == "applied"
+        assert client.writes == [
+            ("site-1", "n-free", 5, 2),
+            ("site-1", "n-prem", 50, 20),
+        ]
+        _no_vendor_steps(result.as_dict())
+
+    async def test_missing_and_other_limit_are_neutral_codes(
+        self, nas_only, aruba_control_open
+    ) -> None:  # noqa: ANN001
+        client = FakeControlClient(
+            [{"id": "n-free", "networkName": "WYFY_FREE"}],
+            {"n-free": _Limit(10, 5, True)},
+        )
+        result = await self._run(
+            _settings(instant_on_ssid_tier_push_enabled=True),
+            dry_run=False,
+            client=client,
+        )
+        assert (result.status, result.reason) == ("pending", "not_all_applied")
+        assert {(i.ssid, i.reason) for i in result.items} == {
+            ("WYFY_FREE", "network_has_other_limit"),
+            ("WYFY_PREMIUM", "network_not_found"),
+        }
+        assert client.writes == []
+        _no_vendor_steps(result.as_dict())
+
+    async def test_whole_sync_failure_is_pending_apply_failed(
+        self, nas_only, aruba_control_open
+    ) -> None:  # noqa: ANN001
+        @asynccontextmanager
+        async def _broken(target):  # noqa: ANN001, ANN202
+            raise RuntimeError("token refresh failed: Instant On app says no")
+            yield  # pragma: no cover
+
+        result = await self._run(
+            _settings(instant_on_ssid_tier_push_enabled=True),
+            dry_run=False,
+            factory=_broken,
+        )
+        assert (result.status, result.reason) == ("pending", "apply_failed")
+        _no_vendor_steps(result.as_dict())
+
+    async def test_master_sync_still_carries_the_steps(self, control_open) -> None:  # noqa: ANN001
+        """The Master view is unchanged: ops still get the by-hand steps."""
+        result = await sync_ssid_tiers_to_instant_on(
+            None,
+            organization_id=uuid.uuid4(),
+            location_id=uuid.uuid4(),
+            rules=RULES,
+            dry_run=True,
+            settings=_settings(),
+        )
+        assert result.as_dict()["manual_steps"] == instant_on_manual_steps(RULES)
+        assert "Instant On app > Networks > WYFY_FREE" in result.manual_steps[0]
+
+
+class _Locations:
+    def __init__(self, location) -> None:  # noqa: ANN001
+        self.location = location
+
+    async def get_location(self, location_id, *, requesting_organization_id):  # noqa: ANN001, ANN201
+        assert location_id == self.location.id
+        return self.location
+
+
+class _Tiers:
+    async def list_rules(self, *, organization_id, location_id):  # noqa: ANN001, ANN201
+        return list(RULES)
+
+
+def _request() -> SimpleNamespace:
+    return SimpleNamespace(state=SimpleNamespace(request_id="req-1"))
+
+
+class TestCustomerRoutes:
+    def _pinned(self, path: str, method: str) -> tuple[str, Any]:
+        from app.domains.rbac.enums import ScopeType
+
+        route = _route(path, method)
+        closures = [
+            {
+                type(cell.cell_contents): cell.cell_contents
+                for cell in (getattr(d.dependency, "__closure__", None) or ())
+            }
+            for d in route.dependencies
+        ]
+        pinned = [c for c in closures if ScopeType in c]
+        assert len(pinned) == 1, "permission scope must be pinned explicitly"
+        return pinned[0][str], pinned[0][ScopeType]
+
+    @pytest.mark.parametrize(
+        ("method", "key"), [("GET", "policy.read"), ("PUT", "policy.update")]
+    )
+    def test_tier_routes_pin_location_scope(self, method: str, key: str) -> None:
+        from app.domains.rbac.enums import ScopeType
+
+        assert self._pinned("/locations/{location_id}/ssid-tiers", method) == (
+            key,
+            ScopeType.LOCATION,
+        )
+
+    def test_apply_route_matches_usage_limits_speed_write(self) -> None:
+        from app.domains.network_integration import instant_on_router
+        from app.domains.rbac.enums import ScopeType
+
+        path = "/locations/{location_id}/ssid-tiers/apply-speeds"
+        assert self._pinned(path, "POST") == (
+            "bandwidth.update",
+            ScopeType.ORGANIZATION,
+        )
+        usage_limits = {
+            type(c.cell_contents): c.cell_contents
+            for c in instant_on_router._CUSTOMER_SPEED_UPDATE.__closure__
+        }
+        assert (usage_limits[str], usage_limits[ScopeType]) == self._pinned(
+            path, "POST"
+        )
+        from app.domains.rbac.dependencies import CurrentLocation, CurrentOrganization
+
+        calls = {d.call for d in _route(path, "POST").dependant.dependencies}
+        assert CurrentOrganization in calls and CurrentLocation in calls
+
+    def test_apply_route_mounted_under_v1(self) -> None:
+        from app.api.v1.router import api_v1_router
+
+        paths = {r.path for r in api_v1_router.routes}
+        assert "/locations/{location_id}/ssid-tiers/apply-speeds" in paths
+
+    async def test_customer_get_carries_no_vendor_steps(self, nas_only) -> None:  # noqa: ANN001
+        from app.domains.guest import ssid_tier_router as mod
+
+        org, loc = uuid.uuid4(), uuid.uuid4()
+        location = SimpleNamespace(id=loc, organization_id=org)
+        body = await mod.list_ssid_tiers(
+            _request(),
+            loc,
+            requesting_organization_id=org,
+            scope_location_id=loc,
+            location_service=_Locations(location),
+            service=_Tiers(),
+            db=None,
+        )
+        data = body["data"]
+        assert "instant_on_manual_steps" not in data
+        assert data["speed_status"]["status"] in (
+            "applied",
+            "pending",
+            "not_applicable",
+        )
+        assert len(data["items"]) == 2
+        _no_vendor_steps(data)
+
+    async def test_customer_get_at_mikrotik_venue_is_not_applicable(
+        self, nas_only
+    ) -> None:  # noqa: ANN001
+        from app.domains.guest import ssid_tier_router as mod
+
+        nas_only.venue = False
+        org, loc = uuid.uuid4(), uuid.uuid4()
+        body = await mod.list_ssid_tiers(
+            _request(),
+            loc,
+            requesting_organization_id=org,
+            scope_location_id=None,
+            location_service=_Locations(SimpleNamespace(id=loc, organization_id=org)),
+            service=_Tiers(),
+            db=None,
+        )
+        assert body["data"]["speed_status"]["status"] == "not_applicable"
+
+    async def test_apply_route_uses_the_location_rows_org(
+        self, nas_only, monkeypatch
+    ) -> None:  # noqa: ANN001
+        """Reads and writes with the LOCATION ROW's organization."""
+        from app.domains.guest import ssid_tier_router as mod
+        from app.domains.guest.ssid_tier_instant_on import CustomerSpeedStatus
+
+        seen: dict[str, Any] = {}
+
+        async def _apply(db, **kw):  # noqa: ANN001, ANN003, ANN202
+            seen.update(kw)
+            return CustomerSpeedStatus("applied", None, True, [])
+
+        monkeypatch.setattr(mod, "customer_apply_ssid_tier_speeds", _apply)
+        row_org, loc = uuid.uuid4(), uuid.uuid4()
+        body = await mod.apply_ssid_tier_speeds(
+            _request(),
+            loc,
+            mod.SsidTierSyncRequest(dry_run=False),
+            user=SimpleNamespace(id=str(uuid.uuid4())),
+            requesting_organization_id=row_org,
+            scope_location_id=loc,
+            location_service=_Locations(
+                SimpleNamespace(id=loc, organization_id=row_org)
+            ),
+            service=_Tiers(),
+            db=None,
+        )
+        assert seen["organization_id"] == row_org and seen["location_id"] == loc
+        assert seen["dry_run"] is False
+        assert body["data"]["status"] == "applied"
+        _no_vendor_steps(body["data"])
+
+    async def test_apply_route_refuses_a_sibling_location(self) -> None:
+        from app.domains.guest import ssid_tier_router as mod
+        from app.domains.location.exceptions import CrossLocationScopeAccessError
+
+        class _NoLocations:
+            async def get_location(self, *a, **kw):  # noqa: ANN002, ANN003, ANN201
+                raise AssertionError("must not be reached")
+
+        with pytest.raises(CrossLocationScopeAccessError):
+            await mod.apply_ssid_tier_speeds(
+                _request(),
+                uuid.uuid4(),
+                mod.SsidTierSyncRequest(dry_run=False),
+                user=SimpleNamespace(id=str(uuid.uuid4())),
+                requesting_organization_id=uuid.uuid4(),
+                scope_location_id=uuid.uuid4(),
+                location_service=_NoLocations(),
+                service=_Tiers(),
+                db=None,
+            )
+
+
+class TestNasOnlyRouterQuery:
+    async def test_query_is_tenant_location_and_vendor_scoped(self) -> None:
+        from app.domains.guest.ssid_tier_instant_on import nas_only_router_at
+
+        captured: list[Any] = []
+
+        class _Db:
+            async def execute(self, statement):  # noqa: ANN001, ANN201
+                captured.append(statement)
+                return SimpleNamespace(
+                    scalars=lambda: SimpleNamespace(first=lambda: None)
+                )
+
+        org, loc, router = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+        assert (
+            await nas_only_router_at(
+                _Db(), organization_id=org, location_id=loc, router_id=router
+            )
+            is False
+        )
+        sql = str(captured[0].compile(compile_kwargs={"literal_binds": False}))
+        params = captured[0].compile().params
+        assert "routers.organization_id" in sql and "routers.location_id" in sql
+        assert "routers.vendor IN" in sql and "routers.id" in sql
+        assert org in params.values() and loc in params.values()
+        assert router in params.values()
+        vendors = next(v for v in params.values() if isinstance(v, list))
+        assert "mikrotik" not in vendors and "omada" not in vendors
+        assert "aruba_instant_on" in vendors
