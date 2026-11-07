@@ -28,6 +28,10 @@ if [ "$(id -u)" = "0" ] && [ "${CLOUDGUEST_RUN_AS_ROOT:-0}" != "1" ]; then
   if command -v setpriv >/dev/null 2>&1 \
      && setpriv --reuid="$APP_USER" --regid="$APP_USER" --init-groups \
           sh -c 'test -w "$1" && test -w /app' _ "$LOG_DIR" 2>/dev/null; then
+    # setpriv keeps the root env, so HOME stays /root (0700). asyncpg then
+    # stats ~/.postgresql/postgresql.key on every new connection and gets
+    # EACCES instead of ENOENT -> every DB connection fails (prod, 2026-11-07).
+    export HOME=/app
     exec setpriv --reuid="$APP_USER" --regid="$APP_USER" --init-groups -- "$@"
   fi
   echo "WARNING: docker-entrypoint: $LOG_DIR or /app is not writable by $APP_USER (or setpriv is missing); running as root" >&2
