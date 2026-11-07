@@ -208,7 +208,11 @@ if [[ "$SERVICE" == "api" && "$DB_BACKUP" == "1" ]]; then
   STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
   KEY="db-backups/pre-deploy-$STAMP.sql.gz"
   log "dumping database to the backup bucket: $KEY"
-  if docker exec deploy-postgres-1 pg_dump -U cloudguest -d cloudguest \
+  # shellcheck source=/dev/null
+  source /opt/wyfy/scripts/rds-env.sh
+  if docker run --rm -i \
+       -e PGHOST -e PGPORT -e PGUSER -e PGDATABASE -e PGPASSWORD \
+       "$PG_CLIENT_IMAGE" pg_dump \
        | gzip -9 \
        | aws s3 cp - "s3://$BACKUP_BUCKET/$KEY" --region "$REGION" >/dev/null; then
     log "backup ok: $KEY"
