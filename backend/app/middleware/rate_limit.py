@@ -69,7 +69,6 @@ RATE_LIMITED_PATH_PREFIXES: tuple[str, ...] = (
     "/api/v1/otp/request",
     "/api/v1/otp/verify",
     "/api/v1/vouchers/validate",
-    "/api/v1/vouchers/redeem",
     "/api/v1/captive-portal/resolve",
     "/api/v1/guest/",
     # Public "Book a Demo" lead-capture form -- no auth, so nothing but this
@@ -109,6 +108,19 @@ RATE_LIMITED_PATH_PREFIXES: tuple[str, ...] = (
 )
 
 _RATE_LIMIT_KEY_TEMPLATE = "rate_limit:{client_ip}:{path}"
+
+# Guest captive-portal sign-in paths (QA 2026-11-06, M4). Like
+# /captive-portal/resolve, every guest at a venue reaches these through the
+# venue's one NAT address, so a device-sized per-IP cap is really a
+# venue-wide cap: a busy lobby 429s itself. They get the resolve cap
+# instead. The per-identifier limits behind them (OTP per number, voucher
+# per address, PIN and password lockouts) are unchanged.
+GUEST_PORTAL_PATH_PREFIXES: tuple[str, ...] = (
+    "/api/v1/otp/request",
+    "/api/v1/otp/verify",
+    "/api/v1/guest/login/",
+    "/api/v1/guest/session/",
+)
 
 # The one path whose bucket is not keyed on the client IP alone -- see
 # module docstring and ``_resolve_buckets``.
@@ -177,6 +189,7 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         window_seconds: int,
         path_prefixes: tuple[str, ...] = RATE_LIMITED_PATH_PREFIXES,
         resolve_max_requests: int | None = None,
+        guest_portal_max_requests: int | None = None,
     ) -> None:
         super().__init__(app)
         self.redis = redis
@@ -184,6 +197,10 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         self.window_seconds = window_seconds
         self.path_prefixes = path_prefixes
         self.resolve_max_requests = resolve_max_requests or max_requests
+        # Never below the general cap: this may only ever loosen (QA M4).
+        self.guest_portal_max_requests = max(
+            guest_portal_max_requests or max_requests, max_requests
+        )
 
     def _resolve_buckets(self, request: Request) -> list[tuple[str, int]]:
         """The ``(key, cap)`` buckets a ``/captive-portal/resolve`` call
@@ -249,10 +266,15 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         if path.startswith(CAPTIVE_PORTAL_RESOLVE_PATH):
             return self._resolve_buckets(request)
         client_ip = request.client.host if request.client else "unknown"
+        cap = (
+            self.guest_portal_max_requests
+            if path.startswith(GUEST_PORTAL_PATH_PREFIXES)
+            else self.max_requests
+        )
         return [
             (
                 _RATE_LIMIT_KEY_TEMPLATE.format(client_ip=client_ip, path=path),
-                self.max_requests,
+                cap,
             )
         ]
 

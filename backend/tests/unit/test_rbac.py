@@ -647,6 +647,38 @@ async def assign_role(
     )
 
 
+async def make_role_editor(
+    repo: FakeRBACRepository,
+    keys: tuple[str, ...],
+    *,
+    organization_id: uuid.UUID | None = None,
+) -> uuid.UUID:
+    """A user holding ``keys`` -- at ORGANIZATION scope in ``organization_id``
+    (a tenant Owner), or at GLOBAL scope when no organization is given
+    (platform staff). Role editors may only hand out what they hold."""
+    role = await make_role(
+        repo,
+        f"Editor {uuid.uuid4().hex[:6]}",
+        scope_type=(ScopeType.ORGANIZATION if organization_id else ScopeType.GLOBAL),
+        organization_id=organization_id,
+    )
+    for key in keys:
+        module, action = key.split(".")
+        permission = await repo.get_permission_by_key(key) or await make_permission(
+            repo, module, action
+        )
+        await repo.add_role_permission(role.id, permission.id, granted_by=None)
+    user_id = uuid.uuid4()
+    await assign_role(
+        repo,
+        user_id=user_id,
+        role=role,
+        scope_type=ScopeType.ORGANIZATION if organization_id else ScopeType.GLOBAL,
+        organization_id=organization_id,
+    )
+    return user_id
+
+
 def make_service(
     repo: FakeRBACRepository | None = None,
 ) -> tuple[RBACService, FakeRBACRepository, PermissionCache]:
@@ -1502,8 +1534,9 @@ class TestEditExistingRoles:
             location_id=uuid.uuid4(),
         )
 
+        owner_a = await make_role_editor(repo, ("reports.read",), organization_id=org_a)
         copy = await service.update_role(
-            actor_user_id=uuid.uuid4(),
+            actor_user_id=owner_a,
             role_id=shared.id,
             requesting_organization_id=org_a,
             data={
@@ -1654,8 +1687,11 @@ class TestEditExistingRoles:
             organization_id=org_a,
         )
 
+        owner_a = await make_role_editor(
+            repo, ("vouchers.read",), organization_id=org_a
+        )
         updated = await service.update_role(
-            actor_user_id=uuid.uuid4(),
+            actor_user_id=owner_a,
             role_id=own.id,
             requesting_organization_id=org_a,
             data={"name": "Late Shift", "permission_keys": ["vouchers.read"]},
@@ -1906,6 +1942,282 @@ class TestDeleteExistingRoles:
 # ============================================================================
 
 
+class TestRoleSelfEscalation:
+    """Security review 2026-11-06, C1.
+
+    An organization Owner holds ``roles.create``/``roles.manage``/
+    ``roles.assign``. The old chain was: create an empty role (optionally
+    GLOBAL), assign it to yourself (nothing to escalate yet, so the
+    assignment check passes), then attach any permission key. Each step now
+    refuses anything the editor does not already hold."""
+
+    async def _owner_setup(
+        self,
+    ) -> tuple[RBACService, FakeRBACRepository, uuid.UUID, uuid.UUID]:
+        service, repo, _cache = make_service()
+        org = uuid.uuid4()
+        await make_permission(
+            repo, "demo_requests", "read", scope_types=(ScopeType.GLOBAL,)
+        )
+        await make_permission(repo, "device_console", "execute")
+        owner = await make_role_editor(
+            repo,
+            ("roles.create", "roles.manage", "roles.assign", "vouchers.read"),
+            organization_id=org,
+        )
+        return service, repo, org, owner
+
+    async def test_owner_cannot_create_a_global_role(self) -> None:
+        service, _repo, org, owner = await self._owner_setup()
+        with pytest.raises(RoleEscalationError):
+            await service.create_role(
+                actor_user_id=owner,
+                name="Shadow",
+                slug="shadow",
+                description=None,
+                scope_type=ScopeType.GLOBAL,
+                organization_id=org,
+                requesting_organization_id=org,
+            )
+        with pytest.raises(RoleEscalationError):
+            await service.create_role(
+                actor_user_id=owner,
+                name="Shadow 2",
+                slug="shadow-2",
+                description=None,
+                scope_type=ScopeType.ORGANIZATION,
+                organization_id=org,
+                requesting_organization_id=org,
+                allowed_scope_types=[ScopeType.GLOBAL],
+            )
+
+    async def test_owner_cannot_create_a_role_with_keys_they_lack(self) -> None:
+        service, _repo, org, owner = await self._owner_setup()
+        with pytest.raises(RoleEscalationError):
+            await service.create_role(
+                actor_user_id=owner,
+                name="Console",
+                slug="console",
+                description=None,
+                scope_type=ScopeType.ORGANIZATION,
+                organization_id=org,
+                requesting_organization_id=org,
+                permission_keys=["vouchers.read", "device_console.execute"],
+            )
+
+    async def test_owner_cannot_inherit_from_a_platform_role(self) -> None:
+        service, repo, org, owner = await self._owner_setup()
+        platform = await _shared_role_with_permissions(
+            repo,
+            "Super Admin",
+            ("demo_requests.read",),
+            scope_type=ScopeType.GLOBAL,
+        )
+        with pytest.raises(RoleEscalationError):
+            await service.create_role(
+                actor_user_id=owner,
+                name="Child",
+                slug="child",
+                description=None,
+                scope_type=ScopeType.ORGANIZATION,
+                organization_id=org,
+                requesting_organization_id=org,
+                parent_role_id=platform.id,
+            )
+        with pytest.raises(RoleEscalationError):
+            await service.clone_role(
+                actor_user_id=owner,
+                source_role_id=platform.id,
+                requesting_organization_id=org,
+                new_name="Mine",
+                new_slug="mine",
+                target_organization_id=org,
+            )
+
+    async def test_create_assign_attach_chain_is_refused_at_attach(self) -> None:
+        service, repo, org, owner = await self._owner_setup()
+        platform = await _shared_role_with_permissions(
+            repo,
+            "Platform Support",
+            ("device_console.execute",),
+            scope_type=ScopeType.ORGANIZATION,
+            is_system_role=False,
+        )
+
+        # Step 1 and 2 are legitimate on their own and still work.
+        empty = await service.create_role(
+            actor_user_id=owner,
+            name="Empty",
+            slug="empty",
+            description=None,
+            scope_type=ScopeType.ORGANIZATION,
+            organization_id=org,
+            requesting_organization_id=org,
+        )
+        await service.assign_role_to_user(
+            actor_user_id=owner,
+            target_user_id=owner,
+            role_id=empty.id,
+            scope_type=ScopeType.ORGANIZATION,
+            requesting_organization_id=org,
+            organization_id=org,
+        )
+
+        # Step 3, every route into it:
+        with pytest.raises(RoleEscalationError):
+            await service.assign_permission_to_role(
+                actor_user_id=owner,
+                role_id=empty.id,
+                permission_key="device_console.execute",
+                requesting_organization_id=org,
+            )
+        with pytest.raises(RoleEscalationError):
+            await service.update_role(
+                actor_user_id=owner,
+                role_id=empty.id,
+                requesting_organization_id=org,
+                data={"permission_keys": ["device_console.execute"]},
+            )
+        with pytest.raises(RoleEscalationError):
+            await service.update_role(
+                actor_user_id=owner,
+                role_id=empty.id,
+                requesting_organization_id=org,
+                data={"parent_role_id": platform.id},
+            )
+
+        assert await service.resolver.resolve_role_permission_keys(empty.id) == set()
+        grants = await service.access_validator.get_effective_grants(owner)
+        assert "device_console.execute" not in grants.permission_keys()
+
+    async def test_owner_can_still_grant_what_they_hold(self) -> None:
+        service, repo, org, owner = await self._owner_setup()
+        role = await service.create_role(
+            actor_user_id=owner,
+            name="Front Desk",
+            slug="front-desk",
+            description=None,
+            scope_type=ScopeType.LOCATION,
+            organization_id=org,
+            requesting_organization_id=org,
+            permission_keys=["vouchers.read"],
+        )
+        assert await _role_keys(repo, role) == {"vouchers.read"}
+        await service.remove_permission_from_role(
+            actor_user_id=owner,
+            role_id=role.id,
+            permission_key="vouchers.read",
+            requesting_organization_id=org,
+        )
+        await service.assign_permission_to_role(
+            actor_user_id=owner,
+            role_id=role.id,
+            permission_key="vouchers.read",
+            requesting_organization_id=org,
+        )
+        assert await _role_keys(repo, role) == {"vouchers.read"}
+
+    async def test_existing_keys_do_not_block_an_unrelated_edit(self) -> None:
+        """A role already carrying a key its editor lacks (an older role)
+        can still be renamed and have held keys added: only what an edit
+        newly grants is checked."""
+        service, repo, org, owner = await self._owner_setup()
+        legacy = await make_role(
+            repo, "Legacy", scope_type=ScopeType.ORGANIZATION, organization_id=org
+        )
+        console = await repo.get_permission_by_key("device_console.execute")
+        await repo.add_role_permission(legacy.id, console.id, granted_by=None)
+
+        updated = await service.update_role(
+            actor_user_id=owner,
+            role_id=legacy.id,
+            requesting_organization_id=org,
+            data={
+                "name": "Legacy 2",
+                "permission_keys": ["device_console.execute", "vouchers.read"],
+            },
+        )
+        assert await _role_keys(repo, updated) == {
+            "device_console.execute",
+            "vouchers.read",
+        }
+
+    async def test_parent_role_inheritance_is_escalation_checked(self) -> None:
+        """A parent passes its effective permissions down, so setting one is
+        a grant: a system role carrying keys the editor lacks is refused,
+        one inside the editor's own grants is allowed."""
+        service, repo, org, owner = await self._owner_setup()
+        too_much = await _shared_role_with_permissions(
+            repo, "Network Administrator", ("device_console.execute",)
+        )
+        within = await _shared_role_with_permissions(
+            repo, "Reception Staff", ("vouchers.read",)
+        )
+        own = await make_role(
+            repo, "Desk", scope_type=ScopeType.LOCATION, organization_id=org
+        )
+
+        with pytest.raises(RoleEscalationError):
+            await service.update_role(
+                actor_user_id=owner,
+                role_id=own.id,
+                requesting_organization_id=org,
+                data={"parent_role_id": too_much.id},
+            )
+        updated = await service.update_role(
+            actor_user_id=owner,
+            role_id=own.id,
+            requesting_organization_id=org,
+            data={"parent_role_id": within.id},
+        )
+        assert updated.parent_role_id == within.id
+
+    async def test_permission_edit_writes_a_per_permission_audit_diff(self) -> None:
+        service, repo, org, owner = await self._owner_setup()
+        reports = await make_permission(repo, "reports", "read")
+        own = await make_role(
+            repo, "Shift", scope_type=ScopeType.ORGANIZATION, organization_id=org
+        )
+        await repo.add_role_permission(own.id, reports.id, granted_by=None)
+        repo.audit_log_rows.clear()
+
+        await service.update_role(
+            actor_user_id=owner,
+            role_id=own.id,
+            requesting_organization_id=org,
+            data={"permission_keys": ["vouchers.read"]},
+        )
+
+        actions = [(row.action, row.description) for row in repo.audit_log_rows]
+        assert (
+            "permission_assigned",
+            "Permission 'vouchers.read' assigned to role 'Shift'",
+        ) in actions
+        assert (
+            "permission_removed",
+            "Permission 'reports.read' removed from role 'Shift'",
+        ) in actions
+        assert any(action == "role_updated" for action, _ in actions)
+
+    async def test_platform_staff_can_create_global_roles(self) -> None:
+        service, repo, _cache = make_service()
+        await make_permission(
+            repo, "demo_requests", "read", scope_types=(ScopeType.GLOBAL,)
+        )
+        staff = await make_role_editor(repo, ("demo_requests.read",))
+        role = await service.create_role(
+            actor_user_id=staff,
+            name="Sales Desk",
+            slug="sales-desk",
+            description=None,
+            scope_type=ScopeType.GLOBAL,
+            organization_id=None,
+            requesting_organization_id=None,
+            permission_keys=["demo_requests.read"],
+        )
+        assert await _role_keys(repo, role) == {"demo_requests.read"}
+
+
 class TestPermissionOverrideEscalation:
     async def test_cannot_grant_allow_override_for_permission_not_held(self) -> None:
         service, repo, _cache = make_service()
@@ -2022,7 +2334,7 @@ class TestPermissionCacheBehavior:
         assert grants.permission_keys() == {"dashboard.view"}
 
         await service.assign_permission_to_role(
-            actor_user_id=uuid.uuid4(),
+            actor_user_id=await make_role_editor(repo, ("reports.read",)),
             role_id=role.id,
             permission_key="reports.read",
             requesting_organization_id=None,

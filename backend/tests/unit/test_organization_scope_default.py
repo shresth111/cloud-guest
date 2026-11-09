@@ -450,3 +450,65 @@ class TestRequireOrganization:
         """
         with pytest.raises(SingleOrganizationRequiredError):
             await RequireOrganization(scope=OrganizationScope.all())
+
+
+# ============================================================================
+# Security review 2026-11-06 (C1): a GLOBAL *role* is not a GLOBAL *grant*
+# ============================================================================
+
+
+class TestGlobalRoleAssignedNarrowly:
+    """A role whose own ``scope_type`` is GLOBAL but which was handed out at
+    ORGANIZATION scope gives authority inside that organization only. It
+    must not skip the membership check or unlock "all organizations"."""
+
+    async def _narrow_holder(self, repo: FakeRBACRepository) -> _FakeUser:
+        user_id = uuid.uuid4()
+        role = await make_role(
+            repo,
+            f"Shadow {uuid.uuid4().hex[:6]}",
+            scope_type=ScopeType.GLOBAL,
+            organization_id=REAL_ORG,
+        )
+        await assign_role(
+            repo,
+            user_id=user_id,
+            role=role,
+            scope_type=ScopeType.ORGANIZATION,
+            organization_id=REAL_ORG,
+        )
+        _FakeGenericRepository.memberships.add((REAL_ORG, user_id))
+        return _FakeUser(user_id)
+
+    @pytest.mark.asyncio
+    async def test_cannot_name_another_organization(
+        self, fake_repositories: type[_FakeGenericRepository]
+    ) -> None:
+        repo = FakeRBACRepository()
+        user = await self._narrow_holder(repo)
+        request = _make_request(headers={"X-Organization-Id": str(OTHER_ORG)})
+
+        with pytest.raises(OrganizationMembershipRequiredError):
+            await _resolve(request, user, repo)
+
+    @pytest.mark.asyncio
+    async def test_cannot_ask_for_all_organizations(
+        self, fake_repositories: type[_FakeGenericRepository]
+    ) -> None:
+        repo = FakeRBACRepository()
+        user = await self._narrow_holder(repo)
+        request = _make_request(headers={ORGANIZATION_SCOPE_HEADER: "all"})
+
+        with pytest.raises(CrossOrganizationScopeDeniedError):
+            await _resolve(request, user, repo)
+
+    @pytest.mark.asyncio
+    async def test_own_organization_still_works(
+        self, fake_repositories: type[_FakeGenericRepository]
+    ) -> None:
+        repo = FakeRBACRepository()
+        user = await self._narrow_holder(repo)
+        request = _make_request(headers={"X-Organization-Id": str(REAL_ORG)})
+
+        scope = await _resolve(request, user, repo)
+        assert scope.organization_id == REAL_ORG

@@ -540,7 +540,10 @@ async def export_guest_authentication_logs(
     "/system",
     response_model=ApiResponse[HealthCheckLogListResponse],
     status_code=status.HTTP_200_OK,
-    dependencies=[Depends(RequirePermission("audit_logs.read"))],
+    # Platform component health spans every tenant: Master console only.
+    dependencies=[
+        Depends(RequirePermission("audit_logs.read", scope=ScopeType.GLOBAL))
+    ],
 )
 async def list_system_logs(
     request: Request,
@@ -566,7 +569,9 @@ async def list_system_logs(
 @router.get(
     "/system/export",
     status_code=status.HTTP_200_OK,
-    dependencies=[Depends(RequirePermission("audit_logs.export"))],
+    dependencies=[
+        Depends(RequirePermission("audit_logs.export", scope=ScopeType.GLOBAL))
+    ],
 )
 async def export_system_logs(
     component: HealthComponent = Query(...),

@@ -201,6 +201,8 @@ class EmptyRequest(_Strict):
 class GuestConsentRequest(_Strict):
     guest_id: uuid.UUID
     session_id: uuid.UUID
+    # QA 2026-11-06 H1 -- see app.domains.guest.session_token.
+    session_token: str | None = Field(default=None, max_length=512)
     opt_in: bool
     consent_text_version: str | None = Field(default=None, max_length=50)
 

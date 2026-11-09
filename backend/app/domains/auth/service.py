@@ -127,6 +127,23 @@ class UserNotFoundError(AuthServiceError):
         super().__init__(message, status_code=status.HTTP_404_NOT_FOUND)
 
 
+_DUMMY_PASSWORD_HASH: str | None = None
+
+
+def _dummy_password_hash() -> str:
+    """An Argon2 hash of a random value, made once per process, to verify
+    against when the email is unknown."""
+    global _DUMMY_PASSWORD_HASH
+    if _DUMMY_PASSWORD_HASH is None:
+        _DUMMY_PASSWORD_HASH = PasswordManager.hash_raw(uuid4().hex)
+    return _DUMMY_PASSWORD_HASH
+
+
+class SessionNotFoundError(AuthServiceError):
+    def __init__(self, message: str = "Session not found") -> None:
+        super().__init__(message, status_code=status.HTTP_404_NOT_FOUND)
+
+
 class InvalidCredentialsError(AuthServiceError):
     def __init__(self, message: str = "Invalid email or password") -> None:
         super().__init__(message, status_code=status.HTTP_401_UNAUTHORIZED)
@@ -471,16 +488,26 @@ class AuthService:
 
         user = await self.repository.get_user_by_email(email)
         if not user:
+            # Spend the same Argon2 verify a real account would, so response
+            # time does not tell an unknown email from a wrong password.
+            self._verify_password_safe(password, _dummy_password_hash())
             await self._record_attempt(
                 None, email, device_info, success=False, reason="user_not_found"
             )
             raise InvalidCredentialsError()
 
         if not user.is_active:
+            # Same answer as a wrong password unless the caller proved they
+            # know it -- only then is "inactive" news to nobody but them.
+            password_ok = self._verify_password_safe(
+                password, user.password_hash, user_id=user.id
+            )
             await self._record_attempt(
                 user.id, email, device_info, success=False, reason="account_inactive"
             )
-            raise InvalidCredentialsError("Account is inactive")
+            if password_ok:
+                raise InvalidCredentialsError("Account is inactive")
+            raise InvalidCredentialsError()
 
         AuthSecurity.check_account_lock(user.locked_until)
 
@@ -519,6 +546,10 @@ class AuthService:
                 )
                 raise MfaRequiredError()
             if not await self._verify_mfa_or_recovery_code(user.id, mfa_code):
+                # A wrong second factor counts toward the same lockout as a
+                # wrong password; otherwise a known password leaves the
+                # 6-digit code open to unlimited guessing.
+                await self._register_failed_attempt(user)
                 await self._record_attempt(
                     user.id,
                     email,
@@ -748,6 +779,14 @@ class AuthService:
         )
         await self.repository.add_password_history(user_id, new_hash)
         await self.repository.revoke_all_sessions(user_id)
+        # A reset means the old password may be known to someone else, so
+        # access tokens already issued stop working now rather than at their
+        # 15-minute expiry. Floored to the second because a JWT's ``iat`` is
+        # whole seconds: a token minted later in this same second (the user
+        # logging straight back in) must not be caught by it.
+        await self.repository.update_user(
+            user, tokens_invalidated_at=datetime.now(UTC).replace(microsecond=0)
+        )
 
         logger.info("password_reset_completed", extra={"user_id": str(user_id)})
 
@@ -925,7 +964,16 @@ class AuthService:
     async def list_sessions(self, user_id: uuid.UUID):
         return await self.repository.get_active_sessions(user_id)
 
-    async def revoke_session(self, session_id: uuid.UUID) -> None:
+    async def revoke_session(
+        self, session_id: uuid.UUID, *, owner_user_id: uuid.UUID
+    ) -> None:
+        """Revoke one of the caller's *own* sessions. Someone else's session
+        id answers 404 exactly like an unknown one, so this neither revokes
+        it nor confirms it exists. (Platform staff end another user's
+        sessions with the audited force-logout on the user record.)"""
+        session_row = await self.repository.get_session_by_id(session_id)
+        if session_row is None or session_row.user_id != owner_user_id:
+            raise SessionNotFoundError()
         await self.repository.revoke_session(session_id)
 
     # -- login attempts (real history read, for app.domains.controller_logs) ---

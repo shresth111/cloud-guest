@@ -83,6 +83,7 @@ from app.domains.rbac.dependencies import CurrentOrganization, RequirePermission
 
 from .constants import OtpChannel, OtpPurpose
 from .dependencies import get_otp_service
+from .exceptions import OtpPurposeNotAllowedError, OtpVenueRequiredError
 from .models import OtpRequest
 from .schemas import (
     OtpRequestAdminResponse,
@@ -180,6 +181,14 @@ async def request_otp(
     service: OtpService = Depends(get_otp_service),
     guest_service: GuestService = Depends(get_guest_service),
 ):
+    # QA 2026-11-06 M3 + H4: this public route serves guest login only, and
+    # only for a named venue -- without one, every venue gate below is a
+    # no-op and the platform's SMS credit is anyone's to spend. The portal
+    # always sends both ids.
+    if payload.purpose != OtpPurpose.GUEST_LOGIN:
+        raise OtpPurposeNotAllowedError(payload.purpose.value)
+    if payload.location_id is None:
+        raise OtpVenueRequiredError()
     # Whitelist-only mode is enforced *here*, before a code is generated
     # and before a provider is paid, not only at `POST /guest/login/otp`.
     #
@@ -249,6 +258,8 @@ async def verify_otp(
     payload: OtpVerifyRequest,
     service: OtpService = Depends(get_otp_service),
 ):
+    if payload.purpose != OtpPurpose.GUEST_LOGIN:
+        raise OtpPurposeNotAllowedError(payload.purpose.value)
     otp_request = await service.verify_otp(
         identifier=payload.identifier,
         code=payload.code,

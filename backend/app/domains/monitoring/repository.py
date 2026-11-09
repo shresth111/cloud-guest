@@ -39,6 +39,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.constants import SortOrder
 from app.database.repositories.generic import GenericRepository
+from app.database.utils.filters import AnyOfOrNull
 from app.database.utils.pagination import PageParams, PaginationMeta, paginate
 from app.domains.captive_portal.models import CaptivePortalConfig
 from app.domains.dhcp.models import RouterRogueDhcpStatus
@@ -243,7 +244,7 @@ class MonitoringRepositoryProtocol(Protocol):
         status: str | None,
         severity: str | None,
         router_id: uuid.UUID | None,
-        location_id: uuid.UUID | None = None,
+        location_id: uuid.UUID | list[uuid.UUID] | AnyOfOrNull | None = None,
         page: int,
         page_size: int,
     ) -> tuple[list[Alert], PaginationMeta]: ...
@@ -807,7 +808,7 @@ class MonitoringRepository:
         status: str | None = None,
         severity: str | None = None,
         router_id: uuid.UUID | None = None,
-        location_id: uuid.UUID | None = None,
+        location_id: uuid.UUID | list[uuid.UUID] | AnyOfOrNull | None = None,
         page: int = 1,
         page_size: int = 25,
     ) -> tuple[list[Alert], PaginationMeta]:

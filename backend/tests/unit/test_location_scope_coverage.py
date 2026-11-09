@@ -590,12 +590,6 @@ _GUEST_FACING_UNCONFINED: dict[tuple[str, str], str] = {
         "is not on this path. Unconfined is correct because the caller is a "
         "guest acting on their own session."
     ),
-    ("POST", "/api/v1/vouchers/redeem"): (
-        "A guest redeeming or checking a code handed to them at a front desk -- the "
-        "whole point is that they have no account. They hold no roles, so there is no "
-        "confinement to derive, and redemption resolves the voucher by its own code "
-        "rather than through the confined `get_batch`."
-    ),
     ("POST", "/api/v1/vouchers/validate"): (
         "A guest redeeming or checking a code handed to them at a front desk -- the "
         "whole point is that they have no account. They hold no roles, so there is no "

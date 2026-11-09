@@ -15,7 +15,7 @@ import uuid
 from datetime import date
 from typing import Protocol
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.constants import DEFAULT_SORT_FIELD, SortOrder
@@ -51,6 +51,12 @@ class OtpRepositoryProtocol(Protocol):
         sort_by: str = DEFAULT_SORT_FIELD,
         sort_order: SortOrder = SortOrder.DESC,
     ) -> tuple[list[OtpRequest], PaginationMeta]: ...
+
+    async def reserve_attempt(self, otp_request: OtpRequest) -> int | None: ...
+
+    async def consume(
+        self, otp_request: OtpRequest, *, verified_at: object
+    ) -> bool: ...
 
     async def get_daily_sms_consumption(
         self,
@@ -98,6 +104,53 @@ class OtpRepository:
         self, otp_request: OtpRequest, data: dict[str, object]
     ) -> OtpRequest:
         return await self.requests.update(otp_request, data)
+
+    async def reserve_attempt(self, otp_request: OtpRequest) -> int | None:
+        """Atomically spend one verification attempt (QA 2026-11-06, M1).
+
+        One ``UPDATE ... SET attempt_count = attempt_count + 1 WHERE
+        attempt_count < max_attempts AND NOT is_consumed RETURNING`` --
+        so N parallel guesses can never spend more than ``max_attempts``
+        between them, which the previous read-modify-write let them do.
+        Returns the new count, or ``None`` when no attempt was left (or the
+        code was consumed meanwhile)."""
+        result = await self.session.execute(
+            update(OtpRequest)
+            .where(
+                OtpRequest.id == otp_request.id,
+                OtpRequest.attempt_count < OtpRequest.max_attempts,
+                OtpRequest.is_consumed.is_(False),
+            )
+            .values(
+                attempt_count=OtpRequest.attempt_count + 1,
+                version=OtpRequest.version + 1,
+            )
+            .returning(OtpRequest.attempt_count)
+            .execution_options(synchronize_session=False)
+        )
+        count = result.scalar_one_or_none()
+        await self.session.refresh(otp_request)
+        return count
+
+    async def consume(self, otp_request: OtpRequest, *, verified_at: object) -> bool:
+        """Mark the code used, exactly once under concurrency (QA M1): a
+        conditional ``UPDATE ... WHERE NOT is_consumed RETURNING``. Two
+        correct verifies racing each other: one gets ``True``, the other
+        ``False`` -- never two sessions from one code."""
+        result = await self.session.execute(
+            update(OtpRequest)
+            .where(OtpRequest.id == otp_request.id, OtpRequest.is_consumed.is_(False))
+            .values(
+                is_consumed=True,
+                verified_at=verified_at,
+                version=OtpRequest.version + 1,
+            )
+            .returning(OtpRequest.id)
+            .execution_options(synchronize_session=False)
+        )
+        won = result.scalar_one_or_none() is not None
+        await self.session.refresh(otp_request)
+        return won
 
     async def list_requests(
         self,

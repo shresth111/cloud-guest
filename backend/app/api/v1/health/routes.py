@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import time
 from datetime import UTC, datetime
 
@@ -12,6 +13,7 @@ from app.database.redis import redis_client
 from app.database.session import SessionLocal
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 
 def _request_id(request: Request) -> str:
@@ -40,36 +42,40 @@ async def live(request: Request) -> dict[str, object]:
 
 
 async def _database_status() -> DependencyStatus:
+    # Status only. This endpoint is public (uptime monitors, load balancers),
+    # so timings and exception names stay in the log, not the response.
     started_at = time.perf_counter()
     try:
         async with SessionLocal() as session:
             await session.execute(text("SELECT 1"))
-        return DependencyStatus(
-            status="ok",
-            latency_ms=round((time.perf_counter() - started_at) * 1000, 3),
-        )
+        return DependencyStatus(status="ok")
     except Exception as exc:
-        return DependencyStatus(
-            status="unavailable",
-            latency_ms=round((time.perf_counter() - started_at) * 1000, 3),
-            error=type(exc).__name__,
+        logger.warning(
+            "readiness_dependency_unavailable",
+            extra={
+                "dependency": "database",
+                "error": type(exc).__name__,
+                "latency_ms": round((time.perf_counter() - started_at) * 1000, 3),
+            },
         )
+        return DependencyStatus(status="unavailable")
 
 
 async def _redis_status(timeout_seconds: float) -> DependencyStatus:
     started_at = time.perf_counter()
     try:
         await asyncio.wait_for(redis_client.ping(), timeout=timeout_seconds)
-        return DependencyStatus(
-            status="ok",
-            latency_ms=round((time.perf_counter() - started_at) * 1000, 3),
-        )
+        return DependencyStatus(status="ok")
     except Exception as exc:
-        return DependencyStatus(
-            status="unavailable",
-            latency_ms=round((time.perf_counter() - started_at) * 1000, 3),
-            error=type(exc).__name__,
+        logger.warning(
+            "readiness_dependency_unavailable",
+            extra={
+                "dependency": "redis",
+                "error": type(exc).__name__,
+                "latency_ms": round((time.perf_counter() - started_at) * 1000, 3),
+            },
         )
+        return DependencyStatus(status="unavailable")
 
 
 @router.get(

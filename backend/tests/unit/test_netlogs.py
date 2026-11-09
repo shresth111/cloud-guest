@@ -787,7 +787,14 @@ class TestRouteGuards:
                 pass
 
             async def get_active_assignments(self, user_id):
-                return [SimpleNamespace(role=SimpleNamespace(scope_type="global"))]
+                # The assignment's own scope decides platform reach
+                # (security review 2026-11-06), not the role's scope_type.
+                return [
+                    SimpleNamespace(
+                        assignment=SimpleNamespace(scope_type="global"),
+                        role=SimpleNamespace(scope_type="global"),
+                    )
+                ]
 
         monkeypatch.setattr(rbac_deps, "RoleResolver", Resolver)
         request = SimpleNamespace(

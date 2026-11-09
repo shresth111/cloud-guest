@@ -280,6 +280,13 @@ PIN_MAX_ATTEMPTS = 5
 # AuthUser accounts, scoped to this domain's own guest identifiers instead.
 PIN_LOCKOUT_MINUTES = 30
 
+# Guest password login lockout (QA 2026-11-06, M6) -- see
+# ``service.GuestPasswordSecurity``. Looser than the PIN's 5: a password's
+# keyspace is far larger, so the cap only has to stop online guessing, and a
+# guest who mistypes a long password a few times should not be locked out.
+PASSWORD_MAX_ATTEMPTS = 10
+PASSWORD_LOCKOUT_MINUTES = 15
+
 # A PIN unused (never successfully logged in with, and never freshly set)
 # for longer than this is treated by GuestService.login_via_pin as though
 # it were simply wrong -- see that method's own docstring for why this
@@ -960,6 +967,8 @@ class InternetConfirmationSource(StrEnum):
 
 
 __all__ = [
+    "PASSWORD_MAX_ATTEMPTS",
+    "PASSWORD_LOCKOUT_MINUTES",
     "InternetConfirmationSource",
     "GUEST_DISPLAY_NAME_MAX_LENGTH",
     "GUEST_NAME_INVALID_CODE",

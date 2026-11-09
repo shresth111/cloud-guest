@@ -343,7 +343,18 @@ class TestTheAcceptIsBoundToTheSignedInDevice:
         await _sign_in(fx, mac=None)
         assert (await _authorize(fx, nas)).authorized is True
 
-    async def test_mikrotik_is_unchanged(self) -> None:
+    async def test_mikrotik_is_now_bound_to_the_device_too(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Was ``test_mikrotik_is_unchanged``: QA 2026-11-06 C2 extended the
+        binding to every vendor (see ``test_radius_device_binding_all_vendors``).
+        Enforced only with ``radius_authorize_device_binding_mode=enforce``;
+        the first-deploy default logs and admits."""
+        from app.core.config import get_settings
+
+        monkeypatch.setattr(
+            get_settings(), "radius_authorize_device_binding_mode", "enforce"
+        )
         fx = _fixture(vendor="mikrotik")
         nas = await _register_nas(fx)
         await _sign_in(fx)
@@ -352,7 +363,7 @@ class TestTheAcceptIsBoundToTheSignedInDevice:
             username=_PHONE,
             calling_station_id="0A:1B:2C:3D:4E:5F",
         )
-        assert authz.authorized is True
+        assert authz.authorized is False
 
 
 # ============================================================================

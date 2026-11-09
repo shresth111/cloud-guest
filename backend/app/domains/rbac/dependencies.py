@@ -260,9 +260,14 @@ async def CurrentOrganizationScope(
 
     resolver = RoleResolver(repository)
     active_assignments = await resolver.get_active_assignments(uuid.UUID(user.id))
+    # The *assignment's* scope decides this, not the role's own scope_type:
+    # a role defined as GLOBAL but handed out at ORGANIZATION scope gives its
+    # holder authority inside that one organization only, and must not lift
+    # them over the membership check below. Every grant check in
+    # ``AccessValidator`` already reads the assignment's scope the same way.
     holds_global_role = any(
-        assignment.role.scope_type == ScopeType.GLOBAL.value
-        for assignment in active_assignments
+        active.assignment.scope_type == ScopeType.GLOBAL.value
+        for active in active_assignments
     )
 
     if organization_id is None:

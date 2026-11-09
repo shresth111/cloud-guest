@@ -26,7 +26,7 @@ from datetime import UTC, datetime
 
 from app.common.exceptions import CloudGuestError
 
-from .authorization import AccessValidator
+from .authorization import AccessValidator, RoleResolver
 from .cache import PermissionCache
 from .context import ScopeContext
 from .enums import AuditAction, OverrideEffect, ScopeType
@@ -241,10 +241,30 @@ class RBACService:
         if existing is not None:
             raise DuplicateRoleError(slug, organization_id)
 
+        await self._assert_may_define_role_scope(
+            actor_user_id, scope_type, allowed_scope_types or []
+        )
+
+        inherited_keys: set[str] = set()
         if parent_role_id is not None:
-            parent = await self.repository.get_role_by_id(parent_role_id)
-            if parent is None:
-                raise RoleNotFoundError(parent_role_id)
+            # Same tenant visibility rule as every other role read: a
+            # caller in organization A may inherit from a shared role or one
+            # of A's own, never from organization B's.
+            parent = await self.get_role(
+                parent_role_id, requesting_organization_id=requesting_organization_id
+            )
+            await self._assert_may_define_role_scope(
+                actor_user_id, ScopeType(parent.scope_type), []
+            )
+            inherited_keys = await self.resolver.resolve_role_permission_keys(parent.id)
+
+        await self._assert_may_grant_permissions(
+            actor_user_id,
+            set(permission_keys or []) | inherited_keys,
+            role_name=name,
+            role_scope_type=scope_type.value,
+            organization_id=organization_id,
+        )
 
         role = await self.repository.create_role(
             name=name,
@@ -314,9 +334,33 @@ class RBACService:
                 role.name, "modified directly (clone it instead)"
             )
 
+        # Whatever this edit makes the role grant that it does not grant
+        # already (directly or by inheritance) must be something the editor
+        # holds. Without this, an editor could assign an empty role to
+        # themselves and then fill it with permissions they never had.
+        newly_granted: set[str] = set()
         new_parent_id = data.get("parent_role_id")
         if new_parent_id is not None:
             await self._assert_no_cycle(role.id, new_parent_id)  # type: ignore[arg-type]
+            parent = await self.get_role(
+                new_parent_id,  # type: ignore[arg-type]
+                requesting_organization_id=requesting_organization_id,
+            )
+            await self._assert_may_define_role_scope(
+                actor_user_id, ScopeType(parent.scope_type), []
+            )
+            newly_granted |= await self.resolver.resolve_role_permission_keys(parent.id)
+        if permission_keys is not None:
+            newly_granted |= set(permission_keys)  # type: ignore[arg-type]
+        if newly_granted:
+            already_granted = await self.resolver.resolve_role_permission_keys(role.id)
+            await self._assert_may_grant_permissions(
+                actor_user_id,
+                newly_granted - already_granted,
+                role_name=role.name,
+                role_scope_type=role.scope_type,
+                organization_id=role.organization_id,
+            )
 
         updated = await self.repository.update_role(
             role, {**data, "updated_by": actor_user_id}
@@ -355,12 +399,33 @@ class RBACService:
             row.permission.key for row in current_rows if row.permission is not None
         }
         target_keys = set(permission_keys)
-        for key in target_keys - current_keys:
+        # One audit row per permission actually added or removed, the same
+        # rows the dedicated attach/detach endpoints write, so an edit that
+        # changes what a role grants is never visible only as "role updated".
+        for key in sorted(target_keys - current_keys):
             await self._attach_permission(role, key, granted_by=granted_by)
-        for key in current_keys - target_keys:
+            await self._audit(
+                granted_by,
+                AuditAction.PERMISSION_ASSIGNED,
+                entity_type="role",
+                entity_id=role.id,
+                description=f"Permission '{key}' assigned to role '{role.name}'",
+                organization_id=role.organization_id,
+            )
+        for key in sorted(current_keys - target_keys):
             permission = await self.repository.get_permission_by_key(key)
             if permission is not None:
                 await self.repository.remove_role_permission(role.id, permission.id)
+                await self._audit(
+                    granted_by,
+                    AuditAction.PERMISSION_REMOVED,
+                    entity_type="role",
+                    entity_id=role.id,
+                    description=(
+                        f"Permission '{key}' removed from role '{role.name}'"
+                    ),
+                    organization_id=role.organization_id,
+                )
 
     async def delete_role(
         self,
@@ -583,6 +648,14 @@ class RBACService:
         )
         if not (source.is_system_role or source.is_template):
             raise RoleNotCloneableError(source.name)
+        await self._assert_may_define_role_scope(
+            actor_user_id,
+            ScopeType(source.scope_type),
+            [
+                ScopeType(value)
+                for value in await self.repository.get_role_scope_types(source.id)
+            ],
+        )
 
         if (
             target_organization_id is not None
@@ -660,6 +733,16 @@ class RBACService:
         if role.is_system_role:
             raise SystemRoleImmutableError(
                 role.name, "modified directly (clone it instead)"
+            )
+        if permission_key not in await self.resolver.resolve_role_permission_keys(
+            role.id
+        ):
+            await self._assert_may_grant_permissions(
+                actor_user_id,
+                {permission_key},
+                role_name=role.name,
+                role_scope_type=role.scope_type,
+                organization_id=role.organization_id,
             )
         row = await self._attach_permission(
             role, permission_key, granted_by=actor_user_id
@@ -922,6 +1005,86 @@ class RBACService:
                 f"Assigning at '{scope_type.value}' scope requires a matching "
                 "identifier"
             )
+
+    async def _actor_holds_global_assignment(self, actor_user_id: uuid.UUID) -> bool:
+        """Whether the actor holds any active role assignment made at GLOBAL
+        scope. The assignment's scope is what counts, not the role's own
+        ``scope_type``: a role can be defined as GLOBAL and still be handed
+        out at a narrower scope, and that holder is not platform staff."""
+        assignments = await RoleResolver(self.repository).get_active_assignments(
+            actor_user_id
+        )
+        return any(
+            active.assignment.scope_type == ScopeType.GLOBAL.value
+            for active in assignments
+        )
+
+    async def _assert_may_define_role_scope(
+        self,
+        actor_user_id: uuid.UUID,
+        scope_type: ScopeType,
+        allowed_scope_types: list[ScopeType],
+    ) -> None:
+        """Only platform staff (a GLOBAL-scoped assignment) may create a role
+        that is, or can be assigned as, platform-wide."""
+        wants_global = scope_type == ScopeType.GLOBAL or any(
+            allowed == ScopeType.GLOBAL for allowed in allowed_scope_types
+        )
+        if wants_global and not await self._actor_holds_global_assignment(
+            actor_user_id
+        ):
+            raise RoleEscalationError(
+                "Only platform administrators can create or extend a "
+                "platform-wide (global) role"
+            )
+
+    async def _assert_may_grant_permissions(
+        self,
+        actor_user_id: uuid.UUID,
+        permission_keys: set[str],
+        *,
+        role_name: str,
+        role_scope_type: str,
+        organization_id: uuid.UUID | None,
+    ) -> None:
+        """A role may only be given permissions its editor already holds, at
+        the broadest scope the role could be used at.
+
+        * An organization's own role (``organization_id`` set, not itself
+          GLOBAL) is checked at ORGANIZATION scope in that organization --
+          the level every tenant role editor (Owner/MSP) works at, and the
+          level a GLOBAL grant also satisfies.
+        * A shared/platform role (``organization_id`` is NULL) or a GLOBAL
+          role is checked at GLOBAL scope.
+
+        Platform staff holding ``permissions.manage`` at GLOBAL scope bypass
+        the check, the same bypass ALLOW permission overrides use."""
+        if not permission_keys:
+            return
+        if await self.access_validator.has_permission(
+            actor_user_id,
+            _PERMISSION_MANAGE_BYPASS_PERMISSION,
+            scope_type=ScopeType.GLOBAL,
+            scope_context=ScopeContext.global_scope(),
+        ):
+            return
+        if organization_id is None or role_scope_type == ScopeType.GLOBAL.value:
+            check_scope = ScopeType.GLOBAL
+            context = ScopeContext.global_scope()
+        else:
+            check_scope = ScopeType.ORGANIZATION
+            context = ScopeContext(organization_id=organization_id)
+        for permission_key in sorted(permission_keys):
+            if not await self.access_validator.has_permission(
+                actor_user_id,
+                permission_key,
+                scope_type=check_scope,
+                scope_context=context,
+            ):
+                raise RoleEscalationError(
+                    f"Cannot give role '{role_name}' the permission "
+                    f"'{permission_key}': you do not hold it yourself"
+                )
 
     async def _assert_no_role_escalation(
         self,

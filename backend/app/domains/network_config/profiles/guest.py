@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+from .constants import escape_routeros_string as _shared_escape_routeros_string
 from .constants import wyfy_comment
 
 
 def _escape_routeros_string(value: str) -> str:
-    return value.replace("\\", "\\\\").replace('"', '\\"')
+    # One escaper for every renderer: see escape_routeros_string. Values
+    # without RouterOS-special characters render exactly as before.
+    return _shared_escape_routeros_string(value)
 
 
 def render_create_bridge(name: str) -> list[str]:

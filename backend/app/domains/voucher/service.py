@@ -129,6 +129,7 @@ from app.common.spreadsheet_safety import sanitize_spreadsheet_row
 from app.core.email_layout import esc, heading, paragraph, render_email
 from app.core.storage import ObjectStorageProtocol
 from app.database.constants import MAX_BULK_CREATE_SIZE
+from app.database.utils.filters import AnyOfOrNull
 from app.domains.location.models import Location
 from app.domains.notification.constants import (
     NotificationChannelType,
@@ -138,6 +139,7 @@ from app.domains.organization.models import Organization
 from app.domains.rbac.enums import AuditAction
 from app.domains.rbac.location_scope import (
     LocationScope,
+    confine_location_filter,
     enforce_entity_location,
 )
 
@@ -588,12 +590,27 @@ class VoucherService:
         self,
         *,
         requesting_organization_id: uuid.UUID | None,
+        location_id: uuid.UUID | None = None,
         page: int = 1,
         page_size: int = 25,
     ) -> tuple[list[VoucherBatch], object]:
         filters: dict[str, object] = {}
         if requesting_organization_id is not None:
             filters["organization_id"] = requesting_organization_id
+        # One venue's batches, plus the organization-wide ones (no location),
+        # which are valid at every venue. A caller holding only location
+        # grants is confined to their own sites, as ``get_batch`` already is;
+        # before this the listing returned every venue's batches.
+        location_filter = confine_location_filter(
+            requested_location_id=location_id,
+            caller_location_scope=self.caller_location_scope,
+            error=CrossLocationVoucherBatchAccessError(),
+            include_organization_wide=True,
+        )
+        if isinstance(location_filter, uuid.UUID):
+            location_filter = AnyOfOrNull((location_filter,))
+        if location_filter is not None:
+            filters["location_id"] = location_filter
         batches, meta = await self.repository.list_batches(
             page=page, page_size=page_size, filters=filters or None
         )
@@ -933,11 +950,13 @@ class VoucherService:
             location_id=None,
         )
 
-    async def _enforce_redemption_rate_limit(self, source: str) -> None:
+    async def _enforce_redemption_rate_limit(
+        self, source: str, *, max_attempts: int | None = None
+    ) -> None:
         await VoucherRedemptionRateLimiter.check_and_increment(
             self.redis,
             source,
-            max_attempts=self.redemption_max_attempts_per_window,
+            max_attempts=max_attempts or self.redemption_max_attempts_per_window,
             window_minutes=self.redemption_window_minutes,
         )
 
@@ -963,9 +982,21 @@ class VoucherService:
         )
 
     async def redeem_voucher(
-        self, *, code: str, identifier: str, source: str
+        self,
+        *,
+        code: str,
+        identifier: str,
+        source: str,
+        organization_id: uuid.UUID | None = None,
+        location_id: uuid.UUID | None = None,
+        max_attempts_per_window: int | None = None,
     ) -> tuple[Voucher, VoucherBatch]:
         """Redeems ``code`` exactly once, atomically.
+
+        ``source`` is the rate-limit key and must come from the trusted
+        request (QA 2026-11-06, M2), never from a request body.
+        ``max_attempts_per_window`` lets a caller whose ``source`` is a
+        venue's shared NAT address size the bucket for a venue.
 
         The read/validate phase below and the write that follows it form a
         check-then-act, and the write is deliberately **not** a blind
@@ -998,8 +1029,34 @@ class VoucherService:
         (no such caller exists today -- the standalone endpoint
         ``POST /vouchers/redeem`` also commits only at request end).
         """
-        await self._enforce_redemption_rate_limit(source)
+        await self._enforce_redemption_rate_limit(
+            source, max_attempts=max_attempts_per_window
+        )
         voucher, batch = await self._get_voucher_and_batch(code)
+        # QA 2026-11-06 H3: codes are looked up globally, so a venue must not
+        # accept another org's -- or, for a location-bound batch, another
+        # location's -- voucher. Answered as "not found" (no oracle for
+        # which venues a code belongs to), and before any write, so the
+        # voucher is neither burned nor marked as a failed attempt.
+        if organization_id is not None and (
+            batch.organization_id != organization_id
+            or (
+                location_id is not None
+                and batch.location_id is not None
+                and batch.location_id != location_id
+            )
+        ):
+            logger.info(
+                "voucher_redeem_wrong_venue",
+                extra={
+                    "event_voucher_id": str(voucher.id),
+                    "event_batch_organization_id": str(batch.organization_id),
+                    "event_batch_location_id": str(batch.location_id),
+                    "event_requested_organization_id": str(organization_id),
+                    "event_requested_location_id": str(location_id),
+                },
+            )
+            raise VoucherNotFoundError()
         now = datetime.now(UTC)
         reason = self._redemption_failure_reason(voucher, batch, now=now)
         if reason is not None:

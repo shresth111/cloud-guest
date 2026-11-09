@@ -28,6 +28,18 @@ PUBLIC_DEFAULT_SECRET_FIELDS = (
     "mfa_encryption_key",
 )
 
+# Payment webhook signing secrets. Empty by default, and an empty secret makes
+# the provider's HMAC computable by anyone, so the webhook endpoints refuse
+# every event while one is unset (see billing.webhooks). Kept apart from
+# PUBLIC_DEFAULT_SECRET_FIELDS because a deployment that takes no payments
+# through a provider legitimately leaves its secret empty: that is logged as a
+# warning at startup, and only refuses startup when strict_production_secrets
+# is on.
+PAYMENT_WEBHOOK_SECRET_FIELDS = (
+    "stripe_webhook_secret",
+    "razorpay_webhook_secret",
+)
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -3078,6 +3090,115 @@ class Settings(BaseSettings):
         ),
     )
 
+    guest_session_token_ttl_seconds: int = Field(
+        default=12 * 3600,
+        ge=60,
+        le=7 * 24 * 3600,
+        description=(
+            "Lifetime of the signed session_token a guest login response "
+            "carries (app.domains.guest.session_token). The session-mutating "
+            "guest endpoints accept it as proof the caller is the browser "
+            "that signed in."
+        ),
+    )
+    guest_session_token_enforcement: str = Field(
+        default="off",
+        pattern="^(off|sensitive|all)$",
+        description=(
+            "Which session-mutating guest endpoints REQUIRE a valid "
+            "session_token (QA 2026-11-06, H1). 'off' (transition default): "
+            "the old guest_id+session_id pair is still accepted, because "
+            "portal bundles cached in captive sheets keep sending it; a "
+            "token that IS sent is always checked, and every call without "
+            "one logs guest_session_token_missing. 'sensitive': "
+            "/set-password, /set-pin, /profile and /marketing-consent "
+            "require it. 'all': every one of them, including "
+            "/session/disconnect, /sign-in-name and the review flags. Raise "
+            "it once guest_session_token_missing stops appearing."
+        ),
+    )
+    guest_login_router_venue_check: str = Field(
+        default="log",
+        pattern="^(enforce|log)$",
+        description=(
+            "QA 2026-11-06 H2: a guest login's router_id must belong to the "
+            "organization and (when the router has one) the location the "
+            "login names. 'enforce' refuses a mismatch with 403 "
+            "ROUTER_NOT_AT_VENUE; 'log' only writes "
+            "guest_login_router_not_at_venue and admits. Defaults to 'log' "
+            "for the first deploy: a router moved to another location whose "
+            "portal URL still names the old one would otherwise lock real "
+            "guests out. Set 'enforce' once the log line is quiet and the "
+            "read-only router/location SQL in PR #501 shows no mismatch."
+        ),
+    )
+    otp_daily_cap_per_location: int = Field(
+        default=2000,
+        ge=0,
+        le=1_000_000,
+        description=(
+            "QA 2026-11-06 H4: most OTP codes one location may send per UTC "
+            "day (all channels), counted in Redis before a provider is paid. "
+            "0 disables the cap. Backstop against SMS pumping, which rotates "
+            "numbers and so defeats the per-identifier limit."
+        ),
+    )
+    otp_daily_cap_mode: str = Field(
+        default="log",
+        pattern="^(enforce|log)$",
+        description=(
+            "QA 2026-11-06 H4: what reaching otp_daily_cap_per_location / "
+            "otp_daily_cap_platform does. 'log' (first-deploy default) writes "
+            "otp_daily_cap_reached and still sends; 'enforce' refuses with "
+            "429. No production volume figures were on hand to size the caps "
+            "against real peaks (a temple festival day), so they log first."
+        ),
+    )
+    otp_daily_cap_platform: int = Field(
+        default=20000,
+        ge=0,
+        le=10_000_000,
+        description=(
+            "QA 2026-11-06 H4: most OTP codes the whole platform may send "
+            "per UTC day (all channels). 0 disables the cap."
+        ),
+    )
+    voucher_login_max_attempts_per_ip_per_window: int = Field(
+        default=300,
+        ge=1,
+        le=100_000,
+        description=(
+            "QA 2026-11-06 M2: voucher sign-in attempts one client address "
+            "(as resolved through FORWARDED_ALLOW_IPS) may make per "
+            "voucher redemption window. Sized for a venue, because every "
+            "guest at one leaves through its single NAT address; before, the "
+            "bucket was keyed on a client-supplied value and so unbounded."
+        ),
+    )
+    radius_authorize_device_binding_mode: str = Field(
+        default="log",
+        pattern="^(enforce|log)$",
+        description=(
+            "QA 2026-11-06 C2, MikroTik and Omada only (NAS-only APs always "
+            "enforce, as before). 'log' (first-deploy default) writes "
+            "radius_authorize_device_mismatch_admitted and accepts, so a MAC "
+            "format or Calling-Station-Id surprise on the live fleet shows in "
+            "the logs instead of locking guests out; 'enforce' rejects. Set "
+            "'enforce' once that line shows only genuine strangers."
+        ),
+    )
+    radius_authorize_device_binding_all_vendors: bool = Field(
+        default=True,
+        description=(
+            "When true, RADIUS Authorize on every vendor (MikroTik, Omada, "
+            "NAS-only APs) requires the Access-Request's Calling-Station-Id "
+            "to own an ACTIVE session of the guest on that router, whenever "
+            "the session already knows its device. False restores the "
+            "pre-2026-11-06 behaviour where only NAS-only APs were bound to "
+            "the device -- a rollback lever for QA finding C2, not a "
+            "setting to run with."
+        ),
+    )
     rate_limit_max_requests: int = Field(
         default=60,
         ge=1,
@@ -3158,6 +3279,18 @@ class Settings(BaseSettings):
             if getattr(self, name) == fields[name].default
         ]
 
+    def unset_payment_webhook_secrets(self) -> list[str]:
+        """Env var names of payment webhook secrets left empty, in a
+        non-local environment. Names only; never raises (see
+        :meth:`secrets_at_public_default`)."""
+        if self.is_local_environment:
+            return []
+        return [
+            f"CLOUDGUEST_{name.upper()}"
+            for name in PAYMENT_WEBHOOK_SECRET_FIELDS
+            if not str(getattr(self, name) or "").strip()
+        ]
+
     def alerting_delivery_gaps(self) -> list[str]:
         """Env var names of alerting settings whose *unset* value silently
         delivers nothing, in a non-local environment. Empty on a developer
@@ -3229,6 +3362,11 @@ class Settings(BaseSettings):
         environment. Used when strict_production_secrets is enabled."""
         if self.is_local_environment:
             return
+        # Unset payment webhook secrets are NOT part of this. A deployment
+        # that does not take Stripe (or Razorpay) payments leaves that secret
+        # empty on purpose; refusing to boot over it would take guest WiFi
+        # login down with the API. The webhook itself refuses (503) and
+        # startup logs payment_webhook_secret_unset instead.
         defaulted = self.secrets_at_public_default()
         if defaulted:
             raise ValueError(

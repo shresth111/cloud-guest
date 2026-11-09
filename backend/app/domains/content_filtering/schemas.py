@@ -9,6 +9,7 @@ from datetime import datetime
 
 from pydantic import BaseModel
 
+from app.common.routeros_text import RouterOSSafeText
 from app.domains.auth.schemas import MessageResponse
 
 from .constants import ContentFilterCategory, ContentFilterValueType
@@ -27,20 +28,20 @@ __all__ = [
 
 class ContentFilterRuleCreateRequest(BaseModel):
     router_id: str
-    name: str
+    name: RouterOSSafeText
     value_type: ContentFilterValueType
     value: str
     category: ContentFilterCategory | None = None
-    comment: str | None = None
+    comment: RouterOSSafeText | None = None
     is_enabled: bool = True
 
 
 class ContentFilterRuleUpdateRequest(BaseModel):
-    name: str | None = None
+    name: RouterOSSafeText | None = None
     value_type: ContentFilterValueType | None = None
     value: str | None = None
     category: ContentFilterCategory | None = None
-    comment: str | None = None
+    comment: RouterOSSafeText | None = None
     is_enabled: bool | None = None
 
 
