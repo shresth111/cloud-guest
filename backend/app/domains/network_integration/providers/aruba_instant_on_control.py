@@ -95,6 +95,12 @@ __all__ = [
 #: (measured 1000/1000) and the UI's bandwidth enum top value.
 MAX_BANDWIDTH_MBPS = 1000
 
+#: How a speed write is confirmed. The write's own 2xx proves nothing, and the
+#: cloud may not show a change the moment it accepts it, so an unchanged read
+#: is only trusted after a few seconds.
+RATE_LIMIT_READ_BACK_ATTEMPTS = 4
+RATE_LIMIT_READ_BACK_DELAY_SECONDS = 2.0
+
 _HEX = frozenset("0123456789abcdef")
 
 
@@ -218,6 +224,22 @@ def _network_total(
         return None
     value = qos.get(field)
     return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _bandwidth_fields(network: Any) -> dict[str, Any]:
+    """Only the bandwidth settings of a network object, safe to log."""
+    if not isinstance(network, dict):
+        return {"shape": type(network).__name__}
+
+    def pick(row: dict[str, Any]) -> dict[str, Any]:
+        return {
+            key: value
+            for key, value in row.items()
+            if "andwidth" in key and isinstance(value, bool | int | str)
+        }
+
+    qos = network.get("qos") if isinstance(network.get("qos"), dict) else {}
+    return {"top": pick(network), "qos": pick(qos)}
 
 
 def _utcnow() -> datetime:
@@ -437,17 +459,38 @@ class InstantOnControlClient:
         if up is not None:
             body["perClientUploadBandwidthLimitInMbps"] = up
 
-        await self._write(
+        answer = await self._write(
             "PUT", site_id, f"networksSummary/{quote(network_id, safe='')}", body=body
         )
-        after = await self.get_guest_network_rate_limit(site_id, network_id)
         wanted_down = down if enabled else None
         wanted_up = up if enabled else None
-        if (
-            after.enabled != enabled
-            or after.download_mbps != wanted_down
-            or after.upload_mbps != wanted_up
-        ):
+        for attempt in range(RATE_LIMIT_READ_BACK_ATTEMPTS):
+            if attempt:
+                await self._sleep(RATE_LIMIT_READ_BACK_DELAY_SECONDS)
+            read = await self.get_network(site_id, network_id)
+            after = GuestNetworkRateLimit.from_network(read)
+            if (
+                after.enabled == enabled
+                and after.download_mbps == wanted_down
+                and after.upload_mbps == wanted_up
+            ):
+                break
+        else:
+            # The whole-object PUT is unproven against the real API, so say
+            # exactly what came back. Bandwidth fields only: the network
+            # object also holds the PSK and RADIUS secrets.
+            logger.warning(
+                "instant_on_guest_rate_limit_not_kept",
+                extra={
+                    "site_id": site_id,
+                    "network_id": network_id,
+                    "wanted_download_mbps": wanted_down,
+                    "wanted_upload_mbps": wanted_up,
+                    "sent_fields": _bandwidth_fields(body),
+                    "read_fields": _bandwidth_fields(read),
+                    "write_answer_fields": _bandwidth_fields(answer),
+                },
+            )
             raise InstantOnWriteNotConfirmedError(
                 "Instant On did not keep the requested guest speed limit",
                 reason="rate_limit_not_kept",
@@ -565,18 +608,19 @@ class InstantOnControlClient:
 
     async def _write(
         self, method: str, site_id: str, resource: str, *, body: Any = None
-    ) -> None:
-        """One write. A lost answer is *not* an error here: the caller's
-        read-back decides whether it landed. Every other non-2xx raises."""
+    ) -> Any:
+        """One write, returning its answer body if it had one. A lost answer
+        is *not* an error here: the caller's read-back decides whether it
+        landed. Every other non-2xx raises."""
         try:
-            await self._call(method, site_id, resource, body=body)
+            return await self._call(method, site_id, resource, body=body)
         except InstantOnUpstreamError as error:
             if error.reason in ("timeout", "connection_failed"):
                 logger.warning(
                     "instant_on_write_answer_lost",
                     extra={"method": method, "reason": error.reason},
                 )
-                return
+                return None
             raise
 
     async def _call(
@@ -623,7 +667,10 @@ class InstantOnControlClient:
             if 200 <= status < 300:
                 if is_read:
                     return _json_body(response, resource.rsplit("/", 1)[-1])
-                return None
+                try:
+                    return response.json()
+                except ValueError:
+                    return None
             if status == 401:
                 # Safe to repeat even for a write: a 401 means the request
                 # was refused before anything was done.

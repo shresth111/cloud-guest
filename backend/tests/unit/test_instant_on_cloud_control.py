@@ -8,7 +8,9 @@ real token, secret or customer MAC appears here.
 
 from __future__ import annotations
 
+import copy
 import json
+import logging
 import uuid
 from datetime import UTC, datetime, timedelta
 
@@ -297,6 +299,48 @@ class TestGuestRateLimit:
             await _client(site).set_guest_network_rate_limit(
                 SITE, NET, download_mbps=5, upload_mbps=2
             )
+
+    async def test_a_slow_cloud_is_not_reported_as_not_kept(self) -> None:
+        site = FakeSite()
+        original = site.handler
+        stale_reads = {"left": 2}
+        before = copy.deepcopy(site.network)
+
+        def lagging(request: httpx.Request) -> httpx.Response:
+            if (
+                request.method == "GET"
+                and site.writes()
+                and stale_reads["left"] > 0
+            ):
+                stale_reads["left"] -= 1
+                site.requests.append(request)
+                return httpx.Response(200, json={"elements": [before]})
+            return original(request)
+
+        site.handler = lagging  # type: ignore[method-assign]
+        after = await _client(site).set_guest_network_rate_limit(
+            SITE, NET, download_mbps=5, upload_mbps=2
+        )
+        assert (after.download_mbps, after.upload_mbps) == (5, 2)
+        assert len(site.writes()) == 1
+
+    async def test_not_kept_logs_what_came_back_and_never_the_key(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        site = FakeSite()
+        site.ignore_writes = True
+        with caplog.at_level(logging.WARNING), pytest.raises(
+            InstantOnWriteNotConfirmedError
+        ):
+            await _client(site).set_guest_network_rate_limit(
+                SITE, NET, download_mbps=5, upload_mbps=2
+            )
+        event = "instant_on_guest_rate_limit_not_kept"
+        record = next(r for r in caplog.records if r.message == event)
+        assert record.sent_fields["qos"]["perClientDownloadBandwidthLimitInMbps"] == 5
+        assert record.read_fields["qos"]["isBandwidthLimitEnabled"] is False
+        assert "do-not-lose-me" not in str(record.__dict__)
+        assert len(site.writes()) == 1
 
     @pytest.mark.parametrize("value", [0, 1001, -1])
     async def test_out_of_range_is_refused_before_any_call(self, value: int) -> None:
