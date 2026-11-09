@@ -384,6 +384,12 @@ VENDOR_NEUTRAL: dict[str, str] = {
         "exactly what makes the row unjudgeable here."
     ),
     # -- monitoring ---------------------------------------------------------
+    "app/domains/monitoring/repository.py::MonitoringRepository.list_wireguard_peers": (
+        "Joins only to drop peers whose router was soft-deleted. The rows "
+        "returned are WireGuard peers, so a vendor with no peer never "
+        "appears; nothing is judged about the device and nothing is "
+        "dispatched."
+    ),
     "app/domains/monitoring/repository.py::MonitoringRepository.list_routers": (
         "One read, two questions. `AlertService.get_router_names_for_alerts` "
         "needs every row -- an alert that references a controller and "
