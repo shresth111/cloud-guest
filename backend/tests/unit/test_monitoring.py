@@ -708,6 +708,66 @@ async def test_check_wireguard_health_all_stale_is_unhealthy():
     assert result.status == HealthStatus.UNHEALTHY
 
 
+async def test_check_wireguard_health_tolerates_one_sweep_of_handshake_lag():
+    """Real staleness logic: the handshake column is only written by a 5-minute
+    sweep, so a 7-minute-old reading on a 5-minute window is not evidence of a
+    dead tunnel. Past window + one sweep, it is."""
+    from app.domains.wireguard.service import WireGuardService
+
+    wg = WireGuardService(
+        repository=None, router_lookup=None, handshake_stale_after_minutes=5
+    )
+    now = datetime.now(UTC)
+    lagging = _wireguard_peer(last_handshake_at=now - timedelta(minutes=7))
+    dead = _wireguard_peer(last_handshake_at=now - timedelta(minutes=11))
+
+    repo = FakeMonitoringRepository(wireguard_peers=[lagging])
+    service, _ = _make_service(repository=repo, wireguard_service=wg)
+    assert (await service.check_wireguard_health()).status == HealthStatus.HEALTHY
+
+    repo = FakeMonitoringRepository(wireguard_peers=[lagging, dead])
+    service, _ = _make_service(repository=repo, wireguard_service=wg)
+    result = await service.check_wireguard_health()
+    assert result.status == HealthStatus.DEGRADED
+    assert result.details["stale_router_ids"] == [str(dead.router_id)]
+
+
+def test_wireguard_observation_lag_matches_the_hub_sweep():
+    from app.domains.hub_reconciliation.constants import (
+        HUB_RECONCILIATION_SWEEP_INTERVAL_SECONDS,
+    )
+    from app.domains.monitoring.constants import (
+        WIREGUARD_HANDSHAKE_OBSERVATION_LAG_SECONDS,
+    )
+
+    assert (
+        WIREGUARD_HANDSHAKE_OBSERVATION_LAG_SECONDS
+        == HUB_RECONCILIATION_SWEEP_INTERVAL_SECONDS
+    )
+
+
+async def test_list_wireguard_peers_skips_deleted_routers():
+    from app.domains.monitoring.repository import MonitoringRepository
+
+    captured = []
+
+    class _Result:
+        def scalars(self):
+            return self
+
+        def all(self):
+            return []
+
+    class _Session:
+        async def execute(self, statement):
+            captured.append(str(statement))
+            return _Result()
+
+    await MonitoringRepository(_Session()).list_wireguard_peers()
+    assert "JOIN routers" in captured[0]
+    assert "routers.is_deleted IS false" in captured[0]
+
+
 async def test_check_wireguard_health_excludes_revoked_peers():
     revoked_peer = _wireguard_peer(status="revoked")
     repo = FakeMonitoringRepository(wireguard_peers=[revoked_peer])
