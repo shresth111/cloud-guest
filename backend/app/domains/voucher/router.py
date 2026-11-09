@@ -414,11 +414,14 @@ async def list_voucher_batches(
     request: Request,
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=25, ge=1, le=100),
+    # A scope alias: RBAC checks the caller against this location first.
+    location_id: uuid.UUID | None = Query(default=None),
     requesting_organization_id: uuid.UUID | None = Depends(CurrentOrganization),
     service: VoucherService = Depends(get_voucher_service),
 ):
     batches, meta = await service.list_batches(
         requesting_organization_id=requesting_organization_id,
+        location_id=location_id,
         page=page,
         page_size=page_size,
     )

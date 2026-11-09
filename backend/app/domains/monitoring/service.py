@@ -108,6 +108,7 @@ from app.domains.otp.service import (
 )
 from app.domains.rbac.location_scope import (
     LocationScope,
+    confine_location_filter,
     enforce_entity_location,
 )
 from app.domains.rbac.models import AuditLogEntry
@@ -1694,13 +1695,24 @@ class AlertService:
         page: int = DEFAULT_LIST_PAGE,
         page_size: int = DEFAULT_LIST_PAGE_SIZE,
     ) -> tuple[list[Alert], PaginationMeta]:
+        # A caller confined to particular sites passes RBAC on its own
+        # LOCATION grant, and without this the listing then returned every
+        # site's alerts in the organization. Same rule as ``get_alert``: a
+        # named location must be one of theirs, no location means "my sites",
+        # and organization-wide alerts (no location) stay visible.
+        location_filter = confine_location_filter(
+            requested_location_id=location_id,
+            caller_location_scope=self.caller_location_scope,
+            error=CrossLocationAlertAccessError(),
+            include_organization_wide=True,
+        )
         return await self.repository.list_alerts(
             organization_id=organization_id,
             include_all_organizations=include_all_organizations,
             status=status,
             severity=severity,
             router_id=router_id,
-            location_id=location_id,
+            location_id=location_filter,
             page=page,
             page_size=page_size,
         )

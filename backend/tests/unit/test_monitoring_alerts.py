@@ -42,6 +42,7 @@ from datetime import UTC, datetime, timedelta
 import httpx
 import pytest
 
+from app.database.utils.filters import AnyOfOrNull
 from app.domains.dhcp.constants import RogueDhcpAlertState
 from app.domains.isp.constants import HealthStatus as IspHealthStatus
 from app.domains.isp.constants import IspLinkRole, IspLinkType
@@ -75,6 +76,7 @@ from app.domains.monitoring.default_alerting import (
 from app.domains.monitoring.exceptions import (
     AlertNotFoundError,
     AlertRuleNotFoundError,
+    CrossLocationAlertAccessError,
     IncidentNotFoundError,
     InsufficientSlaDataError,
     InvalidAlertRuleConfigError,
@@ -2525,10 +2527,21 @@ class _RecordingPaginator:
             r
             for r in self._rows
             if (org is None or r.organization_id == org)
-            # Mirrors apply_filters: a None filter contributes no WHERE clause.
-            and (loc is None or r.location_id == loc)
+            # Mirrors apply_filters: a None filter contributes no WHERE clause,
+            # a list is IN (...), AnyOfOrNull is IN (...) OR IS NULL.
+            and _location_matches(loc, r.location_id)
         ]
         return selected, _FakePaginateMeta(total_items=len(selected))
+
+
+def _location_matches(loc: object, row_location: uuid.UUID | None) -> bool:
+    if loc is None:
+        return True
+    if isinstance(loc, AnyOfOrNull):
+        return row_location is None or row_location in loc.values
+    if isinstance(loc, list | tuple | set):
+        return row_location in loc
+    return row_location == loc
 
 
 def _repo_with_alert_rows(rows: list[_FakeAlertRow]) -> MonitoringRepository:
@@ -2828,6 +2841,47 @@ async def test_list_alerts_without_location_still_returns_the_whole_org():
 
     assert len(items) == 2
     assert repo.alerts.last_filters["location_id"] is None  # type: ignore[union-attr]
+
+
+async def test_list_alerts_confines_a_location_scoped_caller_to_their_sites():
+    """A front-desk account holding only a LOCATION grant on venue A passes
+    RBAC with its own X-Location-Id. The listing must then return venue A's
+    alerts (plus organization-wide ones), never venue B's."""
+    org = uuid.uuid4()
+    venue_a, venue_b = uuid.uuid4(), uuid.uuid4()
+    rows = [
+        _FakeAlertRow(org, venue_a),
+        _FakeAlertRow(org, venue_b),
+        _FakeAlertRow(org, None),
+    ]
+    service = AlertService(
+        _repo_with_alert_rows(rows), caller_location_scope=frozenset({venue_a})
+    )
+
+    items, meta = await service.list_alerts(organization_id=org)
+
+    assert {row.location_id for row in items} == {venue_a, None}
+    assert meta.total_items == 2
+
+
+async def test_list_alerts_refuses_a_location_outside_the_callers_sites():
+    org = uuid.uuid4()
+    venue_a, venue_b = uuid.uuid4(), uuid.uuid4()
+    service = AlertService(
+        _repo_with_alert_rows([_FakeAlertRow(org, venue_b)]),
+        caller_location_scope=frozenset({venue_a}),
+    )
+
+    with pytest.raises(CrossLocationAlertAccessError):
+        await service.list_alerts(organization_id=org, location_id=venue_b)
+
+
+def test_list_alerts_route_accepts_a_location_filter(monitoring_routes_by_path_method):
+    """The service could filter by location; the route never passed it on, so
+    the dashboard's Recent Alerts card showed every venue's alerts."""
+    route = monitoring_routes_by_path_method[("/api/v1/alerts", "GET")]
+    query_names = {param.name for param in route.dependant.query_params}
+    assert "location_id" in query_names
 
 
 class TestHealthCheckSweepIsScheduled:
