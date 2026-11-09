@@ -3117,6 +3117,18 @@ class Settings(BaseSettings):
             "it once guest_session_token_missing stops appearing."
         ),
     )
+    guest_resume_identifier_mode: str = Field(
+        default="off",
+        pattern="^(off|alias|masked)$",
+        description=(
+            "What the unauthenticated GET /guest/session/active returns as "
+            "the guest's identity. 'off': the raw identifier. 'alias': the "
+            "raw identifier plus an opaque hotspot_username the portal posts "
+            "instead, to prove the alias on real routers. 'masked': the "
+            "alias, and the identifier masked. Raise to 'masked' only after "
+            "the portal that reads hotspot_username is live."
+        ),
+    )
     guest_login_router_venue_check: str = Field(
         default="log",
         pattern="^(enforce|log)$",

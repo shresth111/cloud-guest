@@ -126,6 +126,7 @@ from .radius_bridge import (
     push_nas_client,
     validate_controller_nas_address,
 )
+from .resume_username import apply_resume_identity
 from .schemas import (
     NAS_SECRET_ROTATION_DEVICE_ACTION_NAS_ONLY,
     ArubaSharedListenerView,
@@ -813,14 +814,16 @@ async def _login_payload(
     id and a device MAC can call (QA 2026-11-06, H1): it never issues a
     ``session_token``, so once ``guest_session_token_enforcement`` is raised
     the ids it returns stop being enough to change anything the token
-    guards. The identifier stays unmasked there for now: the portal posts it
-    as the hotspot ``username`` when it resumes, and RADIUS resolves the
-    session by it. A real login gets a fresh token."""
+    guards. What identity it returns follows
+    ``guest_resume_identifier_mode`` (see ``resume_username``). A real login
+    gets a fresh token."""
     response = _login_response(result)
     if not resume:
         response.session_token = issue_guest_session_token(
             result.guest.id, result.session.id
         )
+    else:
+        apply_resume_identity(response, result.session.id)
     response.marketing_consent_offer = await marketing_offer.offer_for(result)
     response.review_prompt_due = await service.review_prompt_due(
         result.guest, result.session

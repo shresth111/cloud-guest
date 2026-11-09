@@ -703,6 +703,9 @@ class GuestLoginResponse(BaseModel):
     # ``/login/*`` responses; ``/session/active`` (callable by anyone who
     # knows a router id and a MAC) always returns ``None``.
     session_token: str | None = None
+    # Only on ``GET /session/active``, per ``guest_resume_identifier_mode``:
+    # what the portal posts as the hotspot username in place of the identifier.
+    hotspot_username: str | None = None
     # Whether this guest already has a password set -- lets the
     # guest-facing frontend decide whether to show the "set a password for
     # next time?" prompt after an OTP login (skip it if already set, or if
