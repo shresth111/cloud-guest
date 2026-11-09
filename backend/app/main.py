@@ -42,8 +42,27 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     "environment": app_settings.environment,
                 },
             )
+        # Payment webhooks refuse every event while their secret is unset;
+        # say so once at startup rather than only on the first refused call.
+        for env_var in app_settings.unset_payment_webhook_secrets():
+            logger.warning(
+                "payment_webhook_secret_unset",
+                extra={
+                    "env_var": env_var,
+                    "environment": app_settings.environment,
+                },
+            )
         if app_settings.strict_production_secrets:
             app_settings.validate_no_public_secrets()
+        elif not app_settings.is_local_environment:
+            # Not defaulted on: turning it on refuses startup, and a refused
+            # startup takes guest WiFi login down with it. Say so every boot
+            # until an operator has checked the deployment's .env and set
+            # CLOUDGUEST_STRICT_PRODUCTION_SECRETS=true.
+            logger.warning(
+                "strict_production_secrets_disabled",
+                extra={"environment": app_settings.environment},
+            )
         # Guest Marketing own-provider credentials are encrypted under
         # router_encryption_key. Logged loudly rather than raised (a crash
         # loop here would take guest WiFi login down); every write of such

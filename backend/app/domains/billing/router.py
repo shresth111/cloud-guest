@@ -700,7 +700,9 @@ async def deactivate_plan(
     "/licenses",
     response_model=ApiResponse[LicenseResponse],
     status_code=status.HTTP_201_CREATED,
-    dependencies=[Depends(RequirePermission("subscriptions.create"))],
+    dependencies=[
+        Depends(RequirePermission("subscriptions.create", scope=ScopeType.GLOBAL))
+    ],
 )
 async def assign_license(
     request: Request,
@@ -800,7 +802,9 @@ async def get_license_history(
     "/licenses/{license_id}/activate",
     response_model=ApiResponse[LicenseResponse],
     status_code=status.HTTP_200_OK,
-    dependencies=[Depends(RequirePermission("subscriptions.update"))],
+    dependencies=[
+        Depends(RequirePermission("subscriptions.update", scope=ScopeType.GLOBAL))
+    ],
 )
 async def activate_license(
     request: Request,
@@ -826,7 +830,9 @@ async def activate_license(
     "/licenses/{license_id}/suspend",
     response_model=ApiResponse[LicenseResponse],
     status_code=status.HTTP_200_OK,
-    dependencies=[Depends(RequirePermission("subscriptions.update"))],
+    dependencies=[
+        Depends(RequirePermission("subscriptions.update", scope=ScopeType.GLOBAL))
+    ],
 )
 async def suspend_license(
     request: Request,
@@ -854,7 +860,9 @@ async def suspend_license(
     "/licenses/{license_id}/cancel",
     response_model=ApiResponse[LicenseResponse],
     status_code=status.HTTP_200_OK,
-    dependencies=[Depends(RequirePermission("subscriptions.update"))],
+    dependencies=[
+        Depends(RequirePermission("subscriptions.update", scope=ScopeType.GLOBAL))
+    ],
 )
 async def cancel_license(
     request: Request,
@@ -1009,7 +1017,9 @@ async def refresh_usage(
     "/subscriptions",
     response_model=ApiResponse[SubscriptionResponse],
     status_code=status.HTTP_201_CREATED,
-    dependencies=[Depends(RequirePermission("subscriptions.create"))],
+    dependencies=[
+        Depends(RequirePermission("subscriptions.create", scope=ScopeType.GLOBAL))
+    ],
 )
 async def create_subscription(
     request: Request,
@@ -1091,7 +1101,9 @@ async def get_subscription(
     "/subscriptions/{subscription_id}/cancel",
     response_model=ApiResponse[SubscriptionResponse],
     status_code=status.HTTP_200_OK,
-    dependencies=[Depends(RequirePermission("subscriptions.update"))],
+    dependencies=[
+        Depends(RequirePermission("subscriptions.update", scope=ScopeType.GLOBAL))
+    ],
 )
 async def cancel_subscription(
     request: Request,
@@ -1119,7 +1131,9 @@ async def cancel_subscription(
     "/subscriptions/{subscription_id}/reactivate",
     response_model=ApiResponse[SubscriptionResponse],
     status_code=status.HTTP_200_OK,
-    dependencies=[Depends(RequirePermission("subscriptions.update"))],
+    dependencies=[
+        Depends(RequirePermission("subscriptions.update", scope=ScopeType.GLOBAL))
+    ],
 )
 async def reactivate_subscription(
     request: Request,
@@ -1145,7 +1159,9 @@ async def reactivate_subscription(
     "/subscriptions/{subscription_id}/pause",
     response_model=ApiResponse[SubscriptionResponse],
     status_code=status.HTTP_200_OK,
-    dependencies=[Depends(RequirePermission("subscriptions.update"))],
+    dependencies=[
+        Depends(RequirePermission("subscriptions.update", scope=ScopeType.GLOBAL))
+    ],
 )
 async def pause_subscription(
     request: Request,
@@ -1171,7 +1187,9 @@ async def pause_subscription(
     "/subscriptions/{subscription_id}/resume",
     response_model=ApiResponse[SubscriptionResponse],
     status_code=status.HTTP_200_OK,
-    dependencies=[Depends(RequirePermission("subscriptions.update"))],
+    dependencies=[
+        Depends(RequirePermission("subscriptions.update", scope=ScopeType.GLOBAL))
+    ],
 )
 async def resume_subscription(
     request: Request,
@@ -1197,7 +1215,9 @@ async def resume_subscription(
     "/subscriptions/{subscription_id}/renewal-settings",
     response_model=ApiResponse[SubscriptionResponse],
     status_code=status.HTTP_200_OK,
-    dependencies=[Depends(RequirePermission("subscriptions.update"))],
+    dependencies=[
+        Depends(RequirePermission("subscriptions.update", scope=ScopeType.GLOBAL))
+    ],
 )
 async def update_subscription_renewal_settings(
     request: Request,

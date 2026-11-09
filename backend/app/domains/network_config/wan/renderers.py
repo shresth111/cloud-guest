@@ -86,6 +86,9 @@ renamed. :func:`render_wan_mangle_section` is deliberately untouched.
 from __future__ import annotations
 
 from app.domains.isp.constants import IspConnectionMode, WanRoutingMode
+from app.domains.network_config.profiles.constants import (
+    escape_routeros_string as _shared_escape_routeros_string,
+)
 
 from .context import WanRenderContext, WanRenderLink
 from .pcc import build_weighted_pcc_plan
@@ -130,7 +133,9 @@ DISCOVERED_NAT_COMMENT = "cloudguest-nat-live"
 
 
 def _escape_routeros_string(value: str) -> str:
-    return value.replace("\\", "\\\\").replace('"', '\\"')
+    # One escaper for every renderer: see escape_routeros_string. Values
+    # without RouterOS-special characters render exactly as before.
+    return _shared_escape_routeros_string(value)
 
 
 def _gateway_usable_expr(var_name: str) -> str:

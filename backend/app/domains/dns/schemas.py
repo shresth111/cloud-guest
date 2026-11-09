@@ -12,6 +12,7 @@ from datetime import datetime
 
 from pydantic import BaseModel, Field
 
+from app.common.routeros_text import RouterOSSafeText
 from app.domains.auth.schemas import MessageResponse
 
 from .constants import DEFAULT_TTL_SECONDS, DnsRecordType
@@ -31,7 +32,7 @@ class DnsRecordCreateRequest(BaseModel):
     address: str
     record_type: DnsRecordType = DnsRecordType.A
     ttl_seconds: int = Field(default=DEFAULT_TTL_SECONDS, ge=1)
-    comment: str | None = None
+    comment: RouterOSSafeText | None = None
     is_enabled: bool = True
 
 
@@ -40,7 +41,7 @@ class DnsRecordUpdateRequest(BaseModel):
     address: str | None = None
     record_type: DnsRecordType | None = None
     ttl_seconds: int | None = Field(default=None, ge=1)
-    comment: str | None = None
+    comment: RouterOSSafeText | None = None
     is_enabled: bool | None = None
 
 

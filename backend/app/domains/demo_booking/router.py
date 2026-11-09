@@ -101,6 +101,7 @@ from app.common.responses import ApiResponse, build_response
 from app.domains.auth.models import AuthUser
 from app.domains.demo_request.models import DemoRequest
 from app.domains.rbac.dependencies import CurrentUser, RequirePermission
+from app.domains.rbac.enums import ScopeType
 
 from .availability import BookingWindow
 from .constants import DemoBookingConfirmationState
@@ -368,7 +369,9 @@ async def reschedule_booking(
     "",
     response_model=ApiResponse[BookingListResponse],
     status_code=status.HTTP_200_OK,
-    dependencies=[Depends(RequirePermission("demo_requests.read"))],
+    dependencies=[
+        Depends(RequirePermission("demo_requests.read", scope=ScopeType.GLOBAL))
+    ],
 )
 async def list_bookings(
     request: Request,
@@ -430,7 +433,9 @@ async def list_bookings(
     "/{booking_id}",
     response_model=ApiResponse[BookingResponse],
     status_code=status.HTTP_200_OK,
-    dependencies=[Depends(RequirePermission("demo_requests.manage"))],
+    dependencies=[
+        Depends(RequirePermission("demo_requests.manage", scope=ScopeType.GLOBAL))
+    ],
 )
 async def update_booking(
     request: Request,

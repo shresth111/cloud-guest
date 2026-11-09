@@ -15,6 +15,7 @@ from datetime import datetime
 
 from pydantic import BaseModel, Field
 
+from app.common.routeros_text import RouterOSSafeText
 from app.domains.auth.schemas import MessageResponse
 from app.domains.qos.constants import DEFAULT_PRIORITY, MAX_PRIORITY, MIN_PRIORITY
 
@@ -29,7 +30,7 @@ __all__ = [
 
 class QosTrafficRuleCreateRequest(BaseModel):
     router_id: str
-    name: str
+    name: RouterOSSafeText
     protocol: str | None = None
     port_range_start: int | None = Field(default=None, ge=1, le=65535)
     port_range_end: int | None = Field(default=None, ge=1, le=65535)
@@ -39,7 +40,7 @@ class QosTrafficRuleCreateRequest(BaseModel):
 
 
 class QosTrafficRuleUpdateRequest(BaseModel):
-    name: str | None = None
+    name: RouterOSSafeText | None = None
     protocol: str | None = None
     port_range_start: int | None = Field(default=None, ge=1, le=65535)
     port_range_end: int | None = Field(default=None, ge=1, le=65535)

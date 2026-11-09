@@ -10,6 +10,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, model_validator
 
+from app.common.routeros_text import RouterOSSafeText
 from app.domains.auth.schemas import MessageResponse
 
 from .constants import DEFAULT_PRIORITY, FirewallAction, FirewallChain, FirewallProtocol
@@ -33,7 +34,7 @@ __all__ = [
 
 class FirewallRuleCreateRequest(BaseModel):
     router_id: str
-    name: str
+    name: RouterOSSafeText
     chain: FirewallChain = FirewallChain.FORWARD
     action: FirewallAction = FirewallAction.ACCEPT
     protocol: FirewallProtocol = FirewallProtocol.ALL
@@ -43,7 +44,7 @@ class FirewallRuleCreateRequest(BaseModel):
     destination_port: int | None = Field(default=None, ge=1, le=65535)
     in_interface: str | None = None
     priority: int = DEFAULT_PRIORITY
-    comment: str | None = None
+    comment: RouterOSSafeText | None = None
     is_enabled: bool = True
 
 
@@ -61,7 +62,7 @@ class FirewallRuleUpdateRequest(BaseModel):
     dropped, so removing an address from a rule returned 200 and kept the
     old address, and the router kept enforcing it on the next push."""
 
-    name: str | None = None
+    name: RouterOSSafeText | None = None
     chain: FirewallChain | None = None
     action: FirewallAction | None = None
     protocol: FirewallProtocol | None = None
@@ -71,7 +72,7 @@ class FirewallRuleUpdateRequest(BaseModel):
     destination_port: int | None = Field(default=None, ge=1, le=65535)
     in_interface: str | None = None
     priority: int | None = None
-    comment: str | None = None
+    comment: RouterOSSafeText | None = None
     is_enabled: bool | None = None
 
     @model_validator(mode="after")

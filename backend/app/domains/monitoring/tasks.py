@@ -72,8 +72,7 @@ from __future__ import annotations
 
 import uuid
 
-import httpx
-
+from app.common.outbound_http import public_only_client
 from app.core.async_task_bridge import run_celery_task
 from app.core.celery_app import celery_app
 from app.core.config import get_settings
@@ -122,7 +121,12 @@ async def _run_alert_rule_evaluation_sweep_async() -> AlertEvaluationResult:
     settings = get_settings()
     redis = create_redis_client()
     try:
-        async with httpx.AsyncClient() as http_client, SessionLocal() as session:
+        async with (
+        public_only_client(
+            trusted_urls=[settings.platform_alert_slack_webhook_url]
+        ) as http_client,
+        SessionLocal() as session,
+    ):
             repository = MonitoringRepository(session)
             notification_service = NotificationService(
                 repository,
@@ -281,7 +285,12 @@ async def _send_channel_test_notification_async(channel_id: uuid.UUID) -> str:
     retry at an empty row.
     """
     settings = get_settings()
-    async with httpx.AsyncClient() as http_client, SessionLocal() as session:
+    async with (
+        public_only_client(
+            trusted_urls=[settings.platform_alert_slack_webhook_url]
+        ) as http_client,
+        SessionLocal() as session,
+    ):
         repository = MonitoringRepository(session)
         service = NotificationService(
             repository,
