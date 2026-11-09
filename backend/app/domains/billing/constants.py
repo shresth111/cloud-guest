@@ -494,6 +494,9 @@ class PaymentProvider(StrEnum):
 
     STRIPE = "stripe"
     RAZORPAY = "razorpay"
+    # Money received outside any gateway (bank transfer, UPI) and recorded by
+    # an operator. Has no gateway, so a refund is refused rather than sent.
+    MANUAL = "manual"
 
 
 class PaymentStatus(StrEnum):

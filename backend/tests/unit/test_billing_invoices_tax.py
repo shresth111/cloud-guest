@@ -24,17 +24,21 @@ from __future__ import annotations
 import asyncio
 import uuid
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 
+from app.database.exceptions import DuplicateRecordError
 from app.database.utils.pagination import PageParams, PaginationMeta
 from app.domains.billing.constants import (
+    DASHBOARD_CAPTURED_PAYMENT_STATUSES,
     BillingCycle,
     InvoiceStatus,
     NoteType,
+    PaymentProvider,
     PaymentStatus,
     PlanType,
     TaxType,
@@ -42,6 +46,7 @@ from app.domains.billing.constants import (
 from app.domains.billing.exceptions import (
     BillingProfileNotFoundError,
     InvalidInvoiceStatusTransitionError,
+    InvalidManualPaymentDateError,
     InvalidNoteAmountError,
     InvoiceNotFoundError,
     SubscriptionNotFoundError,
@@ -1885,3 +1890,108 @@ class TestSignupCouponDiscountOnInvoice:
 
         assert invoice.discount_amount == Decimal("0")
         assert invoice.total_amount == Decimal("1000.00")
+
+
+class _FakePaymentRepository:
+    """Enforces the real unique ``idempotency_key``."""
+
+    def __init__(self) -> None:
+        self.rows: dict[str, object] = {}
+
+    async def create_payment(self, **fields: object) -> object:
+        key = str(fields["idempotency_key"])
+        if key in self.rows:
+            raise DuplicateRecordError("Payment", "idempotency_key")
+        row = SimpleNamespace(id=uuid.uuid4(), **fields)
+        self.rows[key] = row
+        return row
+
+
+class TestRecordManualPayment:
+    async def _invoice(self):
+        (
+            service,
+            _invoices,
+            subscription_repository,
+            plan_repository,
+            billing_profile_repository,
+            _tax,
+        ) = _make_invoice_service()
+        org_id = uuid.uuid4()
+        _plan, subscription = await _make_subscription_and_plan(
+            subscription_repository, plan_repository, organization_id=org_id
+        )
+        await _make_billing_profile(billing_profile_repository, organization_id=org_id)
+        invoice = await service.generate_invoice_for_subscription(subscription.id)
+        payments = _FakePaymentRepository()
+        service.payment_repository = payments
+        return service, invoice, payments
+
+    async def test_records_full_total_as_captured_and_marks_paid(self) -> None:
+        service, invoice, payments = await self._invoice()
+        paid = await service.record_manual_payment(
+            actor_user_id=uuid.uuid4(),
+            invoice_id=invoice.id,
+            received_on=date(2026, 10, 5),
+            reference="UTR123",
+        )
+        payment = next(iter(payments.rows.values()))
+        assert paid.status == InvoiceStatus.PAID.value
+        assert paid.payment_id == payment.id
+        assert payment.amount == invoice.total_amount
+        assert payment.provider == PaymentProvider.MANUAL.value
+        assert payment.provider_payment_id == "UTR123"
+        assert PaymentStatus(payment.status) in DASHBOARD_CAPTURED_PAYMENT_STATUSES
+        # The revenue chart buckets on created_at.
+        assert payment.created_at == datetime(2026, 10, 5, 12, tzinfo=UTC)
+
+    async def test_without_a_date_created_at_is_left_to_the_database(self) -> None:
+        service, invoice, payments = await self._invoice()
+        await service.record_manual_payment(actor_user_id=None, invoice_id=invoice.id)
+        assert not hasattr(next(iter(payments.rows.values())), "created_at")
+
+    async def test_second_recording_is_refused_and_writes_nothing(self) -> None:
+        service, invoice, payments = await self._invoice()
+        await service.record_manual_payment(actor_user_id=None, invoice_id=invoice.id)
+        with pytest.raises(InvalidInvoiceStatusTransitionError):
+            await service.record_manual_payment(
+                actor_user_id=None, invoice_id=invoice.id
+            )
+        assert len(payments.rows) == 1
+
+    async def test_racing_request_hits_the_key_not_a_second_payment(self) -> None:
+        service, invoice, payments = await self._invoice()
+        payments.rows[f"manual-invoice-{invoice.id}"] = SimpleNamespace()
+        with pytest.raises(InvalidInvoiceStatusTransitionError):
+            await service.record_manual_payment(
+                actor_user_id=None, invoice_id=invoice.id
+            )
+        assert invoice.status != InvoiceStatus.PAID.value
+
+    async def test_future_date_is_refused_and_writes_nothing(self) -> None:
+        service, invoice, payments = await self._invoice()
+        with pytest.raises(InvalidManualPaymentDateError):
+            await service.record_manual_payment(
+                actor_user_id=None,
+                invoice_id=invoice.id,
+                received_on=(datetime.now(UTC) + timedelta(days=3)).date(),
+            )
+        assert payments.rows == {}
+
+    def test_route_is_pinned_to_global_billing_manage(self) -> None:
+        """A customer must never be able to mark their own invoice paid."""
+        from app.domains.rbac.enums import ScopeType
+        from app.main import create_app
+        from tests.unit.test_billing_dashboards import (
+            _permission_key_and_scope_for_route,
+        )
+
+        route = next(
+            r
+            for r in create_app().routes
+            if getattr(r, "path", "").endswith("/invoices/{invoice_id}/record-payment")
+        )
+        assert _permission_key_and_scope_for_route(route) == (
+            "billing.manage",
+            ScopeType.GLOBAL,
+        )

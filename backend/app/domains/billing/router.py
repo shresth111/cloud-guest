@@ -237,6 +237,7 @@ from .schemas import (
     InvoiceGenerateAndSendResponse,
     InvoiceItemResponse,
     InvoiceListResponse,
+    InvoiceRecordPaymentRequest,
     InvoiceResponse,
     LicenseAssignRequest,
     LicenseChangeLogResponse,
@@ -2346,6 +2347,37 @@ async def void_invoice(
     return build_response(
         success=True,
         message="Invoice voided",
+        data=_invoice_response(invoice, items, notes).model_dump(mode="json"),
+        request_id=_request_id(request),
+    )
+
+
+@router.post(
+    "/invoices/{invoice_id}/record-payment",
+    response_model=ApiResponse[InvoiceResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission("billing.manage", scope=ScopeType.GLOBAL))],
+)
+async def record_invoice_payment(
+    request: Request,
+    invoice_id: uuid.UUID,
+    payload: InvoiceRecordPaymentRequest,
+    user: AuthUser = Depends(get_current_user),
+    service: InvoiceService = Depends(get_invoice_service),
+):
+    """Master only: a customer must never be able to mark their own invoice
+    paid, hence the GLOBAL pin rather than ``invoices.manage``."""
+    invoice = await service.record_manual_payment(
+        actor_user_id=uuid.UUID(user.id),
+        invoice_id=invoice_id,
+        received_on=payload.received_on,
+        reference=(payload.reference or "").strip() or None,
+    )
+    items = await service.list_items(invoice.id)
+    notes = await service.list_notes(invoice.id)
+    return build_response(
+        success=True,
+        message="Payment recorded",
         data=_invoice_response(invoice, items, notes).model_dump(mode="json"),
         request_id=_request_id(request),
     )

@@ -14,7 +14,7 @@ Money (``Plan.base_price``) and usage (``UsageMetric.value``,
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -828,6 +828,14 @@ class ManualInvoiceCreateRequest(BaseModel):
     required (an invoice with nothing on it isn't a real invoice)."""
 
     line_items: list[ManualInvoiceLineItemRequest] = Field(..., min_length=1)
+
+
+class InvoiceRecordPaymentRequest(BaseModel):
+    """Body for ``POST /invoices/{invoice_id}/record-payment``. The amount is
+    always the invoice's own total, so it is not accepted here."""
+
+    received_on: date | None = None
+    reference: str | None = Field(default=None, max_length=255)
 
 
 class InvoiceGenerateAndSendResponse(BaseModel):

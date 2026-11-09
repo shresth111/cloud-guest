@@ -637,6 +637,7 @@ def get_invoice_service(
     coupon_repository: CouponRepositoryProtocol = Depends(get_coupon_repository),
     audit_repository: RBACRepositoryProtocol = Depends(get_rbac_repository),
     settings: Settings = Depends(get_settings),
+    payment_repository: PaymentRepositoryProtocol = Depends(get_payment_repository),
 ) -> InvoiceService:
     return InvoiceService(
         repository,
@@ -651,6 +652,7 @@ def get_invoice_service(
         coupon_repository=coupon_repository,
         invoice_due_days=settings.invoice_due_days,
         audit_writer=audit_repository,
+        payment_repository=payment_repository,
     )
 
 
