@@ -179,6 +179,9 @@ class GuestSetPasswordRequest(BaseModel):
 
     guest_id: uuid.UUID
     session_id: uuid.UUID
+    # QA 2026-11-06 H1: proof the caller is the browser that signed in --
+    # the login response's ``session_token``. See ``session_token.py``.
+    session_token: str | None = Field(default=None, max_length=512)
     password: str = Field(..., min_length=1, max_length=128)
 
 
@@ -222,6 +225,9 @@ class GuestSetPinRequest(BaseModel):
 
     guest_id: uuid.UUID
     session_id: uuid.UUID
+    # QA 2026-11-06 H1: proof the caller is the browser that signed in --
+    # the login response's ``session_token``. See ``session_token.py``.
+    session_token: str | None = Field(default=None, max_length=512)
     pin: str = Field(
         ..., min_length=PIN_LENGTH, max_length=PIN_LENGTH, pattern=r"^\d+$"
     )
@@ -243,6 +249,9 @@ class GuestUpdateProfileRequest(BaseModel):
 
     guest_id: uuid.UUID
     session_id: uuid.UUID
+    # QA 2026-11-06 H1: proof the caller is the browser that signed in --
+    # the login response's ``session_token``. See ``session_token.py``.
+    session_token: str | None = Field(default=None, max_length=512)
     display_name: str | None = Field(default=None, min_length=1, max_length=200)
     email: EmailStr | None = Field(default=None)
     declined: bool = Field(
@@ -277,6 +286,9 @@ class GuestSignInNameRequest(BaseModel):
 
     guest_id: uuid.UUID
     session_id: uuid.UUID
+    # QA 2026-11-06 H1: proof the caller is the browser that signed in --
+    # the login response's ``session_token``. See ``session_token.py``.
+    session_token: str | None = Field(default=None, max_length=512)
     display_name: str = Field(max_length=1000)
 
 
@@ -308,6 +320,9 @@ class GuestReviewLinkOpenedRequest(BaseModel):
 
     guest_id: uuid.UUID
     session_id: uuid.UUID
+    # QA 2026-11-06 H1: proof the caller is the browser that signed in --
+    # the login response's ``session_token``. See ``session_token.py``.
+    session_token: str | None = Field(default=None, max_length=512)
 
 
 class GuestReviewLinkOpenedResponse(BaseModel):
@@ -324,6 +339,9 @@ class GuestReviewPromptShownRequest(BaseModel):
 
     guest_id: uuid.UUID
     session_id: uuid.UUID
+    # QA 2026-11-06 H1: proof the caller is the browser that signed in --
+    # the login response's ``session_token``. See ``session_token.py``.
+    session_token: str | None = Field(default=None, max_length=512)
 
 
 class GuestReviewPromptShownResponse(BaseModel):
@@ -341,6 +359,9 @@ class GuestDisconnectRequest(BaseModel):
 
     guest_id: uuid.UUID
     session_id: uuid.UUID
+    # QA 2026-11-06 H1: proof the caller is the browser that signed in --
+    # the login response's ``session_token``. See ``session_token.py``.
+    session_token: str | None = Field(default=None, max_length=512)
     reason: str | None = Field(default=None, max_length=255)
 
 
@@ -677,6 +698,11 @@ class GuestLoginResponse(BaseModel):
     guest_id: str
     identifier: str
     is_new_guest: bool
+    # Signed proof of this login (QA 2026-11-06, H1) -- the session-mutating
+    # guest endpoints take it back as ``session_token``. Issued only by the
+    # ``/login/*`` responses; ``/session/active`` (callable by anyone who
+    # knows a router id and a MAC) always returns ``None``.
+    session_token: str | None = None
     # Whether this guest already has a password set -- lets the
     # guest-facing frontend decide whether to show the "set a password for
     # next time?" prompt after an OTP login (skip it if already set, or if

@@ -33,6 +33,7 @@ from app.database.redis import get_redis_client
 from app.database.utils.pagination import PaginationMeta
 from app.domains.billing.constants import PlanFeatureKey
 from app.domains.billing.dependencies import RequireFeature
+from app.domains.guest.session_token import require_guest_session_proof
 from app.domains.rbac.dependencies import RequireOrganization, RequirePermission
 from app.domains.rbac.enums import ScopeType
 
@@ -700,6 +701,12 @@ async def guest_marketing_consent(
     body: GuestConsentRequest,
     service: MarketingService = Depends(get_public_marketing_service),
 ):
+    require_guest_session_proof(
+        guest_id=body.guest_id,
+        session_id=body.session_id,
+        session_token=body.session_token,
+        sensitive=True,
+    )
     ip = request.client.host if request.client else None
     return _ok(
         request,

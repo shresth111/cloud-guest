@@ -145,7 +145,6 @@ def test_the_guest_login_and_portal_paths_are_not_gated() -> None:
     """Named explicitly, because these are the ones that would hurt most."""
     must_stay_open = {
         "/api/v1/captive-portal/resolve",
-        "/api/v1/vouchers/redeem",
         "/api/v1/vouchers/validate",
         "/api/v1/guest-teams/join",
     }

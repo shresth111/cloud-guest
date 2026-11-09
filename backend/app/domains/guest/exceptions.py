@@ -26,6 +26,9 @@ from app.common.exceptions import CloudGuestError
 from .constants import GUEST_NAME_INVALID_CODE, GUEST_NAME_REQUIRED_CODE
 
 __all__ = [
+    "RouterNotAtVenueError",
+    "GuestSessionProofRequiredError",
+    "GuestPasswordLockedError",
     "GuestNameInvalidError",
     "GuestNameRequiredError",
     "GuestError",
@@ -238,6 +241,18 @@ class GuestTeamSharedQuotaExceededError(GuestError):
         super().__init__(
             "Your group has used up its shared data allowance",
             status_code=status.HTTP_403_FORBIDDEN,
+        )
+
+
+class RouterNotAtVenueError(GuestError):
+    """The login named a ``router_id`` that does not belong to the
+    organization/location it also named (QA 2026-11-06, H2)."""
+
+    def __init__(self, router_id: uuid.UUID | str) -> None:
+        super().__init__(
+            "This WiFi network is not part of the venue you are signing in to.",
+            status_code=status.HTTP_403_FORBIDDEN,
+            data={"code": "ROUTER_NOT_AT_VENUE", "router_id": str(router_id)},
         )
 
 
@@ -976,4 +991,32 @@ class GuestPinLockedError(GuestError):
             "Too many incorrect PIN attempts. Please try again later, or "
             "sign in with a one-time code instead.",
             status_code=status.HTTP_423_LOCKED,
+        )
+
+
+class GuestPasswordLockedError(GuestError):
+    """``GuestService.login_via_password``'s per-identifier lockout (QA
+    2026-11-06, M6) -- the password twin of ``GuestPinLockedError``."""
+
+    def __init__(self, locked_until: datetime) -> None:
+        self.locked_until = locked_until
+        super().__init__(
+            "Too many incorrect password attempts. Please try again later, or "
+            "sign in with a one-time code instead.",
+            status_code=status.HTTP_423_LOCKED,
+        )
+
+
+class GuestSessionProofRequiredError(GuestError):
+    """A session-mutating guest endpoint was called without a valid
+    ``session_token`` for the ``guest_id``/``session_id`` it names (QA
+    2026-11-06, H1). The ids alone are not a credential: ``GET
+    /guest/session/active`` hands them to anyone who knows a router id and a
+    device MAC. The remedy is the same whatever leg failed: sign in again."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "Please sign in again to change this.",
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            data={"code": "GUEST_SESSION_PROOF_REQUIRED"},
         )
