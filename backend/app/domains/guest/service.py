@@ -447,6 +447,7 @@ from .repository import (
     LocationSessionCount,
     VoucherRedemptionRow,
 )
+from .resume_username import session_id_from_resume_username
 from .validators import (
     DevicePresenceObservation,
     RouterActivityRead,
@@ -9990,6 +9991,7 @@ class RadiusService:
         router = await self.router_lookup.get_router(
             nas_client.router_id, include_deleted=True
         )
+        username = await self._real_radius_username(router, username)
 
         session = await self._find_active_session_for_identifier(router, username)
         reject_reason = "No active guest session for this login"
@@ -10416,6 +10418,26 @@ class RadiusService:
         # venue configured and what the existing wire-format tests pin.
         return max(math.ceil(remaining), 1)
 
+    async def _real_radius_username(self, router: Router, username: str) -> str:
+        """The guest identifier behind a resume alias, or ``username`` as
+        given. An alias for a session on another router, or whose session or
+        guest is gone, stays unresolved and so matches no guest."""
+        session_id = session_id_from_resume_username(username)
+        if session_id is None:
+            return username
+        session = await self.repository.get_session_by_id(session_id)
+        if session is None or session.router_id != router.id:
+            logger.warning(
+                "radius_resume_username_not_on_this_router",
+                extra={
+                    "event_router_id": str(router.id),
+                    "event_session_id": str(session_id),
+                },
+            )
+            return username
+        guest = await self.repository.get_guest_by_id(session.guest_id)
+        return guest.identifier if guest is not None else username
+
     async def _find_active_session_for_identifier(
         self, router: Router, identifier: str
     ) -> GuestSession | None:
@@ -10722,6 +10744,7 @@ class RadiusService:
         router = await self.router_lookup.get_router(
             nas_client.router_id, include_deleted=True
         )
+        username = await self._real_radius_username(router, username)
         guest = await self.repository.get_guest_by_identifier(
             router.organization_id, normalize_identifier(username)
         )
