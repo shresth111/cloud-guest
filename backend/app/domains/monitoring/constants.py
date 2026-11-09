@@ -964,7 +964,15 @@ DEFAULT_ZTP_PAGE = 1
 DEFAULT_ZTP_PAGE_SIZE = 25
 DEFAULT_FAILURE_SAMPLE_LIMIT = 5
 
+# Mirrors ``hub_reconciliation.constants.HUB_RECONCILIATION_SWEEP_INTERVAL_SECONDS``,
+# the sweep that writes ``WireGuardPeer.last_handshake_at``. A test keeps the
+# two equal.
+WIREGUARD_HANDSHAKE_OBSERVATION_LAG_SECONDS = 300
+WIREGUARD_STALE_ROUTER_IDS_LIMIT = 20
+
 __all__ = [
+    "WIREGUARD_HANDSHAKE_OBSERVATION_LAG_SECONDS",
+    "WIREGUARD_STALE_ROUTER_IDS_LIMIT",
     "HealthComponent",
     "HealthStatus",
     "STORAGE_DEGRADED_USED_PERCENT",

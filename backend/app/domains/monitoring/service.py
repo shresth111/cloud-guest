@@ -159,6 +159,8 @@ from .constants import (
     ROGUE_DHCP_STATE_UNGUARDED,
     ROUTER_EVENT_SOURCE_DOMAIN,
     SOURCE_DOMAIN,
+    WIREGUARD_HANDSHAKE_OBSERVATION_LAG_SECONDS,
+    WIREGUARD_STALE_ROUTER_IDS_LIMIT,
     AlertSeverity,
     AlertStatus,
     AlertTriggerType,
@@ -843,16 +845,29 @@ class MonitoringService:
         peers = await self.repository.list_wireguard_peers()
         now = datetime.now(UTC)
         non_revoked = [peer for peer in peers if peer.status != "revoked"]
+        # ``last_handshake_at`` is only written by the hub sweep, so a working
+        # tunnel's recorded age can legitimately reach one sweep interval.
+        # Judging it as of one interval ago stops that lag from reading as
+        # "stale" against a window of the same length.
+        observed_at = now - timedelta(
+            seconds=WIREGUARD_HANDSHAKE_OBSERVATION_LAG_SECONDS
+        )
         counts: dict[str, int] = {}
+        stale_router_ids: list[str] = []
         for peer in non_revoked:
-            peer_status = self.wireguard_service.compute_health_status(peer, now=now)
+            peer_status = self.wireguard_service.compute_health_status(
+                peer, now=observed_at
+            )
             key = getattr(peer_status, "value", str(peer_status))
             counts[key] = counts.get(key, 0) + 1
+            if key == "stale":
+                stale_router_ids.append(str(peer.router_id))
         elapsed_ms = (time.perf_counter() - started) * 1000
         details: dict[str, object] = {
             "total_peers": len(peers),
             "non_revoked_peers": len(non_revoked),
             "status_counts": counts,
+            "stale_router_ids": stale_router_ids[:WIREGUARD_STALE_ROUTER_IDS_LIMIT],
             "proxy_signal": True,
         }
         stale_count = counts.get("stale", 0)

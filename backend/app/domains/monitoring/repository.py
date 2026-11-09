@@ -702,7 +702,17 @@ class MonitoringRepository:
     # -- WireGuard proxy signal (composes with app.domains.wireguard) --------
 
     async def list_wireguard_peers(self) -> list[WireGuardPeer]:
-        statement = select(WireGuardPeer).where(WireGuardPeer.is_deleted.is_(False))
+        # Deleting a router leaves its peer row behind. That peer can never
+        # handshake again, so without this join it holds the platform's
+        # WireGuard status at "degraded" forever.
+        statement = (
+            select(WireGuardPeer)
+            .join(Router, Router.id == WireGuardPeer.router_id)
+            .where(
+                WireGuardPeer.is_deleted.is_(False),
+                Router.is_deleted.is_(False),
+            )
+        )
         result = await self.session.execute(statement)
         return list(result.scalars().all())
 
