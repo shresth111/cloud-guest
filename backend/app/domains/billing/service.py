@@ -50,7 +50,7 @@ import logging
 import uuid
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from typing import Protocol
 
@@ -138,6 +138,7 @@ from .exceptions import (
     DuplicateSubscriptionError,
     InvalidInvoiceStatusTransitionError,
     InvalidLicenseStatusTransitionError,
+    InvalidManualPaymentDateError,
     InvalidNoteAmountError,
     InvalidSubscriptionStatusTransitionError,
     InvalidTaxRateError,
@@ -3239,8 +3240,10 @@ class InvoiceService:
         coupon_repository: CouponRepositoryProtocol | None = None,
         invoice_due_days: int = 15,
         audit_writer: AuditLogWriter | None = None,
+        payment_repository: PaymentRepositoryProtocol | None = None,
     ) -> None:
         self.repository = repository
+        self.payment_repository = payment_repository
         self.subscription_repository = subscription_repository
         self.plan_repository = plan_repository
         self.billing_profile_repository = billing_profile_repository
@@ -3508,7 +3511,11 @@ class InvoiceService:
         return invoice
 
     async def mark_invoice_paid(
-        self, *, invoice_id: uuid.UUID, payment_id: uuid.UUID
+        self,
+        *,
+        invoice_id: uuid.UUID,
+        payment_id: uuid.UUID,
+        actor_user_id: uuid.UUID | None = None,
     ) -> Invoice:
         """Marks a real, previously-``ISSUED``/``OVERDUE`` invoice ``PAID``
         against ``payment_id`` -- called directly (a manual reconciliation)
@@ -3526,13 +3533,67 @@ class InvoiceService:
         )
         logger.info("billing_invoice_marked_paid", extra=_event_extra(event))
         await self._audit(
-            None,
+            actor_user_id,
             AuditAction.INVOICE_MARKED_PAID,
             updated,
             description=f"Invoice {updated.invoice_number} marked paid via "
             f"payment {payment_id}",
         )
         return updated
+
+    async def record_manual_payment(
+        self,
+        *,
+        actor_user_id: uuid.UUID | None,
+        invoice_id: uuid.UUID,
+        received_on: date | None = None,
+        reference: str | None = None,
+    ) -> Invoice:
+        """Records money received outside any gateway (bank transfer, UPI)
+        against an unpaid invoice, for its full total, and marks it paid.
+
+        Writes a real ``SUCCEEDED`` ``Payment`` because that is what revenue
+        reporting counts. ``created_at`` is set to ``received_on`` so the
+        amount lands in the month the money arrived, not the month it was
+        typed in. The key is per-invoice, so an invoice can only ever be
+        recorded once, even by two racing requests.
+        """
+        if self.payment_repository is None:  # pragma: no cover - wiring guard
+            raise RuntimeError("InvoiceService was built without payment_repository")
+        invoice = await self.get_invoice(invoice_id)
+        _assert_invoice_transition(invoice.status, InvoiceStatus.PAID)
+        now = datetime.now(UTC)
+        # A day of slack: "today" in India can be tomorrow in UTC.
+        if received_on is not None and received_on > (now + timedelta(days=1)).date():
+            raise InvalidManualPaymentDateError(received_on)
+        fields: dict[str, object] = {}
+        if received_on is not None:
+            fields["created_at"] = datetime(
+                received_on.year, received_on.month, received_on.day, 12, tzinfo=UTC
+            )
+        try:
+            payment = await self.payment_repository.create_payment(
+                organization_id=invoice.organization_id,
+                subscription_id=invoice.subscription_id,
+                amount=invoice.total_amount,
+                currency=invoice.currency,
+                status=PaymentStatus.SUCCEEDED.value,
+                provider=PaymentProvider.MANUAL.value,
+                provider_payment_id=reference,
+                idempotency_key=f"manual-invoice-{invoice.id}",
+                refunded_amount=Decimal("0"),
+                created_by=actor_user_id,
+                **fields,
+            )
+        except DuplicateRecordError as exc:
+            raise InvalidInvoiceStatusTransitionError(
+                InvoiceStatus.PAID.value, InvoiceStatus.PAID.value
+            ) from exc
+        return await self.mark_invoice_paid(
+            invoice_id=invoice.id,
+            payment_id=payment.id,
+            actor_user_id=actor_user_id,
+        )
 
     async def mark_invoice_paid_for_payment(self, payment: Payment) -> Invoice | None:
         """The natural continuation of a successful payment webhook --

@@ -474,6 +474,14 @@ class InvalidInvoiceStatusTransitionError(BillingError):
         )
 
 
+class InvalidManualPaymentDateError(BillingError):
+    def __init__(self, received_on: object) -> None:
+        super().__init__(
+            f"The payment date {received_on} is in the future",
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        )
+
+
 class InvalidNoteAmountError(BillingError):
     """A credit/debit note's ``amount`` is non-positive, or (for a credit
     note specifically) exceeds the invoice's own ``total_amount``."""
@@ -518,6 +526,7 @@ __all__ = [
     "RefundExceedsRefundableAmountError",
     "PaymentNotRetryableError",
     "NoDefaultPaymentMethodError",
+    "InvalidManualPaymentDateError",
     "UnsupportedPaymentProviderError",
     "PaymentProviderError",
     "WebhookSignatureInvalidError",
