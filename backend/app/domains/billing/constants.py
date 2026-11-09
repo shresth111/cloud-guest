@@ -169,6 +169,18 @@ class PlanFeatureKey(StrEnum):
     # platform's CLOUDGUEST_TRAFFIC_FLOW_RECORDS_ENABLED.
     TRAFFIC_FLOW_RECORDS = "traffic_flow_records"
 
+    # -- Firewall, customer side: the venue's Firewall section -- firewall
+    # rules and their push (``app.domains.firewall``, except the Master-only
+    # band routes) and Block Websites (``app.domains.content_filtering`` and
+    # ``app.domains.dns_filtering``). BOOLEAN, off by default and carried by
+    # no seeded plan, unlocked per organization from the Master console the
+    # same way as GUEST_MARKETING. Organizations that were already using any
+    # of it when the add-on was introduced got an enabled override row from
+    # migration 0178 so nothing they had stopped working. The Security
+    # Check (``app.domains.security``, read-only) is NOT behind it: a venue
+    # can always read its own exposure.
+    FIREWALL = "firewall"
+
 
 class PlanFeatureType(StrEnum):
     """The value-shape a :class:`~.models.PlanFeature` row carries -- see
@@ -243,6 +255,7 @@ BOOLEAN_FEATURE_KEYS: frozenset[PlanFeatureKey] = frozenset(
         PlanFeatureKey.GUEST_MARKETING_BYO,
         PlanFeatureKey.TRAFFIC_FLOW,
         PlanFeatureKey.TRAFFIC_FLOW_RECORDS,
+        PlanFeatureKey.FIREWALL,
     }
 )
 
@@ -257,6 +270,7 @@ ADDON_FEATURE_KEYS: frozenset[PlanFeatureKey] = frozenset(
         PlanFeatureKey.GUEST_MARKETING_BYO,
         PlanFeatureKey.TRAFFIC_FLOW,
         PlanFeatureKey.TRAFFIC_FLOW_RECORDS,
+        PlanFeatureKey.FIREWALL,
     }
 )
 
