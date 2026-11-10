@@ -38,6 +38,7 @@ class IspRole(StrEnum):
     TECHNICIAN = "isp-technician"
     VIEWER = "isp-viewer"
     BILLING = "isp-billing"
+    FRANCHISEE = "isp-franchisee"  # RAKESH-FS, zone-confined (ISP_WORKFLOW_ENABLED)
 
 
 ISP_ROLE_SLUGS: frozenset[str] = frozenset(r.value for r in IspRole)

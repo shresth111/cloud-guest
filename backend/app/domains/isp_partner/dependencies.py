@@ -138,6 +138,7 @@ async def RequireIspPartner(
         "isp-technician",
         "isp-billing",
         "isp-viewer",
+        "isp-franchisee",  # RAKESH-FS
     ]
     chosen = min(isp_roles, key=lambda a: order.index(a.role.slug))
 
@@ -172,7 +173,11 @@ async def RequireIspPartner(
     # a no-op unless ISP_ZONES_ENABLED is on and the param is sent.
     from .zones_scope import apply_zone_scope
 
-    return await apply_zone_scope(ctx, request)
+    ctx = await apply_zone_scope(ctx, request)
+    # RAKESH-FS: an isp-franchisee is confined to its zones (identity otherwise).
+    from .workflow_franchisee import apply_franchisee_scope
+
+    return await apply_franchisee_scope(ctx, request)
 
 
 def isp_guards(permission_key: str) -> list[Any]:

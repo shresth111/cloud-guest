@@ -199,6 +199,39 @@ EXPECTED["isp-viewer"] |= {"isp_referrals.read"}
 # AUDIT-LOG: owner/admin only
 EXPECTED["isp-owner"] |= {"isp_audit.read", "isp_audit.export"}
 EXPECTED["isp-admin"] = EXPECTED["isp-owner"]
+# RAKESH-FS (founder 2026-11-10): zone-confined franchisee login. Never
+# create/manage/assign on isp_partner (no customers, users, ISPs), no zone
+# or plan writes, no logs/IPDR/audit.
+EXPECTED["isp-franchisee"] = {
+    "isp_partner.read",
+    "isp_partner.update",
+    "isp_partner.execute",
+    "isp_zones.read",
+    "isp_plans.read",
+    "isp_coupons.read",
+    "isp_coupons.create",
+    "isp_coupons.export",
+    "isp_subscribers.read",
+    "isp_subscribers.update",
+    "isp_subscribers.disconnect",
+    "isp_subscribers.kyc",
+    "isp_billing.read",
+    "isp_billing.create",
+    "isp_billing.execute",
+    "isp_invoices.read",
+    "isp_invoices.create",
+    "isp_monitor.read",
+    "isp_support.read",
+    "isp_support.create",
+    "isp_apps.read",
+    "isp_apps.create",
+    "isp_apps.update",
+    "isp_collections.read",
+    "isp_collections.collect",
+    "isp_incidents.read",
+    "isp_referrals.read",
+    "isp_referrals.create",
+}
 
 
 class InMemoryRBAC:
@@ -305,7 +338,7 @@ async def test_roles_get_exactly_the_contract_keys(repo) -> None:
     summary = await isp_seed.seed_isp_partner_rbac(repo)
     assert summary.permission_groups_created == 22  # +1 AUDIT-LOG
     assert summary.permissions_created == 83  # +2 isp_audit.*
-    assert summary.roles_created == 6
+    assert summary.roles_created == 7  # +1 isp-franchisee (RAKESH-FS)
     grants = repo.grants(slugs=set(EXPECTED))
     assert grants == EXPECTED
     for key in all_permission_keys():

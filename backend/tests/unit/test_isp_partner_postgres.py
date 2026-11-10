@@ -88,6 +88,7 @@ async def test_isp_partner_end_to_end() -> None:  # noqa: PLR0915 -- one scenari
                 "isp-technician",
                 "isp-viewer",
                 "isp-billing",
+                "isp-franchisee",  # RAKESH-FS
             }
             # ISP roles hold only keys from the ISP permission groups. The
             # list grew lane by lane (isp_engage ... isp_audit), so it is read

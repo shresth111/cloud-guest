@@ -151,4 +151,10 @@ def test_seed_grants_approve_to_owner_and_admin_only() -> None:
     collectors = {
         r.slug for r in ROLES if "isp_collections.collect" in r.permission_keys
     }
-    assert collectors == {"isp-owner", "isp-admin", "isp-technician", "isp-billing"}
+    assert collectors == {
+        "isp-owner",
+        "isp-admin",
+        "isp-technician",
+        "isp-billing",
+        "isp-franchisee",  # RAKESH-FS: collects cash in its own zones
+    }
