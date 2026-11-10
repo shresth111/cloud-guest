@@ -295,3 +295,112 @@ def test_read_state_reports_open_factory_public() -> None:
     assert state.agent_enabled
     assert state.default_public_open
     assert not state.community_present
+
+
+# -- librouteros-shaped reads (Master "NOT verified" on every real router) --
+#
+# librouteros 3.2.1 parses ``yes``/``no``/``true``/``false`` on the wire into
+# Python ``True``/``False`` (measured on CHR 7.25.1, 2026-11-10). The fake
+# above stores what was sent, so it echoed ``"yes"`` back and the text
+# compare ``"True" != "yes"`` was never exercised.
+
+_WIRE_BOOLS = {"yes": True, "true": True, "no": False, "false": False}
+
+
+def _as_librouteros(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        k: _WIRE_BOOLS.get(v, v) if isinstance(v, str) else v for k, v in row.items()
+    }
+
+
+class _LibrouterosMenu(_NoPasswordEcho):
+    def __iter__(self):
+        return (_as_librouteros(r) for r in super().__iter__())
+
+
+class _LibrouterosSettings(_Menu):
+    def __iter__(self):
+        return (_as_librouteros(r) for r in super().__iter__())
+
+
+class _LibrouterosApi(_FakeApi):
+    def path(self, *segments: str) -> _Menu:
+        if segments == ("snmp", "community"):
+            return _LibrouterosMenu(self, segments)
+        return _LibrouterosSettings(self, segments)
+
+
+class TestBooleanReadBack:
+    def test_real_router_read_back_verifies(self) -> None:
+        api = _LibrouterosApi()
+        result = apply_snmp_config(api, _v2())
+        assert result.mismatches == []
+        assert result.verified
+        # the read really did come back as bools
+        mine = next(iter(api.path("snmp", "community")))
+        assert mine["default"] is True
+
+    def test_real_router_second_apply_is_a_no_op(self) -> None:
+        api = _LibrouterosApi()
+        apply_snmp_config(api, _v2())
+        api.writes.clear()
+        result = apply_snmp_config(api, _v2())
+        assert result.changed == []
+        assert api.writes == []
+        assert result.verified
+
+    def test_real_mismatch_still_fails_with_bools(self) -> None:
+        # The router keeps write-access on (an operator, or a write that
+        # did nothing): read back as Python True, desired "no".
+        api = _LibrouterosApi()
+        apply_snmp_config(api, _v2())
+        _ours(api)[0]["write-access"] = "yes"
+        api.ignore_writes = True
+        result = apply_snmp_config(api, _v2())
+        assert "community:write-access" in result.mismatches
+        assert not result.verified
+
+    def test_real_mismatch_still_fails_on_text_fields(self) -> None:
+        api = _LibrouterosApi()
+        apply_snmp_config(api, _v2())
+        _ours(api)[0]["addresses"] = "0.0.0.0/0"
+        api.ignore_writes = True
+        result = apply_snmp_config(api, _v2())
+        assert result.mismatches == ["community:addresses"]
+        assert not result.verified
+
+
+@pytest.mark.parametrize(
+    ("key", "actual", "desired", "same"),
+    [
+        # booleans: librouteros bools and every RouterOS spelling
+        ("read-access", True, "yes", True),
+        ("read-access", "yes", "yes", True),
+        ("read-access", "true", "yes", True),
+        ("read-access", "TRUE", "yes", True),
+        ("write-access", False, "no", True),
+        ("write-access", "no", "no", True),
+        ("write-access", "false", "no", True),
+        ("disabled", False, "no", True),
+        # real boolean mismatches
+        ("read-access", False, "yes", False),
+        ("write-access", True, "no", False),
+        ("write-access", "yes", "no", False),
+        ("read-access", "", "yes", False),
+        ("read-access", None, "yes", False),
+        ("read-access", "maybe", "yes", False),
+        # text fields compare as text, exactly as before
+        ("addresses", "172.31.38.118/32", "172.31.38.118/32", True),
+        ("addresses", "0.0.0.0/0", "172.31.38.118/32", False),
+        ("security", "none", "none", True),
+        ("security", "private", "none", False),
+        # a community NAME that spells a boolean is not normalised
+        ("name", True, "yes", False),
+        ("name", "true", "yes", False),
+        ("name", "yes", "yes", True),
+    ],
+)
+def test_field_compare(key: str, actual: Any, desired: str, same: bool) -> None:
+    from wyfy_device_gateway.mikrotik_snmp import _field_matches
+
+    assert _field_matches(key, actual, desired) is same
