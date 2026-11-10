@@ -21,6 +21,7 @@ from app.common.masking import mask_identifier
 from .billing_service import IspBillingService
 from .dependencies import IspContext
 from .exceptions import _err
+from .p1_cycle_hook import cycle_end as _p1_cycle_end  # RAKESH-P1 P1-2
 from .plans_models import (
     DEFAULT_REMINDER_OPT_IN,
     IspCouponBatch,
@@ -1849,6 +1850,7 @@ class IspPlansService:
         now = self._clock()
         start = max(now, s.valid_until) if s.valid_until else now
         end = start + timedelta(days=package.validity_days * cycles)
+        end = await _p1_cycle_end(self.session, isp, s, package, start, end)  # P1-2
         tz = isp.organization.timezone or "Asia/Kolkata"
         line = {
             "description": (

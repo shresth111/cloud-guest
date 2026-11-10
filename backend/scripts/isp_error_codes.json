@@ -261,6 +261,15 @@
       ]
     },
     {
+      "code": "ISP_COUPONS_NOT_PERMITTED",
+      "kind": "code",
+      "status": 403,
+      "message": "Coupon generation is not permitted in this zone",
+      "sources": [
+        "app/domains/isp_partner/p1_coupon_rights.py"
+      ]
+    },
+    {
       "code": "ISP_COUPON_BATCH_NOT_FOUND",
       "kind": "code",
       "status": 404,

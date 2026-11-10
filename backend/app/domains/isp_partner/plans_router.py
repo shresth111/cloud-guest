@@ -28,6 +28,7 @@ from .constants import DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE
 from .coupon_pdf import render_coupon_sheet
 from .dependencies import IspContext, RequireIspPartner, isp_guards
 from .http import ok
+from .p1_coupon_rights import coupon_gate as p1_coupon_gate  # RAKESH-P1 P1-3
 from .plans_service import IspPlansService, suggest_name
 from .service_control import IspServiceControl
 from .views import page as make_page
@@ -528,6 +529,7 @@ async def create_coupon_batch(
     svc: IspPlansService = Depends(get_plans_service),
     db: AsyncSession = Depends(get_db_session),
 ) -> dict:
+    await p1_coupon_gate(db, isp, payload.isp_customer_id)  # RAKESH-P1 P1-3
     control = IspServiceControl(session=db)
     batch, warnings = await svc.create_coupon_batch(
         isp, payload.model_dump(), is_cut=control.is_cut
