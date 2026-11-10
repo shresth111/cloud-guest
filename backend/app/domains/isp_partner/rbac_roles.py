@@ -458,3 +458,9 @@ ROLES = tuple(
     for r in ROLES
 )
 ROLES_BY_SLUG = {r.slug: r for r in ROLES}
+
+# -- RAKESH-FS: isp-franchisee (zone-confined login; ISP_WORKFLOW_ENABLED).
+from .workflow_franchisee import franchisee_role_definition  # noqa: E402
+
+ROLES = (*ROLES, franchisee_role_definition())
+ROLES_BY_SLUG = {r.slug: r for r in ROLES}

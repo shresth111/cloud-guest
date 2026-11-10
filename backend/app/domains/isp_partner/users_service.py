@@ -127,6 +127,9 @@ class IspUsersService:
     def _check_role(slug: str) -> None:
         if slug not in ISP_ROLE_SLUGS:
             raise IspRoleInvalidError()
+        from .workflow_franchisee import check_role_allowed  # RAKESH-FS
+
+        check_role_allowed(slug)
 
     @staticmethod
     def _check_grant(isp: IspContext, slug: str) -> None:

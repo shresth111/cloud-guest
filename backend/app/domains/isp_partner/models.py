@@ -160,6 +160,7 @@ from .referrals_models import *  # noqa: E402,F403  (REFERRAL-1)
 from .revenue_snapshot_models import *  # noqa: E402,F403  (SMALL-4)
 from .subscriber360_models import *  # noqa: E402,F403
 from .winback_models import *  # noqa: E402,F403  (SMALL-3)
+from .workflow_models import *  # noqa: E402,F403  (RAKESH-FS)
 from .zones_models import *  # noqa: E402,F403  (ZONE-1 zone tree)
 
 __all__ = ["IspCustomerProfile", "IspPartnerProfile", "IspStaffCustomerScope"]
