@@ -1,4 +1,4 @@
-"""RAKESH-FS tables (migration 0199_isp_workflow). Additive only; no existing
+"""RAKESH-FS tables (migration 0225_isp_workflow). Additive only; no existing
 column changes.
 
 * ``isp_franchisee_zones`` -- the zones (each with its whole ZONE-1 subtree)

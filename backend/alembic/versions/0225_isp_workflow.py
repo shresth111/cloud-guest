@@ -2,8 +2,8 @@
 
 Additive: four new ISP-owned link tables. ``downgrade`` drops exactly these.
 
-Revision ID: 0199_isp_workflow
-Revises: 0198_isp_incident_auto
+Revision ID: 0225_isp_workflow
+Revises: 0224_isp_p1_zone_coupon_rights
 Create Date: 2026-11-10
 """
 
@@ -14,8 +14,8 @@ from sqlalchemy.dialects import postgresql
 
 from alembic import op
 
-revision = "0199_isp_workflow"
-down_revision = "0198_isp_incident_auto"
+revision = "0225_isp_workflow"
+down_revision = "0224_isp_p1_zone_coupon_rights"
 branch_labels = None
 depends_on = None
 
