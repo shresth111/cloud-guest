@@ -80,3 +80,28 @@ Verify after install:
 ss -ulpn | grep 2055            # nfacctd on 10.20.0.1 only
 curl -s -H "X-Agent-Secret: $S" http://<hub-private-ip>:9094/flows/health
 ```
+
+## Known pmacct bug: template-file rewrite overflows by one byte
+
+Found 2026-11-10 on the ISP testbox (POSTFIX-1, D9). `delete_line_from_file()`
+in pmacct's `src/util.c` (1.7.7, 1.7.8 and 1.7.9; fixed only on upstream
+master) allocates `strlen(path) + 5` bytes and writes `path + ".copy"` plus
+its NUL into them: one byte too many. It runs every time a router re-sends a
+template it already sent, because `nfacctd_templates_file` is set.
+
+* Built with `-D_FORTIFY_SOURCE=3` (Ubuntu 24.04's `pmacct 1.7.8-2build2`)
+  glibc aborts: `*** buffer overflow detected ***`, crash-loop as soon as a
+  router exports real LAN traffic (RouterOS then re-sends templates often).
+* Built with `_FORTIFY_SOURCE=2` (Debian 12's `1.7.7-1+b1`, the prod hub)
+  the stray byte lands in malloc padding for this file's path
+  (`/var/lib/wyfy-nfacctd/templates.json`, 36 characters) and nothing
+  happens. Replaying the testbox's crashing capture against that build:
+  no crash.
+* **Do not change `nfacctd_templates_file` to a path whose length is 3 more
+  than a multiple of 16** (19, 35, 51 ... characters): the byte then
+  overwrites the next heap chunk's header and even the Debian 1.7.7 build
+  aborts (`free(): invalid next size`, reproduced with a 19-character path).
+* Do not move the hub to a pmacct built with `_FORTIFY_SOURCE=3` (Ubuntu
+  24.04 or later) without a patched build or without dropping the templates
+  file. The testbox runs Debian's 1.7.7 in a container for this reason
+  (`~/wyfy-ops/isp-network/netflow-pmacct177-testbox.sh`).

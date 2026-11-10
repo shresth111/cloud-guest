@@ -334,7 +334,8 @@ def _status_row(
         "router_status": router.status,
         "routeros_version": router.routeros_version,
         "state": overall,
-        "state_label": st.OVERALL_LABEL[overall],
+        "state_label": st.state_label(overall, pipes),
+        "lagging_pipes": st.lagging_pipes(pipes) if overall == st.PARTIAL else [],
         "blocker": blocker,
         "set_up": syslog_on and flows_on,
         "set_up_at": _iso(

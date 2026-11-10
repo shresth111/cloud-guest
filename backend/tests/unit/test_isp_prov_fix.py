@@ -218,6 +218,7 @@ def test_routes_are_flag_gated_and_guarded() -> None:
         ("GET", "/routers/{isp_router_id}/monitoring"),
         ("POST", "/routers/{isp_router_id}/monitoring/enable"),
         ("POST", "/routers/{isp_router_id}/monitoring/disable"),
+        ("GET", "/package-policy-summaries"),
     }
     for r in routes:
         deps = [d.dependency for d in r.dependencies]
@@ -543,3 +544,201 @@ def test_d4_netmon_hint_is_self_serve_only_when_flag_on(
     mod.get_prov_fix_settings.cache_clear()
     assert netmon_router._self_serve_monitoring() is True
     mod.get_prov_fix_settings.cache_clear()
+
+
+# -- [POSTFIX-1] D10: boolean read-back spelling -------------------------------
+
+
+class _Repo:
+    def __init__(self) -> None:
+        self.updates: list[dict] = []
+
+    async def update_router(self, router, data):  # noqa: ANN001, ANN202
+        self.updates.append(data)
+        for k, v in data.items():
+            setattr(router, k, v)
+        return router
+
+
+class _SnmpOutcome(_Snmp):
+    """apply_to_device returns a real-shaped outcome (mismatches + state)."""
+
+    def __init__(self, row, outcome) -> None:  # noqa: ANN001
+        super().__init__(row)
+        self.outcome = outcome
+        self.router_service = SimpleNamespace(repository=_Repo())
+
+    async def apply_to_device(self, rid, *, actor_user_id):  # noqa: ANN001, ANN202
+        return self.outcome
+
+    async def _router(self, rid):  # noqa: ANN001, ANN202
+        return self.row
+
+
+def _state(**kw) -> SimpleNamespace:  # noqa: ANN003
+    base = dict(
+        agent_enabled=True,
+        community_present=True,
+        community_disabled=False,
+        community_read_only=True,
+    )
+    base.update(kw)
+    return SimpleNamespace(**base)
+
+
+def _outcome(mismatches, state) -> SimpleNamespace:  # noqa: ANN001
+    return SimpleNamespace(verified=not mismatches, mismatches=mismatches, state=state)
+
+
+BOOLS = ["community:read-access", "community:write-access"]
+
+
+async def test_d10_boolean_spelling_only_switches_on(monkeypatch) -> None:  # noqa: ANN001
+    row = _router_row()
+    _scope(monkeypatch, row)
+    snmp = _SnmpOutcome(row, _outcome(BOOLS, _state()))
+    audit = _Audit()
+    out = await mod._switch(_req(), ROUTER_ID, True, _isp(), snmp, audit)
+    assert out["data"]["enabled"] is True
+    assert out["data"]["applied_on_router"] is True
+    assert list(snmp.router_service.repository.updates[0]) == ["snmp_device_applied_at"]
+    assert audit.rows[0]["action"] == "isp_router_setup_monitoring_on"
+
+
+@pytest.mark.parametrize(
+    ("mismatches", "state"),
+    [
+        (BOOLS + ["community:addresses"], _state()),
+        (BOOLS + ["default-public:addresses"], _state()),
+        (BOOLS + ["agent:enabled"], _state(agent_enabled=False)),
+        (BOOLS, _state(community_read_only=False)),
+        (BOOLS, _state(community_disabled=True)),
+        (BOOLS, _state(community_present=False)),
+        (BOOLS, None),
+        (["community:missing"], _state(community_present=False)),
+    ],
+)
+async def test_d10_any_real_mismatch_still_refuses(
+    monkeypatch, mismatches, state
+) -> None:  # noqa: ANN001
+    row = _router_row()
+    _scope(monkeypatch, row)
+    snmp = _SnmpOutcome(row, _outcome(mismatches, state))
+    with pytest.raises(mod.IspMonitoringRouterUnreachableError):
+        await mod._switch(_req(), ROUTER_ID, True, _isp(), snmp, _Audit())
+    assert snmp.router_service.repository.updates == []
+
+
+def test_d10_real_writer_against_librouteros_shaped_rows() -> None:
+    """The shared writer, against an API that answers like librouteros 3.2.1
+    on RouterOS (booleans parsed to bool, measured on CHR 7.25.1): reported
+    NOT verified on the two boolean fields only, and the partner check
+    accepts it. A wrong address on the device is still refused."""
+    from wyfy_device_gateway.mikrotik_snmp import SnmpDeviceConfig, apply_snmp_config
+
+    class _Menu:
+        def __init__(self, api, key):  # noqa: ANN001
+            self.api, self.key = api, key
+
+        def __iter__(self):  # noqa: ANN204
+            return iter([dict(r) for r in self.api.menus[self.key]])
+
+        @staticmethod
+        def _parse(fields):  # noqa: ANN001, ANN205
+            words = {"yes": True, "true": True, "no": False, "false": False}
+            return {
+                k: words.get(v, v) if isinstance(v, str) else v
+                for k, v in fields.items()
+            }
+
+        def add(self, **fields):  # noqa: ANN003, ANN202
+            row = {".id": "*9", "default": False, "disabled": False}
+            row.update(self._parse(fields))
+            self.api.menus[self.key].append(row)
+            return "*9"
+
+        def update(self, **fields):  # noqa: ANN003, ANN202
+            rid = fields.pop(".id", None)
+            for row in self.api.menus[self.key]:
+                if rid is None or row.get(".id") == rid:
+                    row.update(self._parse(fields))
+                    if self.api.wrong_address and row.get("comment") == "wyfy-snmp":
+                        row["addresses"] = "0.0.0.0/0"
+
+        def remove(self, *ids):  # noqa: ANN002, ANN202
+            self.api.menus[self.key] = [
+                r for r in self.api.menus[self.key] if r[".id"] not in ids
+            ]
+
+    class _Api:
+        def __init__(self, wrong_address: bool = False) -> None:
+            self.wrong_address = wrong_address
+            self.menus = {
+                ("snmp",): [{"enabled": False}],
+                ("snmp", "community"): [
+                    {
+                        ".id": "*0",
+                        "name": "public",
+                        "addresses": "::/0",
+                        "security": "none",
+                        "read-access": True,
+                        "write-access": False,
+                        "default": True,
+                        "disabled": False,
+                    }
+                ],
+            }
+
+        def path(self, *segments):  # noqa: ANN002, ANN202
+            return _Menu(self, segments)
+
+    cfg = SnmpDeviceConfig(name="wyfy0123456789abcdef", addresses=("10.66.0.1/32",))
+    res = apply_snmp_config(_Api(), cfg)
+    assert res.verified is False
+    assert sorted(res.mismatches) == BOOLS
+    assert mod._monitoring_read_back_ok(res) is True
+
+    api = _Api(wrong_address=True)
+    apply_snmp_config(api, cfg)  # add (correct) ...
+    res = apply_snmp_config(api, cfg)  # ... then an update the device "rewrites"
+    assert "community:addresses" in res.mismatches
+    assert mod._monitoring_read_back_ok(res) is False
+
+
+# -- [POSTFIX-1] D11: the heartbeat's WAN-IP fetch host, by config only --------
+
+BOX_HOSTS = frozenset({"network-staging.wyfyguest.com", "api.ipify.org"})
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        # as stored today (no topics on the wire)
+        "<174>Nov 10 17:31:09 qa-iplogs-chr-066e12 wyfy-990b6cd2: "
+        "Download from api.ipify.org FINISHED",
+        # with add-topics-string=yes (topics before the tag, CHR 7.25.1)
+        "<174>Nov 10 18:16:11 qa-iplogs-chr-066e12 fetch,info wyfy-990b6cd2: "
+        "Download from api.ipify.org FINISHED",
+    ],
+)
+def test_d11_ipify_heartbeat_line_dropped_when_listed(raw: str) -> None:
+    from datetime import UTC, datetime
+
+    from app.domains.device_logs.parser import parse_line
+
+    p = parse_line(raw, received_at=datetime(2026, 11, 10, 12, 1, tzinfo=UTC))
+    assert p.tag == "990b6cd2"
+    assert is_agent_fetch_noise(p, BOX_HOSTS)
+    assert not is_agent_fetch_noise(p, HOSTS)  # not listed -> kept
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Download from api.ipify.org FAILED",
+        "Download from api.ipify.org.evil.example FINISHED",
+        "Download from api.ipify.org FINISHED (12 bytes)",
+    ],
+)
+def test_d11_other_ipify_lines_kept(message: str) -> None:
+    assert not is_agent_fetch_noise(_p(message, "fetch,info"), BOX_HOSTS)

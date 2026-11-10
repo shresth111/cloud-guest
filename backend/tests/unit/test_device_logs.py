@@ -83,6 +83,40 @@ class TestParser:
         assert p.topics == "system,error,critical"
         assert p.severity == 4
 
+    def test_postfix1_d6_topics_before_tag_are_topics_not_identity(self) -> None:
+        # add-topics-string=yes on RouterOS 7.25.1 (CHR, 2026-11-10)
+        p = parse_line(
+            "<174>Nov 10 18:16:11 qa-iplogs-chr-066e12 script,info "
+            "wyfy-990b6cd2: pf1 d6 probe",
+            received_at=datetime(2026, 11, 10, 12, 47, tzinfo=UTC),
+        )
+        assert p.hostname == "qa-iplogs-chr-066e12"
+        assert p.topics == "script,info"
+        assert p.tag == "990b6cd2"
+        assert p.message == "pf1 d6 probe"
+
+    def test_postfix1_d6_identity_with_spaces_and_topics_before_tag(self) -> None:
+        p = parse_line(
+            "<174>Oct  6 14:29:58 Signature Global Office dhcp,info "
+            "wyfy-8a199617 dhcp-guest assigned 10.5.50.12",
+            received_at=NOW,
+        )
+        assert p.hostname == "Signature Global Office"
+        assert p.topics == "dhcp,info"
+        assert p.tag == "8a199617"
+        assert p.message == "dhcp-guest assigned 10.5.50.12"
+
+    def test_postfix1_d6_lines_without_topics_unchanged(self) -> None:
+        p = parse_line(
+            "<174>Oct  6 14:29:58 Signature Global Office wyfy-8a199617: hello",
+            received_at=NOW,
+        )
+        assert (p.hostname, p.topics, p.tag) == (
+            "Signature Global Office",
+            None,
+            "8a199617",
+        )
+
     def test_line_without_pri_keeps_severity_unknown_not_info(self) -> None:
         p = parse_line("something happened", received_at=NOW)
         assert p.severity is None and p.facility is None

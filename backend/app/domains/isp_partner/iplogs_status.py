@@ -37,6 +37,11 @@ OFFLINE = "offline"
 OVERALL_SILENT = "silent"
 NEEDS_LINK = "needs_link"
 NOT_SUPPORTED = "not_supported"
+#: [POSTFIX-1] D12: at least one pipe arrives and another set-up pipe has
+#: stopped or never started. Before this the card read "Logs arriving"
+#: (green) as soon as ANY pipe arrived, so system logs alone hid that the
+#: connection logs / NAT rows (what IPDR, CGNAT and LEA need) were not.
+PARTIAL = "partial"
 
 OVERALL_LABEL: dict[str, str] = {
     LOGS_ARRIVING: "Logs arriving",
@@ -46,7 +51,16 @@ OVERALL_LABEL: dict[str, str] = {
     OVERALL_SILENT: "No logs lately",
     NEEDS_LINK: "Finish the setup script first",
     NOT_SUPPORTED: "Not supported on this device",
+    PARTIAL: "Some logs are not arriving",
 }
+
+#: Partner names of the pipes, for the partial headline.
+PIPE_LABEL: dict[str, str] = {
+    "syslog": "System logs",
+    "flows": "Connection logs",
+    "nat": "NAT translations",
+}
+_LAGGING_WORD: dict[str, str] = {SILENT: "stopped", AWAITING_FIRST: "not arriving yet"}
 
 SYSLOG_STALE = timedelta(minutes=60)
 #: Flow windows close every 5 minutes and are pulled after a grace period.
@@ -82,7 +96,7 @@ def overall_state(
         return NOT_SUPPORTED
     states = set(pipes.values())
     if RECEIVING in states:
-        return LOGS_ARRIVING
+        return PARTIAL if lagging_pipes(pipes) else LOGS_ARRIVING
     if blocker == "needs_link":
         return NEEDS_LINK
     if not router_online:
@@ -92,6 +106,30 @@ def overall_state(
     if AWAITING_FIRST in states:
         return WAITING
     return OVERALL_NOT_SET_UP
+
+
+def lagging_pipes(pipes: dict[str, str]) -> list[str]:
+    """Pipes that were set up but are not arriving (stopped, or never
+    started), in card order. A pipe that is not set up or not collected on
+    this server is not lagging: those have their own state and warning."""
+    return [
+        name
+        for name in ("syslog", "flows", "nat")
+        if pipes.get(name) in (SILENT, AWAITING_FIRST)
+    ]
+
+
+def state_label(overall: str, pipes: dict[str, str]) -> str:
+    """The card headline. For ``partial`` it names the pipes that are not
+    arriving ("Some logs are not arriving: Connection logs stopped, NAT
+    translations stopped"), so a green card never hides a stopped pipe."""
+    if overall != PARTIAL:
+        return OVERALL_LABEL[overall]
+    parts = [
+        f"{PIPE_LABEL[name]} {_LAGGING_WORD[pipes[name]]}"
+        for name in lagging_pipes(pipes)
+    ]
+    return f"{OVERALL_LABEL[PARTIAL]}: {', '.join(parts)}"
 
 
 def is_non_public(address: str | None) -> bool:

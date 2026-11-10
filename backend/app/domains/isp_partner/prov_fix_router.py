@@ -38,14 +38,18 @@ from __future__ import annotations
 
 import secrets
 import uuid
+from datetime import UTC, datetime
 from functools import lru_cache
 from typing import Any
 
 from fastapi import APIRouter, Depends, Request
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings, get_settings
+from app.database.session import get_db_session
 from app.domains.rbac.dependencies import get_rbac_repository
 from app.domains.rbac.repository import RBACRepositoryProtocol
 from app.domains.router import router as router_routes
@@ -72,8 +76,11 @@ from .constants import (
     IspRole,
 )
 from .dependencies import IspContext, RequireIspPartner, isp_guards
+from .enforcement_models import IspPackagePolicy
 from .exceptions import IspSetupNotAllowedError, _err
 from .http import ok
+from .plans_models import IspPackage
+from .plans_router import PLANS_READ
 from .scoping import IspScope
 
 AUDIT_PREFIX = "isp_router_setup_"
@@ -178,6 +185,7 @@ async def setup_fixes(request: Request) -> dict:
             "in_app_choices": True,
             "heartbeat_reports_version": True,
             "monitoring_self_serve": True,
+            "package_policy_summaries": True,
         },
         "Setup fixes",
     )
@@ -288,6 +296,41 @@ def _snmp_service(
     return RouterSnmpService(router_service, settings=settings)
 
 
+#: [POSTFIX-1] D10. Read-back "mismatches" that are only RouterOS's boolean
+#: spelling. librouteros parses ``read-access=yes`` / ``write-access=no`` into
+#: Python ``True`` / ``False`` (measured on CHR 7.25.1, 2026-11-10), while
+#: ``mikrotik_snmp._compare`` compares ``str(actual)`` with the desired
+#: ``"yes"`` / ``"no"``. So every real router reads back "NOT verified" and
+#: enable answered 502 ISP_MONITORING_ROUTER_UNREACHABLE although the write
+#: had landed. The same read-back's ``state`` judges these two fields
+#: correctly (``community_read_only``, via ``_truthy``). Partner path only;
+#: the shared writer is not changed here.
+_BOOL_SPELLING_MISMATCHES: frozenset[str] = frozenset(
+    {"community:read-access", "community:write-access"}
+)
+
+
+def _monitoring_read_back_ok(outcome: Any) -> bool:
+    """True when the device holds what enable asked for. ``verified`` as
+    reported, or every mismatch is a boolean spelling AND the read-back
+    state shows the agent on and our community present, enabled and
+    read-only. Any other mismatch (addresses, security, duplicate, public
+    fence, agent off) still fails."""
+    if outcome.verified:
+        return True
+    mismatches = set(getattr(outcome, "mismatches", None) or ())
+    if not mismatches or not mismatches <= _BOOL_SPELLING_MISMATCHES:
+        return False
+    state = getattr(outcome, "state", None)
+    return bool(
+        state is not None
+        and state.agent_enabled
+        and state.community_present
+        and not state.community_disabled
+        and state.community_read_only is True
+    )
+
+
 def _monitoring_view(router: Any) -> dict:
     return {
         "enabled": bool(router.snmp_enabled),
@@ -362,7 +405,17 @@ async def _switch(
         if getattr(exc, "status_code", 500) in (409, 422):
             raise IspMonitoringUnavailableError() from None
         raise
-    if on and not outcome.verified:
+    verified = outcome.verified
+    if on and not verified and _monitoring_read_back_ok(outcome):
+        # [POSTFIX-1] D10: only the boolean spelling disagreed. Record the
+        # apply the shared service left unrecorded (it clears the stamp on
+        # any mismatch).
+        router = await service._router(target.id)  # noqa: SLF001
+        await service.router_service.repository.update_router(
+            router, {"snmp_device_applied_at": datetime.now(UTC)}
+        )
+        verified = True
+    if on and not verified:
         # Written but the read-back disagrees: do not leave it half on.
         raise IspMonitoringRouterUnreachableError(verified=False)
     await _audit(
@@ -370,7 +423,7 @@ async def _switch(
         isp,
         target,
         "monitoring_on" if on else "monitoring_off",
-        verified=outcome.verified,
+        verified=verified,
     )
     refreshed = await IspScope.assert_router(isp, isp_router_id)
     view = _monitoring_view(refreshed)
@@ -408,6 +461,60 @@ async def disable_monitoring(
     audit: RBACRepositoryProtocol = Depends(get_rbac_repository),
 ) -> dict:
     return await _switch(request, isp_router_id, False, isp, service, audit)
+
+
+# ---------------------------------------------------------------------------
+# [POSTFIX-1] package list: FUP and validity start per package
+# ---------------------------------------------------------------------------
+
+#: More packages than one ISP ever sells; bounds the read.
+_POLICY_SUMMARY_LIMIT = 2000
+
+
+@prov_fix_router.get(
+    "/package-policy-summaries",
+    dependencies=[*_ON, *isp_guards(PLANS_READ)],
+)
+async def package_policy_summaries(
+    request: Request,
+    isp: IspContext = Depends(RequireIspPartner),
+    db: AsyncSession = Depends(get_db_session),
+) -> dict:
+    """The package list showed "30 d" and "Cap None" for a plan with a
+    3000 GB FUP whose validity starts at first login (QA W8): both live in
+    the package policy, which was only readable one package at a time. One
+    row per package of THIS ISP that has a policy; packages without one use
+    the defaults (no FUP, validity from activation). Read-only."""
+    p, k = IspPackagePolicy, IspPackage
+    rows = (
+        await db.execute(
+            select(p.package_id, p.fup_limit_mb, p.fup_reset, p.validity_starts)
+            .join(k, k.id == p.package_id)
+            .where(
+                p.isp_organization_id == isp.isp_org_id,
+                k.isp_organization_id == isp.isp_org_id,
+                p.is_deleted.is_(False),
+                k.is_deleted.is_(False),
+            )
+            .order_by(p.package_id)
+            .limit(_POLICY_SUMMARY_LIMIT)
+        )
+    ).all()
+    return ok(
+        request,
+        {
+            "items": [
+                {
+                    "package_id": str(r.package_id),
+                    "fup_limit_mb": r.fup_limit_mb,
+                    "fup_reset": r.fup_reset,
+                    "validity_starts": r.validity_starts,
+                }
+                for r in rows
+            ]
+        },
+        "Package policy summaries",
+    )
 
 
 __all__ = ["prov_fix_router", "get_prov_fix_settings"]

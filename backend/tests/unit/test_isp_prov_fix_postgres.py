@@ -162,6 +162,37 @@ async def test_prov_fix_scoping(monkeypatch) -> None:  # noqa: ANN001, C901
             await _router(w, cs, 3)
             p1 = await package(api, "A", price=50000, name="PfOne")
 
+            # ---- [POSTFIX-1] package policy summaries: own ISP only
+            await api.put(
+                f"/packages/{p1}/policy",
+                {
+                    "fup_limit_mb": 3000000,
+                    "fup_reset": "cycle",
+                    "fup_fallback_speed_group_id": None,
+                    "fup_exclude_upload": False,
+                    "fup_carry_forward": False,
+                    "boost_speed_group_id": None,
+                    "boost_start_minute": None,
+                    "boost_end_minute": None,
+                    "validity_starts": "first_login",
+                    "queue_priority": None,
+                    "mac_bind_count": 0,
+                    "mac_restriction": False,
+                    "ip_restriction": False,
+                    "max_simultaneous": None,
+                    "idle_timeout_s": None,
+                    "hard_timeout_s": None,
+                },
+            )
+            mine = {
+                i["package_id"]: i
+                for i in (await api.get("/package-policy-summaries"))["items"]
+            }
+            assert mine[p1]["fup_limit_mb"] == 3000000, mine
+            assert mine[p1]["validity_starts"] == "first_login"
+            theirs = (await api.get("/package-policy-summaries", who="B"))["items"]
+            assert p1 not in {i["package_id"] for i in theirs}
+
             async def sub(cust, zone, ident):
                 return (
                     await api.post(

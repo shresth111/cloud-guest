@@ -297,3 +297,44 @@ async def test_flag_off_is_404(monkeypatch: pytest.MonkeyPatch) -> None:
     mod.get_iplogs_settings.cache_clear()
     await mod.RequireIpLogsEnabled()
     mod.get_iplogs_settings.cache_clear()
+
+
+# -- [POSTFIX-1] D12: a stopped pipe is never hidden behind a green card -------
+
+
+def test_d12_partial_when_a_set_up_pipe_stopped() -> None:
+    f = st.overall_state
+    qa = {"syslog": st.RECEIVING, "flows": st.SILENT, "nat": st.SILENT}
+    assert f(blocker=None, router_online=True, pipes=qa) == st.PARTIAL
+    assert st.lagging_pipes(qa) == ["flows", "nat"]
+    assert st.state_label(st.PARTIAL, qa) == (
+        "Some logs are not arriving: Connection logs stopped, NAT translations stopped"
+    )
+    fresh = {
+        "syslog": st.RECEIVING,
+        "flows": st.AWAITING_FIRST,
+        "nat": st.AWAITING_FIRST,
+    }
+    assert f(blocker=None, router_online=True, pipes=fresh) == st.PARTIAL
+    assert "Connection logs not arriving yet" in st.state_label(st.PARTIAL, fresh)
+    flows_only = {"syslog": st.SILENT, "flows": st.RECEIVING, "nat": st.RECEIVING}
+    assert st.state_label(st.PARTIAL, flows_only).endswith(": System logs stopped")
+
+
+@pytest.mark.parametrize(
+    "pipes",
+    [
+        {"syslog": st.RECEIVING, "flows": st.RECEIVING, "nat": st.RECEIVING},
+        # not set up / not collected on this server are not "lagging": they
+        # have their own state and warning
+        {"syslog": st.RECEIVING, "flows": st.COLLECTOR_OFF, "nat": st.COLLECTOR_OFF},
+        {"syslog": st.RECEIVING, "flows": st.NOT_SET_UP, "nat": st.NOT_SET_UP},
+    ],
+)
+def test_d12_all_set_up_pipes_arriving_stays_green(pipes) -> None:  # noqa: ANN001
+    assert (
+        st.overall_state(blocker=None, router_online=True, pipes=pipes)
+        == st.LOGS_ARRIVING
+    )
+    assert st.state_label(st.LOGS_ARRIVING, pipes) == "Logs arriving"
+    assert st.lagging_pipes(pipes) == []
