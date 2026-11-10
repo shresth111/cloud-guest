@@ -648,7 +648,7 @@ def _check_master_operator_mfa(user: AuthUser) -> None:
     can do, so the caller is a platform operator and never a customer. Uses
     ``AuthUser.mfa_enabled``, already loaded with the user: no extra query.
     """
-    if user.mfa_enabled:
+    if getattr(user, "mfa_enabled", False):
         return
     mode = get_settings().master_operator_mfa_mode
     if mode == "off":
