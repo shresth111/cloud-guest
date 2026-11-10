@@ -157,7 +157,9 @@ class TestRouterOs:
         """Parity by test: the paste script and the API writer can only
         differ if this fails."""
         cfg = _config()
-        lines = render_script(cfg)
+        # PROV-FIX D8: the plain (non-deferred) line is what a 7.18+ router
+        # gets; unknown / older versions are covered in test_isp_prov_fix.py.
+        lines = render_script(cfg, routeros_version="7.25.1 (stable)")
         action_lines = [ln for ln in lines if "/system logging action add " in ln]
         rule_lines = [ln for ln in lines if ln.startswith("/system logging add ")]
         assert len(action_lines) == 1
@@ -179,7 +181,7 @@ class TestRouterOs:
         assert "debug" not in text
 
     def test_add_lines_are_not_swallowed_by_on_error(self) -> None:
-        for line in render_script(_config()):
+        for line in render_script(_config(), routeros_version="7.18"):
             for handler in re.findall(r"on-error=\{([^}]*)\}", line):
                 assert "add" not in handler
             if " add " in line and "on-error" in line:

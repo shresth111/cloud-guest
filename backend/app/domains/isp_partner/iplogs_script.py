@@ -170,6 +170,9 @@ def _syslog_lines(t: IpLogsTargets) -> list[str]:
         f"/system logging action add {_args(modern_action_row(config.action_row()))}"
     )
     name = ROUTEROS_ACTION_NAME
+    topics_on = deferred(
+        f"/system logging action set [find name={name}] add-topics-string=yes"
+    )
     lines = [
         f"# 3. System logs to {config.remote_host}:{config.remote_port}",
         f":do {{ /system logging remove [find action={name}] }} on-error={{}}",
@@ -180,6 +183,11 @@ def _syslog_lines(t: IpLogsTargets) -> list[str]:
         f'on-error={{ :do {{ {legacy}; :put "  System logs: older RouterOS format" }} '
         'on-error={ :put "  FAILED: the router refused the remote logging action"; '
         ':error "wyfy: remote logging refused" } }',
+        # PROV-FIX D6: RouterOS 7.25.1 writes add-topics-string=no on a new
+        # action, so the topic list never reaches the collector. Where the
+        # property exists it is switched on; where it does not, the parse is
+        # refused and caught (same deferral as the dialect pick above).
+        f":do {{ {topics_on} }} on-error={{}}",
     ]
     lines.extend(f"/system logging add {_args(row)}" for row in config.rule_rows())
     return lines

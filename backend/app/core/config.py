@@ -612,6 +612,21 @@ class Settings(BaseSettings):
             "ever written. Override via CLOUDGUEST_DEVICE_LOGS_ENABLED."
         ),
     )
+    device_logs_drop_agent_fetch_hosts: list[str] = Field(
+        default_factory=list,
+        description=(
+            "PROV-FIX D7. Hostnames whose RouterOS fetch-success line "
+            "('Download from <host> FINISHED', nothing else on the line) is "
+            "NOT stored by the collector. That line is written by the "
+            "platform's own heartbeat / authorized-MAC schedulers once a "
+            "minute per router (~45% of stored rows on wyfy-isp-test). "
+            "Only that exact shape and only these hosts are dropped: every "
+            "other fetch line (other hosts, FAILED, Upload, anything with "
+            "more text) is stored as before. Empty (the default) drops "
+            "nothing. Override via "
+            "CLOUDGUEST_DEVICE_LOGS_DROP_AGENT_FETCH_HOSTS as a JSON list."
+        ),
+    )
     device_logs_ingest_secret: str = Field(
         default="",
         description=(

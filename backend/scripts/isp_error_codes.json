@@ -965,6 +965,42 @@
       ]
     },
     {
+      "code": "ISP_MANAGEMENT_CONNECTION_NOT_READY",
+      "kind": "code",
+      "status": 409,
+      "message": "We could not prepare the management connection for this router, so no setup script was made. Nothing was changed. Try Generate again in a minute; if it keeps happening, contact Wyfy Guest support.",
+      "sources": [
+        "app/domains/isp_partner/prov_fix_router.py"
+      ]
+    },
+    {
+      "code": "ISP_MONITORING_NOT_ALLOWED",
+      "kind": "code",
+      "status": 403,
+      "message": "Only an ISP owner or admin can switch monitoring on or off.",
+      "sources": [
+        "app/domains/isp_partner/prov_fix_router.py"
+      ]
+    },
+    {
+      "code": "ISP_MONITORING_ROUTER_UNREACHABLE",
+      "kind": "code",
+      "status": 502,
+      "message": "We could not reach the router to switch monitoring on. Check that it is online and that Read now works on its page, then try again. If Read now fails too, generate the setup script again and paste all of it.",
+      "sources": [
+        "app/domains/isp_partner/prov_fix_router.py"
+      ]
+    },
+    {
+      "code": "ISP_MONITORING_UNAVAILABLE",
+      "kind": "code",
+      "status": 409,
+      "message": "Traffic monitoring is not available for this router yet. Contact Wyfy Guest support.",
+      "sources": [
+        "app/domains/isp_partner/prov_fix_router.py"
+      ]
+    },
+    {
       "code": "ISP_MONTH_FORMAT",
       "kind": "reason",
       "status": 422,
@@ -1310,6 +1346,15 @@
       ]
     },
     {
+      "code": "ISP_PROV_FIX_DISABLED",
+      "kind": "code",
+      "status": 404,
+      "message": "Not Found",
+      "sources": [
+        "app/domains/isp_partner/prov_fix_router.py"
+      ]
+    },
+    {
       "code": "ISP_QUERY_INVALID",
       "kind": "reason",
       "status": 422,
@@ -1512,6 +1557,15 @@
       "message": "Another suspend or resume for this customer is running",
       "sources": [
         "app/domains/isp_partner/exceptions.py"
+      ]
+    },
+    {
+      "code": "ISP_SETUP_TOKEN_MISMATCH",
+      "kind": "code",
+      "status": 409,
+      "message": "This setup code belongs to a different router. Close the page and press Generate again on the router you are setting up.",
+      "sources": [
+        "app/domains/isp_partner/prov_fix_router.py"
       ]
     },
     {

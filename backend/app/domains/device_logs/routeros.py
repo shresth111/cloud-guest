@@ -22,6 +22,7 @@ so they are keyed on ``action=`` and *replaced*, never appended -- an
 from __future__ import annotations
 
 import ipaddress
+import re
 import uuid
 from dataclasses import dataclass
 
@@ -135,23 +136,63 @@ def modern_action_row(row: dict[str, str]) -> dict[str, str]:
     return out
 
 
-def render_action_add(config: RemoteLoggingConfig) -> str:
+#: First release that has ``remote-log-format`` (and refuses ``bsd-syslog=``).
+_MODERN_SYSLOG_RELEASE = (7, 18)
+
+
+def _release(version: str | None) -> tuple[int, int] | None:
+    """``"7.25.1 (stable)"`` -> ``(7, 25)``; anything unreadable -> None."""
+    if not version:
+        return None
+    m = re.match(r"\s*(\d+)\.(\d+)", version)
+    return (int(m.group(1)), int(m.group(2))) if m else None
+
+
+def _deferred(command: str) -> str:
+    """``command`` compiled at run time (``[[:parse "..."]]``), so a property
+    this RouterOS does not know is refused when that branch RUNS, not when
+    the whole line is parsed. Same escaping as the ISP IP-logs script."""
+    body = command.replace("\\", "\\\\").replace('"', '\\"').replace("$", "\\$")
+    return f'[[:parse "{body}"]]'
+
+
+def render_action_add(
+    config: RemoteLoggingConfig, *, routeros_version: str | None = None
+) -> str:
     """One line that adds the action in whichever dialect the router speaks.
     The probe reads ``remote-log-format`` off the default ``remote`` action
     (present on every RouterOS); only the probe sits in ``on-error`` -- the
     ``add`` itself is never swallowed, so a rejected parameter still stops
-    the paste loudly."""
+    the paste loudly.
+
+    PROV-FIX D8: RouterOS before 7.18 resolves property names when the line
+    is PARSED, so the plain line (which names ``remote-log-format=`` in its
+    ``do`` branch) is refused whole on 7.16.2 ("expected end of command
+    (line 1 column 287)") and no action is created. Unless the router is
+    known to run 7.18 or newer, each ``add`` is therefore deferred with
+    ``[[:parse "..."]]``; a refusal of the branch that runs still stops the
+    paste. A router known to be on 7.18+ gets the original line byte for
+    byte."""
     legacy = _args(config.action_row())
     modern = _args(modern_action_row(config.action_row()))
+    release = _release(routeros_version)
+    if release is not None and release >= _MODERN_SYSLOG_RELEASE:
+        modern_add = f"/system logging action add {modern}"
+        legacy_add = f"/system logging action add {legacy}"
+    else:
+        modern_add = _deferred(f"/system logging action add {modern}")
+        legacy_add = _deferred(f"/system logging action add {legacy}")
     return (
         ":local m false; :do { /system logging action get [find name=remote] "
         "remote-log-format; :set m true } on-error={}; "
-        f":if ($m) do={{ /system logging action add {modern} }} "
-        f"else={{ /system logging action add {legacy} }}"
+        f":if ($m) do={{ {modern_add} }} "
+        f"else={{ {legacy_add} }}"
     )
 
 
-def render_script(config: RemoteLoggingConfig) -> list[str]:
+def render_script(
+    config: RemoteLoggingConfig, *, routeros_version: str | None = None
+) -> list[str]:
     """Paste script: remove-then-add (idempotent by replacement), then print
     what the router now holds so the operator sees the read-back.
 
@@ -159,7 +200,7 @@ def render_script(config: RemoteLoggingConfig) -> list[str]:
     (e.g. an older RouterOS without ``src-address``) must stop the paste
     loudly instead of leaving a half-configured router that looks done."""
     lines = render_removal()
-    lines.append(render_action_add(config))
+    lines.append(render_action_add(config, routeros_version=routeros_version))
     lines.extend(f"/system logging add {_args(row)}" for row in config.rule_rows())
     lines.append(
         f':put ("Wyfy remote logging: " . [:len [/system logging find '

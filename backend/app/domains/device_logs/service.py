@@ -25,6 +25,7 @@ from __future__ import annotations
 import base64
 import binascii
 import logging
+import re
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -273,6 +274,32 @@ def _id(value: uuid.UUID | None) -> str | None:
     return str(value) if value is not None else None
 
 
+_AGENT_FETCH_LINE = re.compile(r"^Download from (\S+) FINISHED$")
+_FETCH_TOPICS = frozenset({"fetch", "info"})
+
+
+def _agent_fetch_hosts(settings: Settings) -> frozenset[str]:
+    hosts = getattr(settings, "device_logs_drop_agent_fetch_hosts", None) or []
+    return frozenset(h.strip().lower() for h in hosts if h and h.strip())
+
+
+def is_agent_fetch_noise(parsed: Any, hosts: frozenset[str]) -> bool:
+    """PROV-FIX D7: True only for the platform schedulers' own fetch-success
+    line: the message is exactly ``Download from <host> FINISHED`` with
+    ``<host>`` in ``hosts``, and the topic list (when the router sends one)
+    is ``fetch,info`` and nothing else. Every other fetch line is kept."""
+    if not hosts:
+        return False
+    match = _AGENT_FETCH_LINE.match((parsed.message or "").strip())
+    if match is None or match.group(1).lower() not in hosts:
+        return False
+    if parsed.topics:
+        topics = {t.strip().lower() for t in parsed.topics.split(",") if t.strip()}
+        if topics != _FETCH_TOPICS:
+            return False
+    return True
+
+
 class DeviceLogsService:
     def __init__(
         self,
@@ -307,11 +334,16 @@ class DeviceLogsService:
         )
         rows: list[dict[str, Any]] = []
         counts = {"attributed": 0, "unattributed": 0, "tag_mismatch": 0}
+        drop_hosts = _agent_fetch_hosts(self.settings)
+        dropped = 0
         for event in events:
             received_at = event.received_at
             if received_at.tzinfo is None:
                 received_at = received_at.replace(tzinfo=UTC)
             parsed = parse_line(event.raw, received_at=received_at)
+            if drop_hosts and is_agent_fetch_noise(parsed, drop_hosts):
+                dropped += 1
+                continue
             source_ip = event.source_ip.strip()
             matches = owners.get(source_ip, [])
             owner = matches[0] if len(matches) == 1 else None
@@ -359,7 +391,10 @@ class DeviceLogsService:
         await self.repository.insert_guest_events(guest_rows)
         if counts["tag_mismatch"] or counts["unattributed"]:
             logger.warning("device_logs_ingest_attribution_gaps", extra=counts)
-        return {"accepted": len(rows), **counts}
+        result = {"accepted": len(rows), **counts}
+        if dropped:
+            result["dropped_agent_fetch"] = dropped
+        return result
 
     async def backfill_guest_events(self, *, batch_size: int = 1000) -> int:
         """Derive ``guest_device_events`` for stored lines that have none yet.
@@ -680,7 +715,13 @@ class DeviceLogsService:
             "blocker_detail": ctx["blocker_detail"],
             "tunnel_ip": ctx["peer"].tunnel_ip_address if ctx["peer"] else None,
             "status": status,
-            "script": render_script(config) if config is not None else None,
+            "script": (
+                render_script(
+                    config, routeros_version=getattr(router, "routeros_version", None)
+                )
+                if config is not None
+                else None
+            ),
             "state": state.value,
         }
 
@@ -979,4 +1020,3 @@ class DeviceLogsService:
             },
         )
         return self._firewall_state(router_id, row, device=verdict, device_error=None)
-
