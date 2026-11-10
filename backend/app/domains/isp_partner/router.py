@@ -1239,5 +1239,11 @@ def _include_lanes() -> None:
 
     isp_partner_router.include_router(audit_log_router)
 
+    # RAKESH-FS: /isp/workflow (GB limits, router zones, placement,
+    # franchisee zones), behind ISP_WORKFLOW_ENABLED.
+    from .workflow_router import workflow_router
+
+    isp_partner_router.include_router(workflow_router)
+
 
 _include_lanes()
