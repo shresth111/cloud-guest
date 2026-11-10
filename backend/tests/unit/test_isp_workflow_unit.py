@@ -36,12 +36,13 @@ def test_flag_on(monkeypatch) -> None:
 @pytest.mark.parametrize(
     ("gb", "mb"),
     [
-        (3000, 3_072_000),
-        (1.5, 1536),
-        (0.5, 512),
+        (3000, 3_000_000),  # DECISIONS-1: decimal GB
+        (1.5, 1500),
+        (0.5, 500),
         (0.001, 1),  # never rounds a positive limit to 0
-        (1.0005, 1025),
-        (1_000_000, 1_024_000_000),
+        (0.0004, 1),
+        (1.0006, 1001),
+        (1_000_000, 1_000_000_000),
         (0, 0),
         (None, None),
     ],
@@ -57,7 +58,7 @@ def test_gb_to_mb_refuses_negative() -> None:
 
 @pytest.mark.parametrize(
     ("mb", "gb"),
-    [(3_072_000, 3000.0), (1536, 1.5), (500, 0.488), (None, None), (1, 0.001)],
+    [(3_000_000, 3000.0), (1500, 1.5), (500, 0.5), (1024, 1.024), (None, None), (1, 0.001)],
 )
 def test_mb_to_gb(mb, gb) -> None:
     assert wc.mb_to_gb(mb) == gb
