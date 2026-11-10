@@ -58,7 +58,14 @@ def test_gb_to_mb_refuses_negative() -> None:
 
 @pytest.mark.parametrize(
     ("mb", "gb"),
-    [(3_000_000, 3000.0), (1500, 1.5), (500, 0.5), (1024, 1.024), (None, None), (1, 0.001)],
+    [
+        (3_000_000, 3000.0),
+        (1500, 1.5),
+        (500, 0.5),
+        (1024, 1.024),
+        (None, None),
+        (1, 0.001),
+    ],
 )
 def test_mb_to_gb(mb, gb) -> None:
     assert wc.mb_to_gb(mb) == gb

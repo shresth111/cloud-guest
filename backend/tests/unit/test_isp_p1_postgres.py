@@ -9,7 +9,9 @@ Covers:
 * P1-1: template device rules saved; dry run changes nothing; apply writes
   the package's max_devices and only the 3 policy fields (other policy fields
   keep their values); a second apply changes nothing;
-* P1-2: ``subscriber`` basis snaps a renewal to the anchor day; the same
+* P1-2: ``subscriber`` basis snaps a renewal to the anchor day (DECISIONS-1:
+  the first snapped period is pro-rated, the next one on the anchor is full
+  price); the same
   renewal on a ``package`` basis package (or a subscriber with no anchor) is
   exactly validity days;
 * P1-3: zone right inherits from the parent zone, explicit child wins, null
@@ -236,13 +238,37 @@ async def test_rakesh_p1(monkeypatch) -> None:  # noqa: ANN001, C901
             assert await valid_until(sub) - before == timedelta(days=30)
             await api.put(f"/packages/{pkg}/cycle-basis", {"basis": "subscriber"})
             before = await valid_until(sub)
-            await api.post(
+            res = await api.post(
                 f"/subscribers/{sub}/recharge",
                 {"package_id": pkg, "idempotency_key": f"p1sb{w.tag}"},
             )
             snapped = await valid_until(sub)
             assert snapped.astimezone(ist).day == 1, snapped
             assert abs((snapped - before) - timedelta(days=30)) <= timedelta(days=16)
+            # DECISIONS-1: the first snapped period is pro-rated to whole rupees
+            from app.domains.isp_partner.p1_cycle_hook import prorated_paise
+
+            days = (snapped.astimezone(ist).date() - before.astimezone(ist).date()).days
+            inv = await api.get(f"/billing/invoices/{res['invoice']['id']}")
+            [li] = inv["lines"]
+            if before.astimezone(ist).day == 1:  # test ran on an anchor-aligned day
+                assert li["taxable_paise"] == 49900
+            else:
+                assert li["taxable_paise"] == prorated_paise(49900, days, 30), (
+                    li,
+                    days,
+                )
+                assert li["description"] == f"P1 30d (pro-rated {days} days)", li
+                assert li["quantity"] == 1
+            # the next renewal starts on the anchor: full price, not pro-rated
+            res = await api.post(
+                f"/subscribers/{sub}/recharge",
+                {"package_id": pkg, "idempotency_key": f"p1sc{w.tag}"},
+            )
+            assert (await valid_until(sub)).astimezone(ist).day == 1
+            inv = await api.get(f"/billing/invoices/{res['invoice']['id']}")
+            [li] = inv["lines"]
+            assert li["taxable_paise"] == 49900 and "pro-rated" not in li["description"]
             # a subscriber with no anchor day renews by validity
             sub2 = await subscriber(api, "A", c1, pkg, "p1s2")
             before = await valid_until(sub2)

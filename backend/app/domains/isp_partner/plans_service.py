@@ -22,6 +22,7 @@ from .billing_service import IspBillingService
 from .dependencies import IspContext
 from .exceptions import _err
 from .p1_cycle_hook import cycle_end as _p1_cycle_end  # RAKESH-P1 P1-2
+from .p1_cycle_hook import prorate_line as _p1_prorate  # DECISIONS-1
 from .plans_models import (
     DEFAULT_REMINDER_OPT_IN,
     IspCouponBatch,
@@ -1866,6 +1867,7 @@ class IspPlansService:
             "period_to": _local_date(end, tz),
             "package_id": package.id,
         }
+        line = _p1_prorate(isp, package, start, end, line, cycles)  # DECISIONS-1
         quote = None
         if data.get("discount_code"):
             # DISCOUNT-WIRE: quoted before anything is written (422 on a bad code)
