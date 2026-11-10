@@ -6,19 +6,37 @@ an existing table is added or changed.
   "apply" copies the values onto the packages that use the template (the
   same ``isp_packages.max_devices`` and ``isp_package_policies`` fields the
   package form writes), so what enforcement reads is unchanged.
+* ``isp_package_cycle_basis`` (P1-2, migration 0222): is the package's billing
+  cycle its own validity (``package``, = no row) or the subscriber's billing
+  anchor day (``subscriber``)? Read only by ``p1_cycle.cycle_end``.
 """
 
 from __future__ import annotations
 
 import uuid
 
-from sqlalchemy import Boolean, ForeignKey, Index, SmallInteger, text
+from sqlalchemy import (
+    Boolean,
+    CheckConstraint,
+    ForeignKey,
+    Index,
+    SmallInteger,
+    String,
+    text,
+)
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database.base import BaseModel
 
-__all__ = ["P1_TABLES", "IspSpeedGroupDeviceRules"]
+__all__ = [
+    "CYCLE_BASES",
+    "P1_TABLES",
+    "IspPackageCycleBasis",
+    "IspSpeedGroupDeviceRules",
+]
+
+CYCLE_BASES = ("package", "subscriber")
 
 
 class IspSpeedGroupDeviceRules(BaseModel):
@@ -60,4 +78,34 @@ class IspSpeedGroupDeviceRules(BaseModel):
     )
 
 
-P1_TABLES = ("isp_speed_group_device_rules",)
+class IspPackageCycleBasis(BaseModel):
+    __tablename__ = "isp_package_cycle_basis"
+
+    isp_organization_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("organizations.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    package_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("isp_packages.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    #: package | subscriber
+    basis: Mapped[str] = mapped_column(
+        String(12), nullable=False, server_default="package"
+    )
+
+    __table_args__ = (
+        CheckConstraint("basis in ('package','subscriber')", name="basis"),
+        Index(
+            "uq_isp_package_cycle_basis_package",
+            "package_id",
+            unique=True,
+            postgresql_where=text("is_deleted = false"),
+        ),
+        Index("ix_isp_package_cycle_basis_isp", "isp_organization_id"),
+    )
+
+
+P1_TABLES = ("isp_speed_group_device_rules", "isp_package_cycle_basis")

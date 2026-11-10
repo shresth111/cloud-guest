@@ -1254,5 +1254,10 @@ def _include_lanes() -> None:
 
     isp_partner_router.include_router(p1_templates_router)
 
+    # RAKESH-P1: billing cycle basis per package (ISP_CYCLE_BASIS_ENABLED).
+    from .p1_cycle import p1_cycle_router
+
+    isp_partner_router.include_router(p1_cycle_router)
+
 
 _include_lanes()
