@@ -8,7 +8,11 @@ an existing table is added or changed.
   package form writes), so what enforcement reads is unchanged.
 * ``isp_package_cycle_basis`` (P1-2, migration 0222): is the package's billing
   cycle its own validity (``package``, = no row) or the subscriber's billing
-  anchor day (``subscriber``)? Read only by ``p1_cycle.cycle_end``.
+  anchor day (``subscriber``)? Read only by ``p1_cycle_hook.cycle_end``.
+* ``isp_zone_coupon_rights`` (P1-3, migration 0224): an explicit "may the
+  franchisee generate coupons here" per zone. No row = inherit from the
+  parent zone; no explicit row on the whole path = allowed (the RAKESH-FS
+  franchisee role behaviour). Read only by ``p1_coupon_rights.coupon_gate``.
 """
 
 from __future__ import annotations
@@ -33,6 +37,7 @@ __all__ = [
     "CYCLE_BASES",
     "P1_TABLES",
     "IspPackageCycleBasis",
+    "IspZoneCouponRight",
     "IspSpeedGroupDeviceRules",
 ]
 
@@ -108,4 +113,34 @@ class IspPackageCycleBasis(BaseModel):
     )
 
 
-P1_TABLES = ("isp_speed_group_device_rules", "isp_package_cycle_basis")
+class IspZoneCouponRight(BaseModel):
+    __tablename__ = "isp_zone_coupon_rights"
+
+    isp_organization_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("organizations.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    zone_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("isp_zones.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    allow_generate: Mapped[bool] = mapped_column(Boolean, nullable=False)
+
+    __table_args__ = (
+        Index(
+            "uq_isp_zone_coupon_rights_zone",
+            "zone_id",
+            unique=True,
+            postgresql_where=text("is_deleted = false"),
+        ),
+        Index("ix_isp_zone_coupon_rights_isp", "isp_organization_id"),
+    )
+
+
+P1_TABLES = (
+    "isp_speed_group_device_rules",
+    "isp_package_cycle_basis",
+    "isp_zone_coupon_rights",
+)
