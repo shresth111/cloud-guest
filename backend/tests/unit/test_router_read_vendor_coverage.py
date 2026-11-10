@@ -284,6 +284,12 @@ VENDOR_NEUTRAL: dict[str, str] = {
         "`controller_managed` instead of not_set_up / offline (see "
         "`netmon.readability`); nothing is polled or dispatched from here."
     ),
+    "app/domains/isp_partner/iplogs_router.py::ip_logs_routers": (
+        "IPLOGS-SELFSERVE fleet list: every router of the ISP on purpose; a "
+        "controller-managed row is judged by `_blocker` -> `not_mikrotik` "
+        "(overall `not_supported`), never offline / not set up. Read only; "
+        "nothing is pushed or dispatched."
+    ),
     "app/domains/isp_partner/netmon_router.py::_hotspot": (
         "NETMON-2 live / completed hotspot sessions: an outer join from "
         "guest_sessions to routers only to label each existing session with "

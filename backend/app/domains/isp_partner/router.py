@@ -1094,6 +1094,10 @@ def _include_lanes() -> None:
     from .netmon_router import netmon_router
 
     isp_partner_router.include_router(netmon_router)
+    # IPLOGS-SELFSERVE: turn on IP logs per router (ISP_IPLOGS_SELFSERVE_ENABLED).
+    from .iplogs_router import iplogs_router
+
+    isp_partner_router.include_router(iplogs_router)
     # Phase 2c: the venue twins (the customer dashboard's own feature set,
     # ISP-gated). One table row per endpoint -- see ``twins.py``.
     mount_twins(isp_partner_router, ALL_TWINS)
