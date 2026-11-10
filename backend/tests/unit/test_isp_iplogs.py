@@ -48,7 +48,7 @@ def test_safe_identity() -> None:
     assert safe_identity("Hotel Blue Main", RID) == "Hotel-Blue-Main"
     assert safe_identity("  ", RID) == "wyfy-12345678"
     assert safe_identity(None, RID) == "wyfy-12345678"
-    assert safe_identity("a:b/c\"d$e", RID) == "a-b-c-d-e"
+    assert safe_identity('a:b/c"d$e', RID) == "a-b-c-d-e"
     assert len(safe_identity("x" * 80, RID)) == 32
 
 
@@ -76,7 +76,7 @@ def test_enable_script_both_syslog_dialects_are_parse_deferred() -> None:
                 literal = re.sub(r'\[\[:parse "(?:[^"\\]|\\.)*"\]\]', "", line)
                 assert prop not in literal, line
     assert "syslog-time-format=bsd-syslog" in text
-    assert f"remote=10.66.0.1 remote-port=5514 src-address=10.66.0.13" in text
+    assert "remote=10.66.0.1 remote-port=5514 src-address=10.66.0.13" in text
     rules = [ln for ln in lines if ln.startswith("/system logging add ")]
     assert len(rules) == len(ROUTEROS_TOPICS)
     assert all(f"action={ROUTEROS_ACTION_NAME}" in r for r in rules)

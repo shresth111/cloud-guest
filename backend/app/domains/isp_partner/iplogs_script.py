@@ -138,7 +138,8 @@ def _v7_only(command: str) -> str:
 def _identity_lines(t: IpLogsTargets) -> list[str]:
     name = safe_identity(t.router_name, t.router_id)
     return [
-        "# 1. Router name: a name with spaces breaks the log tag, so spaces are replaced",
+        "# 1. Router name: a name with spaces breaks the log tag, "
+        "so spaces are replaced",
         ':if ([:typeof [:find [/system identity get name] " "]] != "nil") do={ '
         f'/system identity set name="{name}"; '
         f':put "  Router name had spaces, now: {name}" }}',
@@ -157,7 +158,8 @@ def _clock_lines() -> list[str]:
         "/system clock set time-zone-autodetect=no "
         f"time-zone-name={CLOCK_TIME_ZONE}",
         f":do {{ {v7} }} on-error={{ :do {{ {v6} }} on-error={{ "
-        ':put "  WARNING: NTP could not be switched on. Set it in System > NTP Client." } }',
+        ':put "  WARNING: NTP could not be switched on. '
+        'Set it in System > NTP Client." } }',
     ]
 
 
@@ -179,9 +181,7 @@ def _syslog_lines(t: IpLogsTargets) -> list[str]:
         'on-error={ :put "  FAILED: the router refused the remote logging action"; '
         ':error "wyfy: remote logging refused" } }',
     ]
-    lines.extend(
-        f"/system logging add {_args(row)}" for row in config.rule_rows()
-    )
+    lines.extend(f"/system logging add {_args(row)}" for row in config.rule_rows())
     return lines
 
 
@@ -227,7 +227,8 @@ def _readback_lines(t: IpLogsTargets) -> list[str]:
             '" (expected 1)")'
         ),
         ':log info "wyfy: IP logs set up"',
-        ':put "=== Done. Open this router in Wyfy: IP logs turns green within 5 minutes. ==="',
+        ':put "=== Done. Open this router in Wyfy: '
+        'IP logs turns green within 5 minutes. ==="',
     ]
 
 

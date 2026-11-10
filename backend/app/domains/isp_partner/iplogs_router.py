@@ -706,9 +706,13 @@ async def ip_logs_routers(
         if peers
         else {}
     )
-    org_names = await isp.repository.names(
-        Organization, list({r.organization_id for r in routers})
-    ) if routers else {}
+    org_names = (
+        await isp.repository.names(
+            Organization, list({r.organization_id for r in routers})
+        )
+        if routers
+        else {}
+    )
     loc_ids = list({r.location_id for r in routers if r.location_id})
     loc_names = await isp.repository.names(Location, loc_ids) if loc_ids else {}
     items = []
