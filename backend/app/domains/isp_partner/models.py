@@ -152,6 +152,7 @@ from .finance_models import *  # noqa: E402,F403  (JAZE-4)
 from .franchise_models import *  # noqa: E402,F403  (FRANCHISE-2)
 from .incident_auto_models import *  # noqa: E402,F403  (SMALL-5)
 from .incidents_models import *  # noqa: E402,F403  (INCIDENTS-1)
+from .p1_models import *  # noqa: E402,F403  (RAKESH-P1)
 from .package_meta_models import *  # noqa: E402,F403  (PKG-2)
 from .plans_models import *  # noqa: E402,F403
 from .pppoe_models import *  # noqa: E402,F403

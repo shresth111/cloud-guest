@@ -1249,5 +1249,10 @@ def _include_lanes() -> None:
 
     isp_partner_router.include_router(workflow_router)
 
+    # RAKESH-P1: speed template device rules (ISP_TEMPLATE_RULES_ENABLED).
+    from .p1_templates_router import p1_templates_router
+
+    isp_partner_router.include_router(p1_templates_router)
+
 
 _include_lanes()
