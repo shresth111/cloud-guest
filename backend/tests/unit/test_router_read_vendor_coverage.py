@@ -294,6 +294,14 @@ VENDOR_NEUTRAL: dict[str, str] = {
         "here and nothing is polled, pushed or dispatched; device actions "
         "stay on the by-id routes, which gate on vendor themselves."
     ),
+    "app/domains/isp_partner/workflow_franchisee_router.py::_linked_zones_at": (
+        "DECISIONS-1 franchisee add-router: which of the franchisee's zones a "
+        "location's routers serve (isp_router_zones), used only to decide "
+        "whether the location is inside the franchisee's zones. Membership "
+        "is vendor-independent (a controller-managed venue can serve a zone "
+        "too); only location/zone ids are read, no status is judged and "
+        "nothing is dispatched."
+    ),
     "app/domains/isp_partner/workflow_router.py::placement": (
         "RAKESH-FS onboarding placement: routers of customers whose profile "
         "zone is on the zone's path, as candidates for where a new "
