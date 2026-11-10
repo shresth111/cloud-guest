@@ -245,9 +245,7 @@ async def test_prov_fix_scoping(monkeypatch) -> None:  # noqa: ANN001, C901
             from app.domains.isp_partner.prov_fix_zone import IspCouponBatchZone
 
             async with SessionLocal() as s:
-                rows = (
-                    (await s.execute(select(IspCouponBatchZone))).scalars().all()
-                )
+                rows = (await s.execute(select(IspCouponBatchZone))).scalars().all()
                 by_batch = {str(r.coupon_batch_id): str(r.zone_id) for r in rows}
             assert by_batch.get(mine["id"]) == za, by_batch
             assert old["id"] not in by_batch
