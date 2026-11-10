@@ -80,6 +80,37 @@ def _truthy(value: Any) -> bool:
     return str(value).lower() in {"true", "yes"}
 
 
+#: ``/snmp community`` fields RouterOS holds as booleans. librouteros
+#: (3.2.1, measured on CHR 7.25.1 2026-11-10) parses the wire's
+#: ``read-access=yes`` / ``write-access=no`` into Python ``True`` / ``False``,
+#: while the desired rows spell them ``"yes"`` / ``"no"``. Compared as text,
+#: every real router read back as a mismatch (``"True" != "yes"``).
+_BOOLEAN_FIELDS = frozenset({"read-access", "write-access", "disabled", "default"})
+
+_BOOL_SPELLINGS = {"yes": True, "true": True, "no": False, "false": False}
+
+
+def _as_routeros_bool(value: Any) -> bool | None:
+    """``True``/``False``/``"yes"``/``"no"``/``"true"``/``"false"`` -> bool;
+    anything else (missing, empty, unexpected) -> None, which never equals a
+    desired value, so it still reads as a mismatch."""
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return None
+    return _BOOL_SPELLINGS.get(str(value).strip().lower())
+
+
+def _field_matches(key: str, actual: Any, desired: str) -> bool:
+    """One field of a read-back against the desired text. Boolean fields
+    compare by meaning (``True`` == ``"yes"``); every other field compares
+    as text, exactly as before."""
+    if key in _BOOLEAN_FIELDS:
+        want = _as_routeros_bool(desired)
+        return want is not None and _as_routeros_bool(actual) == want
+    return str("" if actual is None else actual) == desired
+
+
 @dataclass(frozen=True, slots=True)
 class SnmpDeviceConfig:
     """What the platform wants on the device. ``name`` is the v2c community
@@ -226,7 +257,7 @@ def _compare(
             elif str(actual.get(key)) != value:
                 mismatches.append(f"{prefix}:{key}")
             continue
-        if str(actual.get(key, "")) != value:
+        if not _field_matches(key, actual.get(key, ""), value):
             mismatches.append(f"{prefix}:{key}")
     if _truthy(actual.get("disabled")):
         mismatches.append(f"{prefix}:disabled")
@@ -244,7 +275,9 @@ def apply_snmp_config(api, config: SnmpDeviceConfig) -> SnmpApplyResult:  # noqa
     ours = _ours(rows)
     if ours:
         row = ours[0]
-        delta = {k: v for k, v in desired.items() if str(row.get(k, "")) != v}
+        delta = {
+            k: v for k, v in desired.items() if not _field_matches(k, row.get(k, ""), v)
+        }
         # Passwords may not be echoed; always (re)send them so a rotation
         # on the platform is never skipped by a read that could not see it.
         for key in _PASSWORD_FIELDS:
@@ -264,7 +297,7 @@ def apply_snmp_config(api, config: SnmpDeviceConfig) -> SnmpApplyResult:  # noqa
 
     public = _default_public(rows)
     if public is not None and any(
-        str(public.get(k, "")) != v for k, v in fence.items()
+        not _field_matches(k, public.get(k, ""), v) for k, v in fence.items()
     ):
         menu.update(**{".id": public[".id"], **fence})
         changed.append("default-public-fenced")

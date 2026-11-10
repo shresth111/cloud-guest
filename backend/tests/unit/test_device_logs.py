@@ -35,6 +35,7 @@ from app.domains.device_logs.routeros import (
     render_action_add,
     render_removal,
     render_script,
+    render_topics_on,
     router_tag,
 )
 from app.domains.device_logs.schemas import IngestEvent, IngestRequest
@@ -239,6 +240,46 @@ class TestRouterOs:
         row = _config().action_row()
         assert adapt_action_for_device(row, modern=True) == modern_action_row(row)
         assert adapt_action_for_device(row, modern=False) == row
+
+    def test_master_script_golden(self) -> None:
+        """The whole paste for a 7.18+ router, byte for byte. Line 4 (topics
+        on) is new (MASTER-FIX 2026-11-10); every other line is unchanged.
+        Older / unknown versions: test_isp_prov_fix.py (PROV-FIX D8)."""
+        assert render_script(_config(), routeros_version="7.25.1 (stable)") == [
+            ":do { /system logging remove [find action=wyfysyslog] } on-error={}",
+            ":do { /system logging action remove [find name=wyfysyslog] } "
+            "on-error={}",
+            ":local m false; :do { /system logging action get [find name=remote] "
+            "remote-log-format; :set m true } on-error={}; :if ($m) do={ /system "
+            "logging action add name=wyfysyslog target=remote remote=10.20.0.1 "
+            "remote-port=5140 src-address=10.20.0.31 syslog-facility=local5 "
+            "syslog-severity=auto remote-log-format=syslog "
+            "syslog-time-format=bsd-syslog } else={ /system logging action add "
+            "name=wyfysyslog target=remote remote=10.20.0.1 remote-port=5140 "
+            "src-address=10.20.0.31 bsd-syslog=yes syslog-facility=local5 "
+            "syslog-severity=auto }",
+            ':do { [[:parse "/system logging action set [find name=wyfysyslog] '
+            'add-topics-string=yes"]] } on-error={}',
+            *(
+                f"/system logging add action=wyfysyslog topics={t} "
+                "prefix=wyfy-8a199617"
+                for t in ROUTEROS_TOPICS
+            ),
+            ':put ("Wyfy remote logging: " . [:len [/system logging find '
+            f'action=wyfysyslog]] . " rules, expected {len(ROUTEROS_TOPICS)}")',
+        ]
+
+    def test_topics_on_follows_the_action_add_and_is_optional(self) -> None:
+        lines = render_script(_config())
+        idx = lines.index(render_topics_on())
+        assert "/system logging action add " in lines[idx - 1]
+        assert lines[idx + 1].startswith("/system logging add ")
+        # The property name is invisible to the line parser (older RouterOS
+        # without it ignores the line), and the line can never stop a paste.
+        outside = re.sub(r'\[\[:parse "[^"]*"\]\]', "", render_topics_on())
+        assert "add-topics-string" not in outside
+        assert render_topics_on().endswith(" on-error={}")
+        assert max(len(ln) for ln in lines) < 3300
 
     def test_script_targets_the_tunnel(self) -> None:
         row = _config().action_row()

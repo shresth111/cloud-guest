@@ -76,6 +76,65 @@ def test_d8_older_or_unknown_router_gets_parse_deferred_adds(version) -> None:  
     assert '\\"' not in line  # no value needs quoting today
 
 
+#: MASTER-FIX (2026-11-10): the line the Master script now carries right
+#: after the action add, on every version. RouterOS creates a new action
+#: with add-topics-string=no, so a re-paste of the Master script used to
+#: turn topics off (POSTFIX-1 D6 "Open").
+TOPICS_ON_LINE = (
+    ':do { [[:parse "/system logging action set [find name=wyfysyslog] '
+    'add-topics-string=yes"]] } on-error={}'
+)
+
+#: The deferred action line an older or unknown router gets (PROV-FIX D8).
+DEFERRED_ACTION_LINE = (
+    ":local m false; :do { /system logging action get [find name=remote] "
+    'remote-log-format; :set m true } on-error={}; :if ($m) do={ [[:parse "/system '
+    "logging action add name=wyfysyslog target=remote remote=10.20.0.1 "
+    "remote-port=5140 src-address=10.20.0.31 syslog-facility=local5 "
+    "syslog-severity=auto remote-log-format=syslog "
+    'syslog-time-format=bsd-syslog"]] } else={ [[:parse "/system logging action '
+    "add name=wyfysyslog target=remote remote=10.20.0.1 remote-port=5140 "
+    "src-address=10.20.0.31 bsd-syslog=yes syslog-facility=local5 "
+    'syslog-severity=auto"]] }'
+)
+
+
+def _golden(action_line: str) -> list[str]:
+    from app.domains.device_logs.constants import ROUTEROS_TOPICS
+
+    return [
+        ":do { /system logging remove [find action=wyfysyslog] } on-error={}",
+        ":do { /system logging action remove [find name=wyfysyslog] } on-error={}",
+        action_line,
+        TOPICS_ON_LINE,
+        *(
+            f"/system logging add action=wyfysyslog topics={t} prefix=wyfy-8a199617"
+            for t in ROUTEROS_TOPICS
+        ),
+        ':put ("Wyfy remote logging: " . [:len [/system logging find '
+        f'action=wyfysyslog]] . " rules, expected {len(ROUTEROS_TOPICS)}")',
+    ]
+
+
+@pytest.mark.parametrize(
+    ("version", "action_line"),
+    [
+        # 7.18+: the original action line byte for byte, then topics on
+        ("7.18", ORIGINAL_ACTION_LINE),
+        ("7.25.1 (stable)", ORIGINAL_ACTION_LINE),
+        # pre-7.18 and unknown: the D8 deferred line, then the same topics line
+        ("7.16.2", DEFERRED_ACTION_LINE),
+        ("6.49.17", DEFERRED_ACTION_LINE),
+        (None, DEFERRED_ACTION_LINE),
+        ("junk", DEFERRED_ACTION_LINE),
+    ],
+)
+def test_master_fix_whole_script_golden(version, action_line: str) -> None:  # noqa: ANN001
+    lines = render_script(_cfg(), routeros_version=version)
+    assert lines == _golden(action_line)
+    assert max(len(ln) for ln in lines) < 3300  # RouterOS paste ceiling
+
+
 def test_d8_same_values_in_both_shapes() -> None:
     plain = render_action_add(_cfg(), routeros_version="7.18")
     deferred = render_action_add(_cfg(), routeros_version="7.16.2")
@@ -631,9 +690,10 @@ async def test_d10_any_real_mismatch_still_refuses(
 
 def test_d10_real_writer_against_librouteros_shaped_rows() -> None:
     """The shared writer, against an API that answers like librouteros 3.2.1
-    on RouterOS (booleans parsed to bool, measured on CHR 7.25.1): reported
-    NOT verified on the two boolean fields only, and the partner check
-    accepts it. A wrong address on the device is still refused."""
+    on RouterOS (booleans parsed to bool, measured on CHR 7.25.1). Before
+    MASTER-FIX it reported NOT verified on the two boolean fields only and
+    the partner check had to accept that; now it verifies outright. A wrong
+    address on the device is still refused by both."""
     from wyfy_device_gateway.mikrotik_snmp import SnmpDeviceConfig, apply_snmp_config
 
     class _Menu:
@@ -694,13 +754,18 @@ def test_d10_real_writer_against_librouteros_shaped_rows() -> None:
 
     cfg = SnmpDeviceConfig(name="wyfy0123456789abcdef", addresses=("10.66.0.1/32",))
     res = apply_snmp_config(_Api(), cfg)
-    assert res.verified is False
-    assert sorted(res.mismatches) == BOOLS
+    # MASTER-FIX (2026-11-10): the shared compare now reads RouterOS booleans
+    # by meaning, so the writer itself verifies; the partner fallback is not
+    # reached (it short-circuits on ``verified``).
+    assert res.verified is True
+    assert res.mismatches == []
     assert mod._monitoring_read_back_ok(res) is True
 
     api = _Api(wrong_address=True)
     apply_snmp_config(api, cfg)  # add (correct) ...
-    res = apply_snmp_config(api, cfg)  # ... then an update the device "rewrites"
+    ours = next(r for r in api.menus[("snmp", "community")] if r.get("comment"))
+    ours["addresses"] = "10.9.9.9/32"  # drift, so the next apply updates ...
+    res = apply_snmp_config(api, cfg)  # ... and the device "rewrites" it
     assert "community:addresses" in res.mismatches
     assert mod._monitoring_read_back_ok(res) is False
 

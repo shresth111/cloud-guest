@@ -315,7 +315,12 @@ def _monitoring_read_back_ok(outcome: Any) -> bool:
     reported, or every mismatch is a boolean spelling AND the read-back
     state shows the agent on and our community present, enabled and
     read-only. Any other mismatch (addresses, security, duplicate, public
-    fence, agent off) still fails."""
+    fence, agent off) still fails.
+
+    MASTER-FIX (2026-11-10): the shared ``mikrotik_snmp._compare`` now reads
+    RouterOS booleans by meaning, so a real router reports ``verified`` and
+    the fallback below is no longer reached. Kept as a harmless guard for a
+    gateway build without that fix."""
     if outcome.verified:
         return True
     mismatches = set(getattr(outcome, "mismatches", None) or ())
