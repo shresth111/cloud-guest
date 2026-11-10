@@ -296,6 +296,17 @@ class RoleNotHeldError(RBACError):
         )
 
 
+class MfaSetupRequiredError(RBACError):
+    """A Master operator without MFA, while master_operator_mfa_mode=enforce."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "Turn on two-factor authentication to use the Master console",
+            status_code=status.HTTP_403_FORBIDDEN,
+            data={"code": "mfa_setup_required"},
+        )
+
+
 class InvalidScopeHeaderError(RBACError):
     """A scope header (e.g. ``X-Organization-Id``) did not contain a valid UUID."""
 

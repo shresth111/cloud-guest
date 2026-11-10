@@ -3117,6 +3117,22 @@ class Settings(BaseSettings):
             "it once guest_session_token_missing stops appearing."
         ),
     )
+    master_operator_mfa_mode: str = Field(
+        default="log",
+        pattern="^(off|log|enforce)$",
+        description=(
+            "Second factor for Master operators: a caller whose permission "
+            "check passed at GLOBAL scope (only a GLOBAL grant can pass one) "
+            "and who has not enabled MFA. 'log': allowed, logged as "
+            "master_operator_without_mfa (at most once an hour per user and "
+            "process). 'enforce': 403 mfa_setup_required, so the Master "
+            "console stops until the operator enrolls via /auth/mfa/enroll, "
+            "which needs no permission and so is never blocked. Customer "
+            "and tenant-scoped requests are never affected. Ship default is "
+            "'log' because no operator had MFA on 2026-11-10; switch to "
+            "'enforce' only after every operator has enrolled."
+        ),
+    )
     guest_resume_identifier_mode: str = Field(
         default="masked",
         pattern="^(off|alias|masked)$",
