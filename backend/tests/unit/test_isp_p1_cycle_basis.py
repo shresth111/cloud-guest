@@ -17,7 +17,12 @@ from pydantic import ValidationError
 
 from app.domains.isp_partner import p1_cycle, p1_cycle_hook
 from app.domains.isp_partner.p1_config import get_p1_settings
-from app.domains.isp_partner.p1_cycle_hook import cycle_end, snap_to_anchor
+from app.domains.isp_partner.p1_cycle_hook import (
+    cycle_end,
+    prorate_line,
+    prorated_paise,
+    snap_to_anchor,
+)
 
 IST = "Asia/Kolkata"
 
@@ -167,3 +172,117 @@ def test_recharge_calls_the_hook_once_right_after_the_old_end() -> None:
         "end = await _p1_cycle_end(self.session, isp, s, package, start, end)"
     )
     assert plans_service._p1_cycle_end is p1_cycle_hook.cycle_end
+
+
+# -- DECISIONS-1 (2026-11-10): pro-rate the first snapped period -------------
+
+
+def _line(amount=50_000, cycles=1):
+    return {"description": "Home 30", "amount_paise": amount, "quantity": cycles}
+
+
+def _named(days=30):
+    return SimpleNamespace(id=uuid.uuid4(), validity_days=days, name="Home 30")
+
+
+def test_prorate_rounds_to_whole_rupees() -> None:
+    assert prorated_paise(50_000, 21, 30) == 35_000
+    assert prorated_paise(49_900, 21, 30) == 34_900  # 349.30 -> 349
+    assert prorated_paise(49_950, 21, 30) == 35_000  # 349.65 -> 350
+    assert prorated_paise(59_900, 42, 30) == 83_900  # 838.60 -> 839
+    assert prorated_paise(100, 1, 30) == 100  # never below one rupee
+
+
+def test_prorate_identity_with_flag_off(monkeypatch) -> None:
+    monkeypatch.delenv("ISP_CYCLE_BASIS_ENABLED", raising=False)
+    get_p1_settings.cache_clear()
+    line = _line()
+    start = _ist(2026, 11, 10)
+    assert prorate_line(_isp(), _named(), start, _ist(2026, 12, 1), line) is line
+
+
+async def test_shorter_first_period_is_prorated(flag_on) -> None:
+    start = _ist(2026, 11, 10)
+    end = await cycle_end(
+        _Db("subscriber", 1),
+        _isp(),
+        _sub(),
+        _named(),
+        start,
+        start + timedelta(days=30),
+    )
+    assert end == _ist(2026, 12, 1)  # 21 days, shorter than 30
+    line = _line()
+    got = prorate_line(_isp(), _named(), start, end, line)
+    assert got is not line
+    assert got["amount_paise"] == 35_000  # 500 x 21 / 30
+    assert got["quantity"] == 1
+    assert got["description"] == "Home 30 (pro-rated 21 days)"
+    assert line["amount_paise"] == 50_000, "input line not mutated"
+
+
+async def test_longer_first_period_is_prorated(flag_on) -> None:
+    start = _ist(2026, 11, 20)
+    end = await cycle_end(
+        _Db("subscriber", 1),
+        _isp(),
+        _sub(),
+        _named(),
+        start,
+        start + timedelta(days=30),
+    )
+    assert end == _ist(2027, 1, 1)  # 20 Dec is nearer 1 Jan: 42 days
+    got = prorate_line(_isp(), _named(), start, end, _line(59_900))
+    assert got["amount_paise"] == 83_900  # 599 x 42 / 30 = 838.6 -> 839
+    assert got["description"] == "Home 30 (pro-rated 42 days)"
+
+
+async def test_later_period_on_the_anchor_is_full_price(flag_on) -> None:
+    start = _ist(2026, 12, 1)  # already on anchor 1
+    end = await cycle_end(
+        _Db("subscriber", 1),
+        _isp(),
+        _sub(),
+        _named(),
+        start,
+        start + timedelta(days=30),
+    )
+    assert end == _ist(2027, 1, 1)  # 31 days: snapped, but not a first period
+    line = _line()
+    assert prorate_line(_isp(), _named(), start, end, line) is line
+
+
+def test_unsnapped_end_is_full_price(flag_on) -> None:
+    start = _ist(2026, 11, 10)
+    line = _line()
+    end = start + timedelta(days=30)
+    assert prorate_line(_isp(), _named(), start, end, line) is line
+
+
+async def test_multi_cycle_prorates_only_the_first_period(flag_on) -> None:
+    start = _ist(2026, 11, 10)
+    end = await cycle_end(
+        _Db("subscriber", 1),
+        _isp(),
+        _sub(),
+        _named(),
+        start,
+        start + timedelta(days=90),
+    )
+    assert end == _ist(2027, 2, 1)  # 83 days for 3 x 30: first period 23 days
+    got = prorate_line(_isp(), _named(), start, end, _line(50_000, 3), cycles=3)
+    assert got["amount_paise"] == 2 * 50_000 + 38_300  # 500 x 23 / 30 = 383.3
+    assert got["quantity"] == 1
+    assert "first period pro-rated 23 days" in got["description"]
+
+
+def test_recharge_prorates_right_after_the_line() -> None:
+    import inspect
+
+    from app.domains.isp_partner import plans_service
+
+    src = inspect.getsource(plans_service.IspPlansService.recharge)
+    assert src.count("_p1_prorate(") == 1
+    i_line, i_call = src.index('"package_id": package.id,'), src.index("_p1_prorate(")
+    assert i_line < i_call < src.index("apply_to_line")
+    assert plans_service._p1_prorate is p1_cycle_hook.prorate_line
