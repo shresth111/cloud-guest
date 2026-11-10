@@ -73,6 +73,22 @@ async def RequireNetmonEnabled() -> None:
 
 
 netmon_router = APIRouter(prefix="/netmon", tags=["ISP Partner: network monitoring"])
+
+#: PROV-FIX D4: with ISP_PROV_FIX_ENABLED the owner/admin switches monitoring
+#: on from the router page, so the hint stops sending them to support.
+SELF_SERVE_MONITORING_HINT = (
+    "Traffic history needs monitoring switched on for this router. An owner "
+    "or admin can switch it on from the router's page (Traffic monitoring), "
+    "or open the router and use Read now for a live reading."
+)
+
+
+def _self_serve_monitoring() -> bool:
+    from .prov_fix_router import get_prov_fix_settings
+
+    return bool(get_prov_fix_settings().prov_fix_enabled)
+
+
 _ON = [Depends(RequireNetmonEnabled)]
 AUDIT_SESSIONS_EXPORT = "isp_completed_sessions_exported"
 
@@ -168,6 +184,8 @@ async def traffic(
             now=now,
             controller_managed=is_controller_managed_row(r),
         )
+        if reason == "monitoring_off" and _self_serve_monitoring():
+            hint = SELF_SERVE_MONITORING_HINT
         cards.append(
             {
                 "isp_router_id": str(r.id),

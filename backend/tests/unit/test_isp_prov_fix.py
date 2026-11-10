@@ -525,3 +525,21 @@ async def test_d4_config_problem_is_partner_copy(monkeypatch) -> None:  # noqa: 
     with pytest.raises(mod.IspMonitoringUnavailableError) as exc:
         await mod._switch(_req(), ROUTER_ID, True, _isp(), snmp, _Audit())
     assert "POLLER" not in exc.value.message
+
+
+def test_d4_netmon_hint_is_self_serve_only_when_flag_on(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.domains.isp_partner import netmon_router
+    from app.domains.isp_partner.netmon import FORBIDDEN_HINT_WORDS
+
+    low = netmon_router.SELF_SERVE_MONITORING_HINT.lower()
+    assert not any(w in low for w in FORBIDDEN_HINT_WORDS)
+    assert "support" not in low
+    monkeypatch.delenv("ISP_PROV_FIX_ENABLED", raising=False)
+    mod.get_prov_fix_settings.cache_clear()
+    assert netmon_router._self_serve_monitoring() is False
+    monkeypatch.setenv("ISP_PROV_FIX_ENABLED", "true")
+    mod.get_prov_fix_settings.cache_clear()
+    assert netmon_router._self_serve_monitoring() is True
+    mod.get_prov_fix_settings.cache_clear()
