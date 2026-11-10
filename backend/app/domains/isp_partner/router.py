@@ -1264,5 +1264,11 @@ def _include_lanes() -> None:
 
     isp_partner_router.include_router(p1_coupon_rights_router)
 
+    # DECISIONS-1: franchisee adds a router at a site inside its zones
+    # (/isp/workflow/franchisee/*, behind ISP_WORKFLOW_ENABLED).
+    from .workflow_franchisee_router import franchisee_router_add
+
+    isp_partner_router.include_router(franchisee_router_add)
+
 
 _include_lanes()

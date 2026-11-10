@@ -20,8 +20,11 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from .exceptions import IspFeatureDisabledError
 
-#: 1 GB = 1024 MB, the factor the console's existing ``formatMb`` uses.
-MB_PER_GB = 1024
+#: DECISIONS-1 (2026-11-10): 1 GB = 1000 MB in the ISP console. Telecom
+#: plans in India are sold in decimal GB ("3,000 GB", not 3,072,000 MB).
+#: The DB still stores whole MB; enforcement still treats 1 MB as 2**20
+#: bytes (enforcement.MB), so a "3000 GB" cap is 3,000,000 stored MB.
+MB_PER_GB = 1000
 
 
 class IspWorkflowSettings(BaseSettings):

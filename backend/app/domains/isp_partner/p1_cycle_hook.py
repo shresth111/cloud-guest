@@ -9,7 +9,16 @@ BILL-2 compute it.
 to that end in the ISP's timezone (a tie goes to the later date), at the same
 local time of day. An on-time renewal of a subscriber already on the anchor
 stays on it month after month; a first renewal moves by at most about 15
-days. The price is not changed (pro-rating is a founder question).
+days.
+
+Price (DECISIONS-1, 2026-11-10, founder delegated): the *first* snapped
+period is pro-rated, ``price x days / package_days`` rounded to whole rupees,
+and the invoice line says "pro-rated N days". "First" = the period starts off
+the anchor day (a new subscriber, a first switch to the subscriber basis, or
+a renewal after a lapse); once a subscriber renews on the anchor every later
+period is charged the full price even when the calendar month is a day or two
+longer or shorter. ``prorate_line`` is pure (no query) and identity unless
+``cycle_end`` actually moved the end.
 
 ``cycle_end`` is the only thing ``plans_service.recharge`` calls. It returns
 the old ``end`` unchanged unless all of these hold: ``ISP_CYCLE_BASIS_ENABLED``
@@ -22,6 +31,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import date, datetime, timedelta
+from decimal import ROUND_HALF_UP, Decimal
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -30,7 +40,14 @@ from sqlalchemy import select
 from .p1_config import get_p1_settings
 from .p1_models import IspPackageCycleBasis
 
-__all__ = ["MIN_SNAP_VALIDITY_DAYS", "cycle_end", "package_basis", "snap_to_anchor"]
+__all__ = [
+    "MIN_SNAP_VALIDITY_DAYS",
+    "cycle_end",
+    "package_basis",
+    "prorate_line",
+    "prorated_paise",
+    "snap_to_anchor",
+]
 
 MIN_SNAP_VALIDITY_DAYS = 28
 _DEFAULT_TZ = "Asia/Kolkata"
@@ -115,3 +132,53 @@ async def cycle_end(
     # days and a nearest-anchor snap, kept as a hard floor)
     floor = start + timedelta(days=package.validity_days / 2)
     return snapped if snapped > floor else end
+
+
+def prorated_paise(price_paise: int, days: int, package_days: int) -> int:
+    """``price x days / package_days`` rounded to whole rupees (half up),
+    never below one rupee for a positive price."""
+    if package_days <= 0 or days <= 0:
+        return int(price_paise)
+    rupees = (Decimal(int(price_paise)) * days / package_days / 100).quantize(
+        Decimal(1), rounding=ROUND_HALF_UP
+    )
+    return max(int(rupees) * 100, 100)
+
+
+def prorate_line(
+    isp: Any,
+    package: Any,
+    start: datetime,
+    end: datetime,
+    line: dict,
+    cycles: int = 1,
+) -> dict:
+    """DECISIONS-1: pro-rate the first period of a renewal whose end was
+    snapped to the subscriber's anchor day. Returns ``line`` itself (same
+    object) when nothing changes: flag off, end not moved, or the period
+    already starts on the anchor day (a later period: full price)."""
+    if not get_p1_settings().cycle_basis_enabled:
+        return line
+    validity = int(package.validity_days or 0)
+    cycles = max(int(cycles or 1), 1)
+    if validity <= 0 or end == start + timedelta(days=validity * cycles):
+        return line
+    tz = _tz(getattr(getattr(isp, "organization", None), "timezone", None))
+    s_local, e_local = start.astimezone(tz), end.astimezone(tz)
+    if s_local.day == e_local.day:
+        # already on the anchor (end is the anchor day after a snap)
+        return line
+    total_days = (e_local.date() - s_local.date()).days
+    first_days = total_days - validity * (cycles - 1)
+    if first_days <= 0:  # pragma: no cover - floor in cycle_end prevents it
+        return line
+    unit = int(line["amount_paise"])
+    amount = unit * (cycles - 1) + prorated_paise(unit, first_days, validity)
+    name = getattr(package, "name", None) or line.get("description") or ""
+    label = (
+        f"{name} (pro-rated {first_days} days)"
+        if cycles == 1
+        else f"{name} x {cycles} (first period pro-rated {first_days} days, "
+        f"{total_days} days)"
+    )
+    return {**line, "description": label, "amount_paise": amount, "quantity": 1}
