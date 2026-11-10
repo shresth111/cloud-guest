@@ -192,7 +192,9 @@ class TestRouterOs:
         """Parity by test: the paste script and the API writer can only
         differ if this fails."""
         cfg = _config()
-        lines = render_script(cfg)
+        # D8: the plain (non-deferred) line is what a 7.18+ router gets;
+        # unknown / older versions: TestMasterLineVersionSplit.
+        lines = render_script(cfg, routeros_version="7.25.1 (stable)")
         action_lines = [ln for ln in lines if "/system logging action add " in ln]
         rule_lines = [ln for ln in lines if ln.startswith("/system logging add ")]
         assert len(action_lines) == 1
@@ -214,7 +216,7 @@ class TestRouterOs:
         assert "debug" not in text
 
     def test_add_lines_are_not_swallowed_by_on_error(self) -> None:
-        for line in render_script(_config()):
+        for line in render_script(_config(), routeros_version="7.18"):
             for handler in re.findall(r"on-error=\{([^}]*)\}", line):
                 assert "add" not in handler
             if " add " in line and "on-error" in line:
@@ -240,9 +242,10 @@ class TestRouterOs:
         assert adapt_action_for_device(row, modern=False) == row
 
     def test_master_script_golden(self) -> None:
-        """The whole paste, byte for byte. Line 4 (topics on) is new
-        (MASTER-FIX 2026-11-10); every other line is unchanged."""
-        assert render_script(_config()) == [
+        """The whole paste for a 7.18+ router, byte for byte. Line 4 (topics
+        on) is new (MASTER-FIX 2026-11-10); every other line is unchanged.
+        Older / unknown versions: TestMasterLineVersionSplit (D8)."""
+        assert render_script(_config(), routeros_version="7.25.1 (stable)") == [
             ":do { /system logging remove [find action=wyfysyslog] } on-error={}",
             ":do { /system logging action remove [find name=wyfysyslog] } "
             "on-error={}",
@@ -306,6 +309,115 @@ class TestRouterOs:
 
 
 # -- service ---------------------------------------------------------------
+
+
+#: The action line today's main renders, captured from origin/main 3007b5b5.
+#: A router known to run 7.18+ must still get it byte for byte (D8).
+PLAIN_ACTION_LINE = (
+    ":local m false; :do { /system logging action get [find name=remote] "
+    "remote-log-format; :set m true } on-error={}; :if ($m) do={ /system logging "
+    "action add name=wyfysyslog target=remote remote=10.20.0.1 remote-port=5140 "
+    "src-address=10.20.0.31 syslog-facility=local5 syslog-severity=auto "
+    "remote-log-format=syslog syslog-time-format=bsd-syslog } else={ /system "
+    "logging action add name=wyfysyslog target=remote remote=10.20.0.1 "
+    "remote-port=5140 src-address=10.20.0.31 bsd-syslog=yes "
+    "syslog-facility=local5 syslog-severity=auto }"
+)
+
+#: The action line a pre-7.18 or unknown-version router gets (D8): each
+#: ``add`` sits in ``[[:parse "..."]]`` so the line parser never sees a
+#: property name this RouterOS lacks.
+DEFERRED_ACTION_LINE = (
+    ":local m false; :do { /system logging action get [find name=remote] "
+    'remote-log-format; :set m true } on-error={}; :if ($m) do={ [[:parse "/system '
+    "logging action add name=wyfysyslog target=remote remote=10.20.0.1 "
+    "remote-port=5140 src-address=10.20.0.31 syslog-facility=local5 "
+    "syslog-severity=auto remote-log-format=syslog "
+    'syslog-time-format=bsd-syslog"]] } else={ [[:parse "/system logging action '
+    "add name=wyfysyslog target=remote remote=10.20.0.1 remote-port=5140 "
+    "src-address=10.20.0.31 bsd-syslog=yes syslog-facility=local5 "
+    'syslog-severity=auto"]] }'
+)
+
+#: MASTER-FIX (PR #521): present on every version, right after the add.
+TOPICS_ON_LINE = (
+    ':do { [[:parse "/system logging action set [find name=wyfysyslog] '
+    'add-topics-string=yes"]] } on-error={}'
+)
+
+
+def _golden(action_line: str) -> list[str]:
+    return [
+        ":do { /system logging remove [find action=wyfysyslog] } on-error={}",
+        ":do { /system logging action remove [find name=wyfysyslog] } on-error={}",
+        action_line,
+        TOPICS_ON_LINE,
+        *(
+            f"/system logging add action=wyfysyslog topics={t} prefix=wyfy-8a199617"
+            for t in ROUTEROS_TOPICS
+        ),
+        ':put ("Wyfy remote logging: " . [:len [/system logging find '
+        f'action=wyfysyslog]] . " rules, expected {len(ROUTEROS_TOPICS)}")',
+    ]
+
+
+class TestMasterLineVersionSplit:
+    """D8: the plain action line is refused whole on RouterOS < 7.18
+    ("expected end of command (line 1 column 287)" on 7.16.2), so only a
+    router known to run 7.18+ gets it; everything else gets the
+    parse-deferred form, which works on every version."""
+
+    @pytest.mark.parametrize("version", ["7.18", "7.18.2", "7.25.1 (stable)", "8.0"])
+    def test_modern_router_gets_todays_line_byte_for_byte(self, version) -> None:
+        assert render_action_add(_config(), routeros_version=version) == (
+            PLAIN_ACTION_LINE
+        )
+        assert render_script(_config(), routeros_version=version)[2] == (
+            PLAIN_ACTION_LINE
+        )
+
+    @pytest.mark.parametrize(
+        "version", [None, "", "7.16.2", "7.17.9", "6.49.17", "junk"]
+    )
+    def test_older_or_unknown_router_gets_parse_deferred_adds(self, version) -> None:
+        line = render_action_add(_config(), routeros_version=version)
+        assert line == DEFERRED_ACTION_LINE
+        # Neither dialect's property name is visible to the line parser.
+        outside = re.sub(r'\[\[:parse "[^"]*"\]\]', "", line)
+        assert "remote-log-format=" not in outside
+        assert "bsd-syslog=yes" not in outside
+        assert line.count('[[:parse "/system logging action add ') == 2
+        # The add is not swallowed: only the probe sits in on-error.
+        for handler in re.findall(r"on-error=\{([^}]*)\}", line):
+            assert "add" not in handler
+        assert line.count("{") == line.count("}")
+        assert line.count("[") == line.count("]")
+        assert '\\"' not in line  # no value needs quoting today
+
+    def test_default_is_unknown(self) -> None:
+        assert render_action_add(_config()) == DEFERRED_ACTION_LINE
+
+    def test_same_values_in_both_shapes(self) -> None:
+        plain = render_action_add(_config(), routeros_version="7.18")
+        deferred = render_action_add(_config(), routeros_version="7.16.2")
+        assert re.sub(r'\[\[:parse "([^"]*)"\]\]', r"\1", deferred) == plain
+
+    @pytest.mark.parametrize(
+        ("version", "action_line"),
+        [
+            ("7.18", PLAIN_ACTION_LINE),
+            ("7.25.1 (stable)", PLAIN_ACTION_LINE),
+            ("7.16.2", DEFERRED_ACTION_LINE),
+            ("6.49.17", DEFERRED_ACTION_LINE),
+            (None, DEFERRED_ACTION_LINE),
+            ("junk", DEFERRED_ACTION_LINE),
+        ],
+    )
+    def test_whole_script_golden(self, version, action_line) -> None:
+        lines = render_script(_config(), routeros_version=version)
+        assert lines == _golden(action_line)
+        assert TOPICS_ON_LINE in lines  # PR #521's line on every version
+        assert max(len(ln) for ln in lines) < 3300  # RouterOS paste ceiling
 
 
 class FakeRepo:
@@ -660,6 +772,25 @@ class TestApplyRemove:
         assert detail["blocker"] == "NO_API_CREDENTIALS"
         assert detail["script"] and any("wyfysyslog" in ln for ln in detail["script"])
         assert detail["state"] == ReceivingState.NOT_CONFIGURED
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("version", "deferred"),
+        [("7.25.1 (stable)", False), ("7.16.2", True), (None, True)],
+    )
+    async def test_detail_script_follows_the_router_version(
+        self, version, deferred
+    ) -> None:
+        """D8: the Master detail renders for the router's stored RouterOS
+        version; unknown (NULL) gets the parse-deferred form."""
+        router = _router(creds=False)
+        router.routeros_version = version
+        repo = FakeRepo()
+        repo.context = _ctx(router)
+        detail = await _service(repo).router_detail(ROUTER_ID)
+        line = detail["script"][2]
+        assert ('[[:parse "/system logging action add ' in line) is deferred
+        assert (":if ($m) do={ /system logging action add " in line) is not deferred
 
     @pytest.mark.asyncio
     async def test_detail_for_aruba_offers_no_script(self) -> None:
