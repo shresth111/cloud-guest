@@ -284,6 +284,25 @@ VENDOR_NEUTRAL: dict[str, str] = {
         "`controller_managed` instead of not_set_up / offline (see "
         "`netmon.readability`); nothing is polled or dispatched from here."
     ),
+    "app/domains/isp_partner/workflow_router.py::_router_rows": (
+        "RAKESH-FS: labels for routers already chosen by id (zone links, a "
+        "subscriber's recorded router, placement candidates): name, "
+        "customer, location and `routers.status` as stored. Every vendor on "
+        "purpose: several zones may share a controller-managed venue (Omada/"
+        "Aruba AP) as much as a MikroTik, and hiding it would make a real "
+        "router vanish from the zone. No health is judged from `status` "
+        "here and nothing is polled, pushed or dispatched; device actions "
+        "stay on the by-id routes, which gate on vendor themselves."
+    ),
+    "app/domains/isp_partner/workflow_router.py::placement": (
+        "RAKESH-FS onboarding placement: routers of customers whose profile "
+        "zone is on the zone's path, as candidates for where a new "
+        "subscriber is placed. Placement is only a recorded association "
+        "(isp_subscriber_routers); a subscriber at a controller-managed "
+        "venue authenticates over RADIUS like any other, so every vendor "
+        "is a valid answer. Read only; no device state is judged and "
+        "nothing is dispatched."
+    ),
     "app/domains/isp_partner/iplogs_router.py::ip_logs_routers": (
         "IPLOGS-SELFSERVE fleet list: every router of the ISP on purpose; a "
         "controller-managed row is judged by `_blocker` -> `not_mikrotik` "
