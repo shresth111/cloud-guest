@@ -1098,6 +1098,11 @@ def _include_lanes() -> None:
     from .iplogs_router import iplogs_router
 
     isp_partner_router.include_router(iplogs_router)
+    # PROV-FIX: partner setup check-in fallback + self-serve monitoring
+    # (ISP_PROV_FIX_ENABLED).
+    from .prov_fix_router import prov_fix_router
+
+    isp_partner_router.include_router(prov_fix_router)
     # Phase 2c: the venue twins (the customer dashboard's own feature set,
     # ISP-gated). One table row per endpoint -- see ``twins.py``.
     mount_twins(isp_partner_router, ALL_TWINS)
