@@ -218,7 +218,7 @@ class TestDailyCaps:
         )
 
     async def test_log_mode_counts_but_still_sends(self) -> None:
-        """``otp_daily_cap_mode=log`` (the first-deploy default) must never
+        """``otp_daily_cap_mode=log`` (the rollback setting) must never
         refuse a guest: it only records that the cap was passed."""
         fx = make_service(max_requests_per_window=100)
         fx.service.daily_cap_per_location = 1
@@ -278,9 +278,10 @@ def test_settings_defaults_are_on() -> None:
     fields = Settings.model_fields
     assert fields["otp_daily_cap_per_location"].default > 0
     assert fields["otp_daily_cap_platform"].default > 0
-    # Counted from the first deploy, enforced only once sized against real
-    # peaks (no production volume figures were on hand).
-    assert fields["otp_daily_cap_mode"].default == "log"
+    # Enforced since 2026-11-10, once sized against real peaks: busiest
+    # location-day 504 vs a cap of 2000. Keep the cap at least 3x that.
+    assert fields["otp_daily_cap_mode"].default == "enforce"
+    assert fields["otp_daily_cap_per_location"].default >= 3 * 504
 
 
 class TestLoggingWhatsAppProviderNeverLogsALiveCode:
