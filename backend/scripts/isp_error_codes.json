@@ -851,6 +851,33 @@
       ]
     },
     {
+      "code": "ISP_IPLOGS_DISABLED",
+      "kind": "code",
+      "status": 404,
+      "message": "Not Found",
+      "sources": [
+        "app/domains/isp_partner/iplogs_router.py"
+      ]
+    },
+    {
+      "code": "ISP_IPLOGS_NEEDS_LINK",
+      "kind": "code",
+      "status": 409,
+      "message": "Finish the router's setup script first: IP logs travel over its management connection, which is not set up yet.",
+      "sources": [
+        "app/domains/isp_partner/iplogs_router.py"
+      ]
+    },
+    {
+      "code": "ISP_IPLOGS_NOT_SUPPORTED",
+      "kind": "code",
+      "status": 409,
+      "message": "IP logs can be turned on for MikroTik routers only.",
+      "sources": [
+        "app/domains/isp_partner/iplogs_router.py"
+      ]
+    },
+    {
       "code": "ISP_IP_INVALID",
       "kind": "reason",
       "status": 422,
