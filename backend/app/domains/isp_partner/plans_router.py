@@ -30,6 +30,7 @@ from .dependencies import IspContext, RequireIspPartner, isp_guards
 from .http import ok
 from .p1_coupon_rights import coupon_gate as p1_coupon_gate  # RAKESH-P1 P1-3
 from .plans_service import IspPlansService, suggest_name
+from .prov_fix_zone import record_coupon_batch_zone  # PROV-FIX item 10
 from .service_control import IspServiceControl
 from .views import page as make_page
 
@@ -534,6 +535,7 @@ async def create_coupon_batch(
     batch, warnings = await svc.create_coupon_batch(
         isp, payload.model_dump(), is_cut=control.is_cut
     )
+    await record_coupon_batch_zone(db, isp, batch)  # PROV-FIX item 10
     data = (await svc.batch_views(isp, [batch]))[0]
     data["coupon_login_disabled_at_locations"] = warnings
     return ok(request, data, "Coupons generated")

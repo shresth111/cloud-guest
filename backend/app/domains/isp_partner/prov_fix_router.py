@@ -129,9 +129,9 @@ IspMonitoringRouterUnreachableError = _err(
     "IspMonitoringRouterUnreachableError",
     "ISP_MONITORING_ROUTER_UNREACHABLE",
     502,
-    "We could not reach the router to switch monitoring on. Check that it is "
-    "online and that Read now works on its page, then try again. If Read now "
-    "fails too, generate the setup script again and paste all of it.",
+    "We could not reach the router. Check it is online and that Read now works "
+    "on its page, then try again. If Read now fails, generate the setup script "
+    "again and paste all of it.",
 )
 
 
