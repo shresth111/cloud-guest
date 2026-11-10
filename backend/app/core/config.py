@@ -3118,15 +3118,16 @@ class Settings(BaseSettings):
         ),
     )
     guest_resume_identifier_mode: str = Field(
-        default="off",
+        default="masked",
         pattern="^(off|alias|masked)$",
         description=(
             "What the unauthenticated GET /guest/session/active returns as "
             "the guest's identity. 'off': the raw identifier. 'alias': the "
             "raw identifier plus an opaque hotspot_username the portal posts "
             "instead, to prove the alias on real routers. 'masked': the "
-            "alias, and the identifier masked. Raise to 'masked' only after "
-            "the portal that reads hotspot_username is live."
+            "alias, and the identifier masked (default since 2026-11-10, "
+            "once the portal that reads hotspot_username was live). 'off' is "
+            "the rollback."
         ),
     )
     guest_login_router_venue_check: str = Field(
@@ -3188,15 +3189,14 @@ class Settings(BaseSettings):
         ),
     )
     radius_authorize_device_binding_mode: str = Field(
-        default="log",
+        default="enforce",
         pattern="^(enforce|log)$",
         description=(
             "QA 2026-11-06 C2, MikroTik and Omada only (NAS-only APs always "
-            "enforce, as before). 'log' (first-deploy default) writes "
-            "radius_authorize_device_mismatch_admitted and accepts, so a MAC "
-            "format or Calling-Station-Id surprise on the live fleet shows in "
-            "the logs instead of locking guests out; 'enforce' rejects. Set "
-            "'enforce' once that line shows only genuine strangers."
+            "enforce, as before). 'enforce' (default since 2026-11-10) "
+            "rejects a device that does not own an ACTIVE session of the "
+            "guest. 'log' writes radius_authorize_device_mismatch_admitted "
+            "and accepts: the rollback if a real guest is refused."
         ),
     )
     radius_authorize_device_binding_all_vendors: bool = Field(

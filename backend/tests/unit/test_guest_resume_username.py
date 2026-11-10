@@ -74,7 +74,14 @@ class TestAlias:
 
 
 class TestModes:
-    def test_off_changes_nothing(self) -> None:
+    def test_the_default_masks(self) -> None:
+        response = _response()
+        apply_resume_identity(response, uuid.uuid4())
+        assert "9811122233" not in response.identifier
+        assert response.hotspot_username.startswith("wr1-")
+
+    def test_off_changes_nothing(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(get_settings(), "guest_resume_identifier_mode", "off")
         response = _response()
         apply_resume_identity(response, uuid.uuid4())
         assert response.identifier == _PHONE

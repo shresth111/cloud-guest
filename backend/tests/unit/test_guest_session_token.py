@@ -155,13 +155,14 @@ class TestLoginVersusResumePayload:
         )
 
     async def test_session_active_issues_no_token(self) -> None:
-        """Anyone who knows a router id and a MAC can call it. The identifier
-        stays (the portal posts it to the hotspot when it resumes)."""
+        """Anyone who knows a router id and a MAC can call it, so by default it
+        returns a masked identifier and an opaque hotspot username."""
         fx = make_fixture()
         result = await _sign_in(fx)
         data = await _login_payload(result, _Offer(), fx.guest_service, resume=True)
         assert data["session_token"] is None
-        assert data["identifier"] == _PHONE
+        assert data["identifier"] != _PHONE
+        assert data["hotspot_username"].startswith("wr1-")
 
 
 class TestSetPasswordNeedsTheToken:

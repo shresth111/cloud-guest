@@ -57,8 +57,8 @@ _VENDORS = ["mikrotik", "tplink_omada"]
 
 @pytest.fixture(autouse=True)
 def _enforce(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The shipped default is 'log' (first deploy); these pin enforcement.
-    The log-mode behaviour is pinned in ``TestFirstDeployLogMode``."""
+    """Pins enforcement (also the shipped default) so these tests do not
+    depend on it. The log-mode rollback is pinned in ``TestFirstDeployLogMode``."""
     monkeypatch.setattr(
         get_settings(), "radius_authorize_device_binding_mode", "enforce"
     )
@@ -151,8 +151,10 @@ class TestFirstDeployLogMode:
         )
         assert authz.authorized is True
 
-    def test_the_first_deploy_default_is_log_only(self) -> None:
-        from app.core.config import Settings
 
-        field = Settings.model_fields["radius_authorize_device_binding_mode"]
-        assert field.default == "log"
+def test_the_shipped_default_enforces() -> None:
+    from app.core.config import Settings
+
+    assert Settings.model_fields["radius_authorize_device_binding_mode"].default == (
+        "enforce"
+    )
