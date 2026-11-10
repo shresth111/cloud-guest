@@ -680,7 +680,13 @@ class DeviceLogsService:
             "blocker_detail": ctx["blocker_detail"],
             "tunnel_ip": ctx["peer"].tunnel_ip_address if ctx["peer"] else None,
             "status": status,
-            "script": render_script(config) if config is not None else None,
+            "script": (
+                render_script(
+                    config, routeros_version=getattr(router, "routeros_version", None)
+                )
+                if config is not None
+                else None
+            ),
             "state": state.value,
         }
 
@@ -979,4 +985,3 @@ class DeviceLogsService:
             },
         )
         return self._firewall_state(router_id, row, device=verdict, device_error=None)
-
