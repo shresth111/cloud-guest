@@ -135,6 +135,33 @@ def modern_action_row(row: dict[str, str]) -> dict[str, str]:
     return out
 
 
+def _deferred(command: str) -> str:
+    """``command`` compiled at run time (``[[:parse "..."]]``), so a property
+    this RouterOS does not know is refused when that branch RUNS, not when
+    the whole line is parsed. Same escaping as the ISP IP-logs script."""
+    body = command.replace("\\", "\\\\").replace('"', '\\"').replace("$", "\\$")
+    return f'[[:parse "{body}"]]'
+
+
+def render_topics_on() -> str:
+    """Switch ``add-topics-string`` on for our action, where it exists.
+
+    RouterOS (measured on CHR 7.25.1, 2026-11-10) creates a new logging
+    action with ``add-topics-string=no``, so the remove-then-add below sent
+    every message without its topic list: the category column fell back to
+    "other", and re-pasting this script on a router where an operator (or
+    the ISP IP-logs script) had turned topics on turned them off again.
+    The property name is deferred with ``[[:parse]]`` and the line sits in
+    ``on-error``, so a RouterOS without the property ignores it; it is the
+    same line the ISP IP-logs script uses. Not part of :meth:`action_row`:
+    the API writer would then refuse the whole action on such a router."""
+    command = (
+        f"/system logging action set [find name={ROUTEROS_ACTION_NAME}] "
+        "add-topics-string=yes"
+    )
+    return f":do {{ {_deferred(command)} }} on-error={{}}"
+
+
 def render_action_add(config: RemoteLoggingConfig) -> str:
     """One line that adds the action in whichever dialect the router speaks.
     The probe reads ``remote-log-format`` off the default ``remote`` action
@@ -157,9 +184,12 @@ def render_script(config: RemoteLoggingConfig) -> list[str]:
 
     The ``add`` lines are NOT wrapped in ``on-error``: a rejected parameter
     (e.g. an older RouterOS without ``src-address``) must stop the paste
-    loudly instead of leaving a half-configured router that looks done."""
+    loudly instead of leaving a half-configured router that looks done.
+    The one exception is :func:`render_topics_on`, which is optional by
+    design."""
     lines = render_removal()
     lines.append(render_action_add(config))
+    lines.append(render_topics_on())
     lines.extend(f"/system logging add {_args(row)}" for row in config.rule_rows())
     lines.append(
         f':put ("Wyfy remote logging: " . [:len [/system logging find '
@@ -177,5 +207,6 @@ __all__ = [
     "hub_tunnel_address",
     "render_removal",
     "render_script",
+    "render_topics_on",
     "router_tag",
 ]

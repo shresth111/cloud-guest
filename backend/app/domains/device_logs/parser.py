@@ -178,6 +178,16 @@ def parse_line(raw: str, *, received_at: datetime) -> ParsedLine:
             for k in range(index, min(len(tokens), _MAX_IDENTITY_TOKENS + 1)):
                 tag_match = _TAG.match(tokens[k])
                 if tag_match:
+                    # [POSTFIX-1] D6: with add-topics-string=yes, RouterOS
+                    # 7.25.1 puts the topic list BEFORE the prefix tag
+                    # ("<host> script,info wyfy-<hex>: msg", measured on CHR
+                    # 2026-11-10); it was read as the identity's last word.
+                    if k - 1 > 0 and _is_topic_list(tokens[k - 1]):
+                        topics = tokens[k - 1].rstrip(":")[:200]
+                        hostname = " ".join(tokens[: k - 1])[:255]
+                        tag = tag_match.group(1)
+                        index = k + 1
+                        break
                     hostname = " ".join(tokens[:k])[:255]
                     tag = tag_match.group(1)
                     index = k + 1
