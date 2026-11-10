@@ -3157,14 +3157,16 @@ class Settings(BaseSettings):
         ),
     )
     otp_daily_cap_mode: str = Field(
-        default="log",
+        default="enforce",
         pattern="^(enforce|log)$",
         description=(
             "QA 2026-11-06 H4: what reaching otp_daily_cap_per_location / "
-            "otp_daily_cap_platform does. 'log' (first-deploy default) writes "
-            "otp_daily_cap_reached and still sends; 'enforce' refuses with "
-            "429. No production volume figures were on hand to size the caps "
-            "against real peaks (a temple festival day), so they log first."
+            "otp_daily_cap_platform does. 'enforce' (default since "
+            "2026-11-10) refuses with 429; 'log' writes otp_daily_cap_reached "
+            "and still sends, and is the rollback. Sized against prod on "
+            "2026-11-10: the busiest location-day ever was 504 OTPs (about 4x "
+            "headroom to the 2000 cap; platform cap 20000), and "
+            "the cap had never been reached in log mode."
         ),
     )
     otp_daily_cap_platform: int = Field(
