@@ -48,6 +48,8 @@ Router domain yet).
 
 from __future__ import annotations
 
+import logging
+import time
 import uuid
 from collections.abc import Awaitable, Callable
 
@@ -56,6 +58,7 @@ from redis.asyncio import Redis
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import get_settings
 from app.database.redis import get_redis_client
 from app.database.repositories.generic import GenericRepository
 from app.database.session import get_db_session
@@ -82,6 +85,7 @@ from .enums import ScopeType
 from .exceptions import (
     CrossOrganizationScopeDeniedError,
     InvalidScopeHeaderError,
+    MfaSetupRequiredError,
     MissingScopeContextError,
     RoleNotHeldError,
     SingleOrganizationRequiredError,
@@ -624,9 +628,38 @@ def RequirePermission(
             scope_type=resolved_scope,
             scope_context=context,
         )
+        if resolved_scope == ScopeType.GLOBAL:
+            _check_master_operator_mfa(user)
         return user
 
     return _dependency
+
+
+logger = logging.getLogger(__name__)
+
+_MFA_LOG_INTERVAL_SECONDS = 3600.0
+_mfa_last_logged: dict[str, float] = {}
+
+
+def _check_master_operator_mfa(user: AuthUser) -> None:
+    """Second factor for Master operators (``master_operator_mfa_mode``).
+
+    Called only after a GLOBAL-scope check passed, which only a GLOBAL grant
+    can do, so the caller is a platform operator and never a customer. Uses
+    ``AuthUser.mfa_enabled``, already loaded with the user: no extra query.
+    """
+    if user.mfa_enabled:
+        return
+    mode = get_settings().master_operator_mfa_mode
+    if mode == "off":
+        return
+    if mode == "enforce":
+        raise MfaSetupRequiredError()
+    now = time.monotonic()
+    last = _mfa_last_logged.get(user.id)
+    if last is None or now - last >= _MFA_LOG_INTERVAL_SECONDS:
+        _mfa_last_logged[user.id] = now
+        logger.warning("master_operator_without_mfa", extra={"user_id": user.id})
 
 
 def RequireRole(
