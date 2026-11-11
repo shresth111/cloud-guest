@@ -1,0 +1,55 @@
+name: ISP PostgreSQL tests (nightly dispatch)
+
+# The ISP PostgreSQL suite (isp-pg.yml, which lives on integ/isp-test) used to
+# run on every push to integ/**: 33 runs x ~52 job-minutes = 1,732 of this
+# repository's 6,365 job-minutes on 2026-11-01..11, the single largest line.
+# Path filters do not help -- 31 of those 33 pushes touched ISP code.
+#
+# Instead it runs once a night, and only if integ/isp-test moved since the
+# suite last ran there. It still runs on every PR into main (isp-pg.yml's own
+# pull_request trigger) and on demand (workflow_dispatch).
+#
+# `schedule` only fires from the default branch, which is why this small
+# dispatcher lives on main while the suite itself stays defined in one place.
+# A workflow_dispatch sent with GITHUB_TOKEN does start a run (it is one of
+# the two events exempt from the "GITHUB_TOKEN does not trigger workflows"
+# rule).
+
+on:
+  schedule:
+    - cron: "30 20 * * *" # 02:00 IST
+  workflow_dispatch:
+
+permissions:
+  actions: write   # to dispatch isp-pg.yml
+  contents: read
+
+concurrency:
+  group: isp-pg-nightly
+  cancel-in-progress: false
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      BRANCH: integ/isp-test
+    steps:
+      - name: Dispatch the ISP suite if integ moved
+        run: |
+          set -euo pipefail
+          HEAD=$(gh api "repos/$REPO/branches/$BRANCH" --jq .commit.sha 2>/dev/null) || {
+            echo "::notice::$BRANCH does not exist; nothing to test."
+            exit 0
+          }
+          # Latest isp-pg.yml run on the branch, any event and any state.
+          LAST=$(gh api "repos/$REPO/actions/workflows/isp-pg.yml/runs?branch=$BRANCH&per_page=1" \
+                   --jq '.workflow_runs[0].head_sha // ""' 2>/dev/null || echo "")
+          if [ "$HEAD" = "$LAST" ]; then
+            echo "$BRANCH is still at ${HEAD:0:7}, which the suite already ran on; skipping."
+            exit 0
+          fi
+          gh workflow run isp-pg.yml --repo "$REPO" --ref "$BRANCH"
+          echo "::notice::Dispatched isp-pg.yml on $BRANCH at ${HEAD:0:7} (last run was on ${LAST:0:7})."

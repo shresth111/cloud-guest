@@ -1,14 +1,16 @@
 name: CI
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - "backend/**"
-      - ".github/workflows/ci.yml"
+  # No `push: main` trigger. cd.yml runs on every main push that touches
+  # backend/**, deploy/** or either workflow, and calls this workflow (or
+  # reuses the PR's pass on the identical tree, see cd.yml `gate`). A direct
+  # push run on main tested the same commit a second time: 700 of 6,365
+  # job-minutes on 2026-11-01..11.
   pull_request:
     paths:
       - "backend/**"
+      # Markdown under backend/ cannot change what ruff or pytest see.
+      - "!backend/**/*.md"
       - ".github/workflows/ci.yml"
   # cd.yml calls this instead of restating ruff/pytest/the test-count floor.
   # The gates stay defined once, here, and a deploy cannot pass a version of
@@ -44,6 +46,9 @@ defaults:
 jobs:
   lint-and-test:
     runs-on: ubuntu-latest
+    # Observed 22-35 min. Without a ceiling a hung pytest worker runs for the
+    # 6-hour default and takes most of a month's free minutes with it.
+    timeout-minutes: 50
 
     steps:
       - name: Checkout
@@ -204,6 +209,28 @@ jobs:
             exit 1
           fi
 
+      # Leaves a receipt that THIS TREE passed every gate above, so cd.yml
+      # can skip re-running the ~25-minute suite on a main commit whose tree
+      # is byte-identical to one a PR already proved (the merge commit of an
+      # up-to-date PR has exactly the tree of the PR's refs/pull/N/merge
+      # checkout). Keyed on the tree, not the commit: the PR run and the main
+      # push have different commit SHAs but the same tree. Only reached when
+      # every earlier step passed. A few bytes, 3-day retention.
+      - name: Record the tested tree
+        id: tree
+        working-directory: .
+        run: |
+          tree=$(git rev-parse 'HEAD^{tree}')
+          echo "tree=$tree" >> "$GITHUB_OUTPUT"
+          printf '%s\n' "$tree" > ci-passed-tree.txt
+      - name: Upload the tested-tree receipt
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ci-passed-tree-${{ steps.tree.outputs.tree }}
+          path: ci-passed-tree.txt
+          retention-days: 3
+          if-no-files-found: error
+
   # ---------------------------------------------------------------------------
   # Slack
   # ---------------------------------------------------------------------------
@@ -233,6 +260,7 @@ jobs:
     # would be nearly right; this says what it means.
     if: ${{ always() && contains(needs.*.result, 'failure') }}
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     # Belt and braces. The action is written never to exit non-zero, but this
     # workflow is also called by cd.yml via workflow_call, where a failing job
     # here would mean a notification breaking a deploy.
