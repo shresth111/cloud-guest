@@ -14,12 +14,13 @@ name: ISP PostgreSQL tests
 #   * It is not a required check on main (founder decision 2026-11-01): it
 #     reports on PRs and on integ pushes, it does not block merges yet.
 
+# Not on every integ/** push any more (2026-11-12): that was 33 runs x ~52
+# job-minutes = 1,732 of the repository's 6,365 job-minutes on 2026-11-01..11,
+# the largest single line, and path filters cannot help because 31 of those
+# 33 pushes touched ISP code. integ/isp-test is now covered by
+# isp-pg-nightly.yml on main, which dispatches this workflow once a night and
+# only when the branch moved. PRs into main and manual runs are unchanged.
 on:
-  push:
-    branches: ["integ/**"]
-    paths:
-      - "backend/**"
-      - ".github/workflows/isp-pg.yml"
   pull_request:
     branches: [main]
     paths:
