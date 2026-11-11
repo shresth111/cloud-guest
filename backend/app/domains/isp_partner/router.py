@@ -533,6 +533,11 @@ async def get_router_as_device(
 
 
 async def _setup_target(isp: IspContext, isp_router_id: uuid.UUID) -> Any:
+    # FR-GENERATE: a franchisee may run setup on routers inside its zones.
+    from .workflow_franchisee_setup import franchisee_setup_router, is_franchisee
+
+    if is_franchisee(isp):
+        return await franchisee_setup_router(isp, isp_router_id)
     if isp.role_slug not in SETUP_SCRIPT_ROLES:
         raise IspSetupNotAllowedError()
     return await IspScope.assert_router(isp, isp_router_id)
@@ -1281,6 +1286,11 @@ def _include_lanes() -> None:
     from .workflow_franchisee_router import franchisee_router_add
 
     isp_partner_router.include_router(franchisee_router_add)
+
+    # FR-GENERATE: can this caller Generate on this router (console probe).
+    from .workflow_franchisee_setup import franchisee_setup_access_router
+
+    isp_partner_router.include_router(franchisee_setup_access_router)
 
 
 _include_lanes()

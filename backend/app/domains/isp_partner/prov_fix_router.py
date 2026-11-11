@@ -221,9 +221,15 @@ async def setup_check_in(
     audit: RBACRepositoryProtocol = Depends(get_rbac_repository),
     settings: Settings = Depends(get_settings),
 ) -> dict:
-    if isp.role_slug not in SETUP_SCRIPT_ROLES:
+    # FR-GENERATE: a franchisee may check in routers inside its zones.
+    from .workflow_franchisee_setup import franchisee_setup_router, is_franchisee
+
+    if is_franchisee(isp):
+        target = await franchisee_setup_router(isp, isp_router_id)
+    elif isp.role_slug not in SETUP_SCRIPT_ROLES:
         raise IspSetupNotAllowedError()
-    target = await IspScope.assert_router(isp, isp_router_id)
+    else:
+        target = await IspScope.assert_router(isp, isp_router_id)
 
     # The token must be this router's, checked BEFORE anything is allocated:
     # a hub allocation cannot be undone.

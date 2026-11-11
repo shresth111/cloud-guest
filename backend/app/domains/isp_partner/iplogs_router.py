@@ -531,6 +531,10 @@ async def router_ip_logs_script(
     db: AsyncSession = Depends(get_db_session),
 ) -> dict:
     router = await IspScope.assert_router(isp, isp_router_id)
+    # FR-GENERATE: a franchisee gets the script only inside its zones.
+    from .workflow_franchisee_setup import assert_router_in_franchisee_zones
+
+    await assert_router_in_franchisee_zones(isp, router)
     peer, server = await _link(db, router.id)
     blocker = _blocker(router, peer, server)
     data: dict[str, Any] = {
