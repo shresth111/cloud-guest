@@ -103,16 +103,83 @@ jobs:
   # Gate on the existing CI rather than restating it. ci.yml gained an
   # `on.workflow_call` trigger for this; the ruff/pytest/test-count-floor
   # steps stay defined in exactly one place.
+  #
+  # ...unless this exact tree has ALREADY passed it. Merging an up-to-date PR
+  # produces a main commit whose tree is byte-identical to the PR's
+  # refs/pull/N/merge checkout, which ci.yml just tested end to end; running
+  # the same ~25-minute suite again on the same bytes was about half of this
+  # repository's Actions minutes. ci.yml leaves a `ci-passed-tree-<tree>`
+  # artifact as its last step, only after every gate passed, and this job
+  # looks for one.
+  #
+  # Anything short of an exact tree match runs the full suite as before: main
+  # moved between the PR's CI and the merge, a direct push to main, the
+  # receipt expired (3 days), the receipt came from a fork, or the API call
+  # failed. Setting the repository variable CD_ALWAYS_RUN_CI=true restores
+  # the old behaviour without a code change.
+  gate:
+    name: Was this exact tree already tested?
+    if: github.event.inputs.image_tag == ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      tested: ${{ steps.check.outputs.tested }}
+    steps:
+      - name: Look for a CI receipt for this tree
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          ALWAYS_RUN_CI: ${{ vars.CD_ALWAYS_RUN_CI }}
+        run: |
+          # Never fails: every error path means "not proven, run the suite".
+          set -u
+          echo "tested=false" >> "$GITHUB_OUTPUT"
+          if [ "${ALWAYS_RUN_CI:-}" = "true" ]; then
+            echo "CD_ALWAYS_RUN_CI=true; running the full suite."
+            exit 0
+          fi
+          TREE=$(gh api "repos/$REPO/git/commits/$SHA" --jq .tree.sha 2>/dev/null) || TREE=""
+          if ! [[ "$TREE" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::warning::Could not read the tree of $SHA; running the full suite."
+            exit 0
+          fi
+          # Same-repository runs only: a fork's pull_request run can upload
+          # artifacts too, and must not be able to vouch for main.
+          COUNT=$(gh api "repos/$REPO/actions/artifacts?name=ci-passed-tree-$TREE&per_page=50" \
+            --jq '[.artifacts[] | select(.expired == false
+                     and .workflow_run.repository_id == .workflow_run.head_repository_id)] | length' \
+            2>/dev/null) || COUNT=0
+          if [ "${COUNT:-0}" -gt 0 ] 2>/dev/null; then
+            echo "tested=true" >> "$GITHUB_OUTPUT"
+            echo "::notice title=CI reused::Tree $TREE already passed ci.yml ($COUNT receipt(s)); skipping the re-run."
+          else
+            echo "No CI receipt for tree $TREE; running the full suite."
+          fi
+
   ci:
     name: CI
-    if: github.event.inputs.image_tag == ''
+    needs: gate
+    # !cancelled() rather than the default success(): if the gate job itself
+    # fails, the answer is "run the suite", not "skip CI and the deploy".
+    if: ${{ !cancelled() && github.event.inputs.image_tag == '' && needs.gate.outputs.tested != 'true' }}
     uses: ./.github/workflows/ci.yml
 
   build:
     name: Build and push to ECR
-    needs: ci
-    if: always() && (needs.ci.result == 'success' || github.event.inputs.image_tag != '')
+    needs: [gate, ci]
+    if: >-
+      ${{ !cancelled() && (
+        needs.ci.result == 'success'
+        || (needs.gate.outputs.tested == 'true' && needs.ci.result == 'skipped')
+        || github.event.inputs.image_tag != ''
+      ) }}
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     outputs:
       # The SHA and repo:tag only. The full ref contains the (masked) account
       # id, and GitHub drops any job output that contains a masked value.
@@ -268,6 +335,7 @@ jobs:
     name: Deploy to app server
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     # Attach required reviewers / a wait timer to this environment in repo
     # settings if backend deploys should need a human. Leaving it with no
     # protection rules makes this fully continuous; the environment exists so
@@ -493,9 +561,10 @@ jobs:
   # run until deploy has already reached a conclusion.
   notify:
     name: Tell Slack how the deploy went
-    needs: [ci, build, deploy]
+    needs: [gate, ci, build, deploy]
     if: always()
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     continue-on-error: true
     # Deliberately does not inherit the workflow's `id-token: write`: this job
     # has no business minting an OIDC token for the deploy role.
