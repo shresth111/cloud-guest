@@ -1,16 +1,15 @@
 name: CI
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - "backend/**"
-      # Markdown under backend/ cannot change what ruff or pytest see.
-      - "!backend/**/*.md"
-      - ".github/workflows/ci.yml"
+  # No `push: main` trigger. cd.yml runs on every main push that touches
+  # backend/**, deploy/** or either workflow, and calls this workflow (or
+  # reuses the PR's pass on the identical tree, see cd.yml `gate`). A direct
+  # push run on main tested the same commit a second time: 700 of 6,365
+  # job-minutes on 2026-11-01..11.
   pull_request:
     paths:
       - "backend/**"
+      # Markdown under backend/ cannot change what ruff or pytest see.
       - "!backend/**/*.md"
       - ".github/workflows/ci.yml"
   # cd.yml calls this instead of restating ruff/pytest/the test-count floor.
