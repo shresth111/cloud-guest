@@ -276,6 +276,10 @@ async def onboard_subscriber(
     svc: IspSubscriber360Service = Depends(get_subscriber360_service),
 ) -> dict:
     data = payload.model_dump(exclude_unset=True)
+    # DEFAULT-LOGS follow-up: first name + mobile (ISP_SUBSCRIBER_CONTACT_REQUIRED)
+    from .subscriber_contact import check_contact_on_create
+
+    check_contact_on_create(data)
     data["profile"] = (
         payload.profile.model_dump(exclude_unset=True) if payload.profile else {}
     )

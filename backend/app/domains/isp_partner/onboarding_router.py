@@ -281,6 +281,11 @@ async def onboard(  # noqa: PLR0912, PLR0913, PLR0915 -- one step per lane
     audit=Depends(get_rbac_repository),  # noqa: B008
     queue_service=Depends(get_queue_management_service),  # noqa: B008
 ) -> dict:
+    # DEFAULT-LOGS follow-up: first name + mobile (ISP_SUBSCRIBER_CONTACT_REQUIRED),
+    # checked before anything is written.
+    from .subscriber_contact import check_contact_on_create
+
+    check_contact_on_create(payload.subscriber.model_dump(exclude_unset=True))
     held = await _held(isp, av)
     for wanted, key in (
         (payload.kyc is not None or payload.caf is not None, KYC_UPDATE),

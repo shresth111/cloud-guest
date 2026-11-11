@@ -1653,12 +1653,30 @@
       ]
     },
     {
+      "code": "ISP_SUBSCRIBER_FIRST_NAME_REQUIRED",
+      "kind": "code",
+      "status": 422,
+      "message": "Enter the subscriber's first name.",
+      "sources": [
+        "app/domains/isp_partner/subscriber_contact.py"
+      ]
+    },
+    {
       "code": "ISP_SUBSCRIBER_FROZEN",
       "kind": "code",
       "status": 409,
       "message": "This subscriber is frozen; unfreeze first",
       "sources": [
         "app/domains/isp_partner/subscriber360_service.py"
+      ]
+    },
+    {
+      "code": "ISP_SUBSCRIBER_MOBILE_REQUIRED",
+      "kind": "code",
+      "status": 422,
+      "message": "Enter the subscriber's mobile number: 10 digits, e.g. 9876543210.",
+      "sources": [
+        "app/domains/isp_partner/subscriber_contact.py"
       ]
     },
     {

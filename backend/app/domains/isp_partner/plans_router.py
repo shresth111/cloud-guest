@@ -774,7 +774,12 @@ async def create_subscriber(
     isp: IspContext = Depends(RequireIspPartner),
     svc: IspPlansService = Depends(get_plans_service),
 ) -> dict:
-    s = await svc.create_subscriber(isp, payload.model_dump(exclude_unset=True))
+    data = payload.model_dump(exclude_unset=True)
+    # DEFAULT-LOGS follow-up: first name + mobile (ISP_SUBSCRIBER_CONTACT_REQUIRED)
+    from .subscriber_contact import check_contact_on_create
+
+    check_contact_on_create(data)
+    s = await svc.create_subscriber(isp, data)
     return ok(request, await svc.subscriber_detail(isp, s.id), "Subscriber created")
 
 
@@ -812,9 +817,13 @@ async def patch_subscriber(
     isp: IspContext = Depends(RequireIspPartner),
     svc: IspPlansService = Depends(get_plans_service),
 ) -> dict:
-    await svc.update_subscriber(
-        isp, subscriber_id, payload.model_dump(exclude_unset=True)
-    )
+    data = payload.model_dump(exclude_unset=True)
+    # DEFAULT-LOGS follow-up: only the keys sent (ISP_SUBSCRIBER_CONTACT_REQUIRED)
+    from .subscriber_contact import check_contact_on_patch
+
+    await svc.subscriber(isp, subscriber_id)  # scope first: another ISP's id is 404
+    check_contact_on_patch(data)
+    await svc.update_subscriber(isp, subscriber_id, data)
     return ok(
         request, await svc.subscriber_detail(isp, subscriber_id), "Subscriber updated"
     )
