@@ -29,6 +29,18 @@ on:
       SLACK_WEBHOOK_URL:
         required: false
 
+# Superseded PR pushes and superseded integ/** pushes cancel each other;
+# nothing else does. integ/isp-test takes bursts of direct pushes (16 of 33
+# runs on 2026-11-01..11 were overtaken by a newer push while still running,
+# ~34 job-minutes each), and each push contains the one before it, so the
+# newest run's verdict is the one anybody reads. main and the copy cd.yml
+# calls stay per-SHA with no cancellation -- cancelling the CI that cd.yml is
+# waiting on would cancel the deploy. The group keys on github.workflow
+# because inside workflow_call it is the CALLER's name ("CD").
+concurrency:
+  group: ci-backend-${{ github.workflow }}-${{ github.event.pull_request.number || (startsWith(github.ref, 'refs/heads/integ/') && github.ref) || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || startsWith(github.ref, 'refs/heads/integ/') }}
+
 defaults:
   run:
     working-directory: backend
@@ -36,6 +48,7 @@ defaults:
 jobs:
   lint-and-test:
     runs-on: ubuntu-latest
+    timeout-minutes: 50
 
     steps:
       - name: Checkout
@@ -227,6 +240,7 @@ jobs:
     # branches; their status is read with `gh run list`, not from Slack.
     if: ${{ always() && contains(needs.*.result, 'failure') && !startsWith(github.ref, 'refs/heads/integ/') }}
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     # Belt and braces. The action is written never to exit non-zero, but this
     # workflow is also called by cd.yml via workflow_call, where a failing job
     # here would mean a notification breaking a deploy.
