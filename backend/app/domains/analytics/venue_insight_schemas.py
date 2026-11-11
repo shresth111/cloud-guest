@@ -143,6 +143,46 @@ class LocationComparisonResponse(BaseModel):
     locations: list[LocationComparisonItem]
 
 
+class RouterCpuPoint(BaseModel):
+    """One downsampled bucket of ``router_health_snapshots``. ``None`` means
+    the snapshots in this bucket carried no value for that metric."""
+
+    #: UTC start of the bucket; the bucket is ``bucket_seconds`` wide.
+    bucket_start: str
+    cpu_avg: float | None
+    cpu_max: float | None
+    memory_avg: float | None
+
+
+class RouterCpuLatest(BaseModel):
+    recorded_at: str
+    cpu_usage_percent: float | None
+    memory_usage_percent: float | None
+    #: Older than ``stale_after_seconds``: show it as not current.
+    is_stale: bool
+
+
+class RouterCpuItem(BaseModel):
+    router_id: uuid.UUID
+    router_name: str
+    status: str
+    #: Most recent reading with a CPU value in the last 30 days, or null.
+    latest: RouterCpuLatest | None
+    #: Oldest first. Buckets with no reading are omitted, not zero-filled.
+    points: list[RouterCpuPoint]
+
+
+class RouterCpuResponse(BaseModel):
+    location_id: uuid.UUID
+    window_start: str
+    window_end: str
+    bucket_seconds: int
+    stale_after_seconds: int
+    high_cpu_percent: float
+    #: MikroTik routers only; empty when the venue has none.
+    routers: list[RouterCpuItem]
+
+
 __all__ = [
     "FunnelStageUnavailable",
     "InternetConfirmedStage",
@@ -154,4 +194,8 @@ __all__ = [
     "LoginMethodItem",
     "PeakHourCell",
     "PeakHoursResponse",
+    "RouterCpuItem",
+    "RouterCpuLatest",
+    "RouterCpuPoint",
+    "RouterCpuResponse",
 ]

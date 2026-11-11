@@ -5,7 +5,8 @@ rules.
 RBAC: ``analytics.read`` with an explicit ``scope=`` on every route (never
 inferred from whatever headers the caller chose to send).
 
-* The three single-venue routes take ``location_id`` as a query parameter
+* The four single-venue routes (peak hours, guest mix, login funnel,
+  router CPU) take ``location_id`` as a query parameter
   and check at ``ScopeType.LOCATION``. ``_current_scope_context`` derives the
   checked organization from the location's real owner, so a location from
   another tenant fails the permission check; the service then re-proves the
@@ -41,11 +42,13 @@ from app.domains.rbac.dependencies import (
 )
 from app.domains.rbac.enums import ScopeType
 
+from .router_cpu import RouterCpuRepository, RouterCpuService
 from .venue_insight_schemas import (
     GuestMixResponse,
     LocationComparisonResponse,
     LoginFunnelResponse,
     PeakHoursResponse,
+    RouterCpuResponse,
 )
 from .venue_insights import (
     VenueInsightsRepository,
@@ -62,6 +65,12 @@ def get_venue_insights_service(
     db: AsyncSession = Depends(get_db_session),
 ) -> VenueInsightsService:
     return VenueInsightsService(VenueInsightsRepository(db))
+
+
+def get_router_cpu_service(
+    db: AsyncSession = Depends(get_db_session),
+) -> RouterCpuService:
+    return RouterCpuService(RouterCpuRepository(db))
 
 
 def _request_id(request: Request) -> str:
@@ -193,4 +202,38 @@ async def get_location_comparison(
     )
 
 
-__all__ = ["get_venue_insights_service", "router"]
+@router.get(
+    "/router-cpu",
+    response_model=ApiResponse[RouterCpuResponse],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(RequirePermission(PERMISSION, scope=ScopeType.LOCATION))],
+)
+async def get_router_cpu(
+    request: Request,
+    location_id: uuid.UUID = Query(...),
+    start_date: datetime | None = _START,
+    end_date: datetime | None = _END,
+    organization_id: uuid.UUID = Depends(RequireOrganization),
+    scope_location_id: uuid.UUID | None = Depends(CurrentLocation),
+    service: RouterCpuService = Depends(get_router_cpu_service),
+):
+    """CPU over time for each MikroTik router at the venue -- see
+    ``router_cpu.py``. Read-only."""
+    enforce_target_location(
+        target_location_id=location_id,
+        scope_location_id=scope_location_id,
+        requesting_organization_id=organization_id,
+    )
+    start, end = resolve_window(start_date, end_date)
+    payload = await service.get_router_cpu(
+        organization_id=organization_id, location_id=location_id, start=start, end=end
+    )
+    return build_response(
+        success=True,
+        message="Router CPU retrieved",
+        data=payload.model_dump(mode="json"),
+        request_id=_request_id(request),
+    )
+
+
+__all__ = ["get_router_cpu_service", "get_venue_insights_service", "router"]
