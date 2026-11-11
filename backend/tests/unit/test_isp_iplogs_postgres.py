@@ -3,11 +3,11 @@
 ISP_IPLOGS_SELFSERVE_ENABLED=true CLOUDGUEST_DEVICE_LOGS_ENABLED=true
 
 Covers: flag off 404; a router without its management connection
-(``needs_link``, enable 409, no script); script + enable writes the intent
-rows (export with ``ipdr_ports``) and an audit row; arrivals turn the card
-green, with double-NAT / clock / NAT-event warnings; disable; the fleet
-list; **ISP B cannot see, script or enable ISP A's router, nor list it**;
-a technician confined to another customer gets 404.
+(``needs_link``, enable records the choice [DEFAULT-LOGS], no script);
+script + enable writes the intent rows (export with ``ipdr_ports``) and an
+audit row; arrivals turn the card green, with double-NAT / clock / NAT-event
+warnings; disable; the fleet list; **ISP B cannot see, script or enable ISP
+A's router, nor list it**; a technician confined to another customer gets 404.
 """
 
 from __future__ import annotations
@@ -212,9 +212,11 @@ async def test_iplogs_end_to_end() -> None:  # noqa: PLR0915
             assert "tunnel" not in d["blocker_hint"].lower()
             sc = await call("GET", f"/routers/{r1}/ip-logs/script")
             assert sc["available"] is False and sc["enable_script"] is None
-            r = await c.post(f"{api}/routers/{r1}/ip-logs/enable", headers=ha)
-            assert r.status_code == 409
-            assert r.json()["data"]["code"] == "ISP_IPLOGS_NEEDS_LINK"
+            # DEFAULT-LOGS: no longer 409; the choice is recorded for the setup
+            # script, no intent rows (test_isp_default_logs_postgres.py).
+            d = await call("POST", f"/routers/{r1}/ip-logs/enable")
+            assert d["state"] == "needs_link" and d["set_up"] is False
+            assert d["wanted"] is True
 
             # give router 1 its management connection -------------------------
             now = datetime.now(UTC)
@@ -286,7 +288,7 @@ async def test_iplogs_end_to_end() -> None:  # noqa: PLR0915
                         )
                     )
                 ).scalar_one()
-                assert n == 1
+                assert n == 2  # DEFAULT-LOGS: + the needs_link choice above
             # idempotent
             await call("POST", f"/routers/{r1}/ip-logs/enable")
             async with SessionLocal() as s:

@@ -19,6 +19,7 @@ from app.domains.isp_partner.iplogs_script import (
     deferred,
     render_disable_script,
     render_enable_script,
+    render_setup_lines,
     safe_identity,
 )
 
@@ -270,6 +271,7 @@ def test_routes_are_flag_gated_and_guarded() -> None:
         ("POST", "/routers/{isp_router_id}/ip-logs/enable"),
         ("POST", "/routers/{isp_router_id}/ip-logs/disable"),
         ("GET", "/ip-logs/routers"),
+        ("GET", "/ip-logs/features"),
     }
     for r in routes:
         deps = [d.dependency for d in r.dependencies]
@@ -338,3 +340,152 @@ def test_d12_all_set_up_pipes_arriving_stays_green(pipes) -> None:  # noqa: ANN0
     )
     assert st.state_label(st.LOGS_ARRIVING, pipes) == "Logs arriving"
     assert st.lagging_pipes(pipes) == []
+
+
+# -- DEFAULT-LOGS: the IP-logs lines folded into the partner setup script -----
+
+
+def _do_bodies(line: str) -> list[list[str]]:
+    """Statements of every ``:do {}`` / ``do={}`` / ``on-error={}`` /
+    ``else={}`` body OUTSIDE strings: the same rule as the console's
+    ``validateSetupScriptChunks`` (one statement per body)."""
+    opens, in_str, i = [], False, 0
+    while i < len(line):
+        ch = line[i]
+        if in_str:
+            if ch == "\\":
+                i += 1
+            elif ch == '"':
+                in_str = False
+        elif ch == '"':
+            in_str = True
+        elif ch == "{" and re.search(
+            r"(?::do|\bdo=|on-error=|else=)\s*$", line[max(0, i - 12) : i]
+        ):
+            opens.append(i)
+        i += 1
+    out = []
+    for o in opens:
+        depth, close, st = 0, -1, False
+        j = o
+        while j < len(line):
+            ch = line[j]
+            if st:
+                if ch == "\\":
+                    j += 1
+                elif ch == '"':
+                    st = False
+            elif ch == '"':
+                st = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    close = j
+                    break
+            j += 1
+        body = line[o + 1 : close]
+        parts, cur, d, bs, k = [], "", 0, False, 0
+        while k < len(body):
+            ch = body[k]
+            if bs:
+                cur += ch
+                if ch == "\\":
+                    k += 1
+                    cur += body[k] if k < len(body) else ""
+                elif ch == '"':
+                    bs = False
+            elif ch == '"':
+                bs = True
+                cur += ch
+            else:
+                if ch in "{[(":
+                    d += 1
+                elif ch in "}])":
+                    d -= 1
+                if d == 0 and ch == ";":
+                    parts.append(cur)
+                    cur = ""
+                    k += 1
+                    continue
+                cur += ch
+            k += 1
+        parts.append(cur)
+        out.append([p.strip() for p in parts if p.strip()])
+    return out
+
+
+def test_setup_lines_one_statement_per_body_and_under_paste_cap() -> None:
+    lines = render_setup_lines(_t())
+    assert all(len(line) <= 3300 for line in lines)
+    assert all("\n" not in line for line in lines)
+    for line in lines:
+        for stmts in _do_bodies(line):
+            assert len(stmts) <= 1, (line, stmts)
+    # the guard itself fires on the card script's two-statement bodies
+    card = render_enable_script(_t())
+    assert any(len(b) > 1 for line in card for b in _do_bodies(line))
+
+
+def test_setup_lines_same_values_and_deferral_as_card_script() -> None:
+    t = _t()
+    lines = render_setup_lines(t)
+    text = "\n".join(lines)
+    card = "\n".join(render_enable_script(t))
+    # both syslog dialects deferred, 7.18+ first, same action text as the card
+    modern = re.search(
+        r'\[\[:parse "(/system logging action add [^"]*remote-log-format[^"]*)"\]\]',
+        text,
+    )
+    legacy = re.search(
+        r'\[\[:parse "(/system logging action add [^"]*bsd-syslog=yes[^"]*)"\]\]', text
+    )
+    assert (
+        modern and legacy and text.index(modern.group(0)) < text.index(legacy.group(0))
+    )
+    assert modern.group(1) in card and legacy.group(1) in card
+    assert "src-address=10.66.0.13" in modern.group(1)
+    assert (
+        ':do { [[:parse "/system logging action set [find name='
+        f'{ROUTEROS_ACTION_NAME}] add-topics-string=yes"]] }} on-error={{}}'
+    ) in text
+    for topic in ROUTEROS_TOPICS:
+        assert f"topics={topic} prefix=wyfy-{RID.hex[:8]}" in text
+    # traffic flow + NAT events: v7 only, deferred, the card's values
+    assert "nat-events=yes" in text and "version=ipfix" in text
+    assert text.count('[:pick [/system resource get version] 0 2] = "7."') >= 5
+    # inside the setup script: no clock (setup has its own), never :error
+    assert "time-zone-name" not in text and "ntp client" not in text
+    assert ":error" not in text
+    assert lines[-1] == ':log info "wyfy: IP logs set up"'
+    # identity fix kept (location names with spaces break the tag)
+    assert 'name="Hotel-Blue-Main"' in text
+    assert "wireguard" not in text.lower() and "tunnel" not in text.lower()
+
+
+def test_add_router_choice_is_a_noop_unless_sent_and_flag_on(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import asyncio
+
+    from app.domains.isp_partner import iplogs_router as mod
+    from app.domains.isp_partner.iplogs_default import record_add_router_choice
+    from app.domains.isp_partner.schemas import IspRouterCreateRequest
+
+    body = IspRouterCreateRequest(
+        name="R", serial_number="S", mac_address="02:00:00:00:00:01", model="hEX"
+    )
+    assert body.ip_logs is None
+    assert "ip_logs" not in body.model_dump(exclude={"ip_logs"})
+
+    class _Db:
+        def __getattr__(self, name: str):  # noqa: ANN204
+            raise AssertionError(f"db touched: {name}")
+
+    data = {"id": str(RID), "name": "R"}
+    assert asyncio.run(record_add_router_choice(_Db(), object(), data, None)) is data
+    monkeypatch.delenv("ISP_IPLOGS_SELFSERVE_ENABLED", raising=False)
+    mod.get_iplogs_settings.cache_clear()
+    assert asyncio.run(record_add_router_choice(_Db(), object(), data, True)) is data
+    mod.get_iplogs_settings.cache_clear()

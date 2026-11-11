@@ -61,6 +61,7 @@ __all__ = [
     "deferred",
     "render_disable_script",
     "render_enable_script",
+    "render_setup_lines",
     "safe_identity",
 ]
 
@@ -271,3 +272,110 @@ def render_disable_script(t: IpLogsTargets) -> list[str]:
         ),
         ':put "=== Wyfy IP logs removed ==="',
     ]
+
+
+# --------------------------------------------------------------------------
+# DEFAULT-LOGS: the same IP-logs lines, folded into the partner setup script
+# --------------------------------------------------------------------------
+
+
+def _guarded(command: str, failure: str) -> str:
+    """``command`` deferred AND caught: a refusal prints ``failure`` instead of
+    stopping. Inside the setup script a stopped line would, in the one-paste
+    copy, also discard every chunk after this one (guest access, NAT check),
+    and IP logs must never cost a venue its guest internet."""
+    return f':do {{ {deferred(command)} }} on-error={{ :put "  {failure}" }}'
+
+
+def _v7_guarded(command: str, failure: str) -> str:
+    return f":if {_V7} do={{ {_guarded(command, failure)} }}"
+
+
+def render_setup_lines(t: IpLogsTargets) -> list[str]:
+    """The IP-logs lines as one chunk of the partner SETUP script.
+
+    Same values, same ``[[:parse "..."]]`` + ``on-error`` deferral, same
+    version detection and the same ``add-topics-string`` line as
+    :func:`render_enable_script` (the card script, which stays as it is).
+    Three differences, all because these lines now sit INSIDE the setup
+    script, which the console checks with its setup-script validator:
+
+    * no clock lines: the setup script's own "Clock + NTP" chunk runs first;
+    * one statement per ``do={}`` / ``on-error={}`` body (the validator's
+      rule, from a confirmed live syntax error), so the identity fix and the
+      dialect pick print their message from a separate line;
+    * nothing calls ``:error``: a refused command prints FAILED / WARNING and
+      the rest of the setup script still runs.
+    """
+    name = safe_identity(t.router_name, t.router_id)
+    has_space = '([:typeof [:find [/system identity get name] " "]] != "nil")'
+    config = t.syslog()
+    action = ROUTEROS_ACTION_NAME
+    legacy = deferred(f"/system logging action add {_args(config.action_row())}")
+    modern = deferred(
+        f"/system logging action add {_args(modern_action_row(config.action_row()))}"
+    )
+    base = flow_desired_config(t.flow_target(), nat_events=False)
+    full = flow_desired_config(t.flow_target(), nat_events=True)
+    nat_only = {k: v for k, v in full.ipfix.items() if k not in base.ipfix}
+    identity = target_identity(t.flow_host, t.flow_port)
+    where = " and ".join(f"{k}={v}" for k, v in identity.items())
+    target = _args(dict(base.target or {}))
+    flow_fail = "WARNING: connection logs could not be set up on this router"
+    lines = [
+        "# Wyfy Guest IP logs (on by default; turn them off on this router's "
+        "page in Wyfy)",
+        ':put "=== Wyfy IP logs ==="',
+        f':if {has_space} do={{ :put "  Router name had spaces, now: {name}" }}',
+        f':if {has_space} do={{ /system identity set name="{name}" }}',
+        f"# System logs to {config.remote_host}:{config.remote_port}",
+        f":do {{ /system logging remove [find action={action}] }} on-error={{}}",
+        f":do {{ /system logging action remove [find name={action}] }} on-error={{}}",
+        # 7.18+ first (remote-log-format), then the older bsd-syslog=yes.
+        f":do {{ {modern} }} on-error={{ :do {{ {legacy} }} on-error={{ "
+        ':put "  FAILED: the router refused the remote logging action" } }',
+        f":if ([:len [/system logging action find name={action}]] > 0) do={{ "
+        ':put "  System logs: remote logging action added" }',
+        # PROV-FIX D6 (same line as the card script).
+        ":do { "
+        + deferred(
+            f"/system logging action set [find name={action}] add-topics-string=yes"
+        )
+        + " } on-error={}",
+    ]
+    lines.extend(
+        f":do {{ /system logging add {_args(row)} }} on-error={{ "
+        f':put "  FAILED: log rule {row.get("topics", "")}" }}'
+        for row in config.rule_rows()
+    )
+    lines += [
+        f"# Connection logs (IPFIX + NAT) to {t.flow_host}:{t.flow_port}, "
+        "RouterOS 7 only",
+        f":if {_NOT_V7} do={{ :put "
+        '"  SKIPPED connection logs: RouterOS 7 is needed (System > Packages > '
+        'Check For Updates)" }',
+        _v7_guarded(
+            f":if ([:len [/ip traffic-flow target find where {where}]] = 0) "
+            f"do={{ /ip traffic-flow target add {target} }}",
+            flow_fail,
+        ),
+        _v7_guarded(
+            f"/ip traffic-flow target set [find where {where}] {target}", flow_fail
+        ),
+        _v7_guarded(f"/ip traffic-flow ipfix set {_args(dict(base.ipfix))}", flow_fail),
+        _v7_guarded(
+            f"/ip traffic-flow ipfix set {_args(nat_only)}",
+            "WARNING: this RouterOS cannot send NAT events. "
+            "Upgrade RouterOS for exact translated ports.",
+        ),
+        _v7_guarded(f"/ip traffic-flow set {_args(dict(base.settings))}", flow_fail),
+        f':put ("  System log rules: " . [:len [/system logging find '
+        f'action={action}]] . " (expected {len(ROUTEROS_TOPICS)})")',
+        _v7_only(
+            ':put ("  Connection log targets: " . '
+            f"[:len [/ip traffic-flow target find where {where}]] . "
+            '" (expected 1)")'
+        ),
+        ':log info "wyfy: IP logs set up"',
+    ]
+    return lines

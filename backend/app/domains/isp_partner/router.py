@@ -460,8 +460,15 @@ async def create_router(
     payload: IspRouterCreateRequest,
     isp: IspContext = Depends(RequireIspPartner),
     service: IspPartnerService = Depends(get_isp_partner_service),
+    db: AsyncSession = Depends(get_db_session),
 ) -> dict:
-    data = await service.create_router(isp, isp_location_id, payload.model_dump())
+    data = await service.create_router(
+        isp, isp_location_id, payload.model_dump(exclude={"ip_logs"})
+    )
+    # DEFAULT-LOGS: the Add router IP-logs switch (no-op when not sent).
+    from .iplogs_default import record_add_router_choice
+
+    data = await record_add_router_choice(db, isp, data, payload.ip_logs)
     return ok(request, data, "Router registered")
 
 

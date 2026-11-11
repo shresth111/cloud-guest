@@ -18,6 +18,16 @@ flag is set.
 * ``POST /isp/routers/{isp_router_id}/ip-logs/disable`` -- intent off (records
   stop being stored); audited ``isp_ip_logs_disabled``.
 * ``GET  /isp/ip-logs/routers`` -- one status row per router in scope.
+* ``GET  /isp/ip-logs/features`` -- DEFAULT-LOGS probe: this build records
+  the Add router choice and folds IP logs into the setup script.
+
+DEFAULT-LOGS (2026-11-11): every status row also carries ``wanted`` (the
+ISP's recorded choice, ``iplogs_default``; ``null`` for a router added
+before the change) and ``switch_on`` (what the console's "IP logs: ON / OFF"
+switch shows). Enable / disable on a router WITHOUT a management connection
+no longer refuse with ``ISP_IPLOGS_NEEDS_LINK``: they record the choice, and
+the setup script picks it up on the next Generate. The script response adds
+``setup_lines``: the same IP-logs lines in the form the setup script embeds.
 
 Scope: a single router goes through ``IspScope.assert_router`` (foreign or
 out-of-confinement = 404); the list runs over ``isp.child_ids()``. Path ids
@@ -60,10 +70,16 @@ from .constants import ISP_PARTNER_EXECUTE, ISP_PARTNER_READ
 from .dependencies import IspContext, RequireIspPartner, isp_guards
 from .exceptions import _err
 from .http import ok
+from .iplogs_default import (
+    SOURCE_SWITCH,
+    ip_logs_wanted,
+    record_ip_logs_choice,
+)
 from .iplogs_script import (
     IpLogsTargets,
     render_disable_script,
     render_enable_script,
+    render_setup_lines,
     safe_identity,
 )
 from .scoping import IspScope
@@ -287,6 +303,7 @@ def _status_row(
     arrivals: dict[str, dict[uuid.UUID, Any]],
     now: datetime,
     names: dict[str, str | None],
+    wanted: bool | None = None,
 ) -> dict[str, Any]:
     collectors = _collectors()
     blocker = _blocker(router, peer, server)
@@ -338,6 +355,10 @@ def _status_row(
         "lagging_pipes": st.lagging_pipes(pipes) if overall == st.PARTIAL else [],
         "blocker": blocker,
         "set_up": syslog_on and flows_on,
+        # DEFAULT-LOGS: the recorded choice (None = router added before it),
+        # and the switch the console shows. A Master-written intent counts.
+        "wanted": wanted,
+        "switch_on": bool((syslog_on and flows_on) or wanted is True),
         "set_up_at": _iso(
             (intent_flows.updated_at if intent_flows else None)
             or (intent_syslog.updated_at if intent_syslog else None)
@@ -459,6 +480,7 @@ async def _detail(
         arrivals=arrivals,
         now=now,
         names=await _names(isp, router),
+        wanted=(await ip_logs_wanted(db, [router.id])).get(router.id),
     )
     extras = await _detail_extras(db, router, peer, now)
     row["warnings"] = st.warnings_for(
@@ -517,6 +539,7 @@ async def router_ip_logs_script(
         "blocker": blocker,
         "enable_script": None,
         "disable_script": None,
+        "setup_lines": None,
         "filename": None,
         "router_name_on_device": safe_identity(router.name, router.id),
         "tag": router_tag(router.id),
@@ -526,6 +549,7 @@ async def router_ip_logs_script(
         data.update(
             enable_script=render_enable_script(t),
             disable_script=render_disable_script(t),
+            setup_lines=render_setup_lines(t),
             filename=f"wyfy-ip-logs-{safe_identity(router.name, router.id)}.rsc",
         )
     return ok(request, data, "IP logs script")
@@ -593,11 +617,23 @@ async def _toggle(
     blocker = _blocker(router, peer, server)
     if on and blocker == "not_mikrotik":
         raise IspIpLogsNotSupportedError()
-    if on and blocker == "needs_link":
-        raise IspIpLogsNeedsLinkError()
-    targets = _targets(router, peer, server) if on else None
     actor = isp.user_id
-    before = await _set_intent(db, router, targets, on=on, actor=actor)
+    # DEFAULT-LOGS: the choice is recorded first, on every router. Without a
+    # management connection that is ALL that happens (the setup script picks
+    # it up on Generate); there are no intent rows to write yet.
+    await record_ip_logs_choice(
+        db,
+        isp_org_id=isp.isp_org_id,
+        router_id=router.id,
+        wanted=on,
+        actor=actor,
+        source=SOURCE_SWITCH,
+    )
+    if blocker == "needs_link":
+        before = {"syslog": False, "flows": False}
+    else:
+        targets = _targets(router, peer, server) if on else None
+        before = await _set_intent(db, router, targets, on=on, actor=actor)
     await audit.create_audit_log_entry(
         actor_user_id=isp.user_id,
         action=AUDIT_ENABLED if on else AUDIT_DISABLED,
@@ -609,6 +645,7 @@ async def _toggle(
             "isp_organization_id": str(isp.isp_org_id),
             "customer_organization_id": str(router.organization_id),
             "was": before,
+            "recorded_for_setup_script": blocker == "needs_link",
         },
         organization_id=isp.isp_org_id,
     )
@@ -677,6 +714,7 @@ async def ip_logs_routers(
     )
     ids = [r.id for r in routers]
     syslog, flows = await _intent(db, ids) if ids else ({}, {})
+    wanted = await ip_logs_wanted(db, ids)
     arrivals = await _arrivals(db, ids, now)
     peers = (
         {
@@ -732,6 +770,7 @@ async def ip_logs_routers(
                     "customer": org_names.get(r.organization_id),
                     "location": loc_names.get(r.location_id),
                 },
+                wanted=wanted.get(r.id),
             )
         )
     summary: dict[str, int] = {}
@@ -741,4 +780,20 @@ async def ip_logs_routers(
         request,
         {"items": items, "summary": summary, "collectors": _collectors()},
         "IP logs routers",
+    )
+
+
+@iplogs_router.get("/ip-logs/features", dependencies=_ON + isp_guards(ISP_PARTNER_READ))
+async def ip_logs_features(request: Request) -> dict:
+    """DEFAULT-LOGS probe. The console sends the Add router ``ip_logs`` field
+    and folds IP logs into the setup script only when this answers (404 while
+    the flag is off, and on a backend without this change)."""
+    return ok(
+        request,
+        {
+            "default_on_add_router": True,
+            "setup_script_lines": True,
+            "switch": True,
+        },
+        "IP logs features",
     )

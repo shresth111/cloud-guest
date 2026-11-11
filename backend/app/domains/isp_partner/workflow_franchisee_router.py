@@ -249,8 +249,12 @@ async def franchisee_add_router(
     scope = _franchisee(isp, db)
     location = await IspScope.assert_location(isp, site_ref)
     zone_id = await site_zone_for_franchisee(db, isp, scope, location, payload.zone_ref)
-    body = payload.model_dump(exclude={"zone_ref"})
+    body = payload.model_dump(exclude={"zone_ref", "ip_logs"})
     data = await service.create_router(isp, location.id, body)
+    # DEFAULT-LOGS: the Add router IP-logs switch (no-op when not sent).
+    from .iplogs_default import record_add_router_choice
+
+    data = await record_add_router_choice(db, isp, data, payload.ip_logs)
     db.add(
         IspRouterZone(
             isp_organization_id=isp.isp_org_id,

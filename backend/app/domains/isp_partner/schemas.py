@@ -161,6 +161,10 @@ class IspRouterCreateRequest(_Body):
     )
     model: str = Field(min_length=1, max_length=100)
     vendor: str = Field(default="mikrotik", max_length=50)
+    # DEFAULT-LOGS: the Add router "IP logs (recommended)" switch. None (not
+    # sent) = exactly as before. Only acted on while
+    # ISP_IPLOGS_SELFSERVE_ENABLED is on; see ``iplogs_default``.
+    ip_logs: bool | None = None
 
 
 class IspRouterUpdateRequest(_Body):
