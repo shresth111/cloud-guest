@@ -50,6 +50,7 @@ from .scoping import IspScope
 from .workflow_franchisee import FRANCHISEE_SLUG, current_franchisee_scope
 
 __all__ = [
+    "franchisee_routers_outside_zones",
     "franchisee_setup_access_router",
     "franchisee_setup_router",
     "is_franchisee",
@@ -87,6 +88,33 @@ async def franchisee_setup_router(isp: IspContext, isp_router_id: uuid.UUID) -> 
     router = await IspScope.assert_router(isp, isp_router_id)
     await assert_router_in_franchisee_zones(isp, router)
     return router
+
+
+async def franchisee_routers_outside_zones(
+    isp: IspContext, routers: list[Any]
+) -> set[uuid.UUID] | None:
+    """FR-IPLOGS-ZONE: ids of ``routers`` (already in the caller's scope) that
+    a franchisee may NOT change, by the same rule as
+    ``assert_router_in_franchisee_zones``. ``None`` for every other role, so
+    callers add nothing to their response. The rule depends only on the
+    router's location, so it is evaluated once per location."""
+    if not is_franchisee(isp):
+        return None
+    by_location: dict[Any, bool] = {}
+    out: set[uuid.UUID] = set()
+    for router in routers:
+        key = router.location_id
+        if key is None:
+            by_location[key] = False
+        elif key not in by_location:
+            try:
+                await assert_router_in_franchisee_zones(isp, router)
+                by_location[key] = True
+            except IspRouterNotFoundError:
+                by_location[key] = False
+        if not by_location[key]:
+            out.add(router.id)
+    return out
 
 
 franchisee_setup_access_router = APIRouter(tags=["ISP Partner: router setup"])

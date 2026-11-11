@@ -495,6 +495,13 @@ async def _detail(
         collector_flows_on=row["collectors"]["flows"],
     )
     row["clock_offset_seconds"] = extras["clock_offset_seconds"]
+    # FR-IPLOGS-ZONE: a franchisee sees whether it may flip the switch (only
+    # inside its zones); other roles get no new key.
+    from .workflow_franchisee_setup import franchisee_routers_outside_zones
+
+    outside = await franchisee_routers_outside_zones(isp, [router])
+    if outside is not None:
+        row["can_change"] = router.id not in outside
     row["blocker_hint"] = {
         "needs_link": "Paste the router's setup script first. IP logs travel over "
         "its management connection, and this router does not have one yet.",
@@ -617,6 +624,11 @@ async def _toggle(
     on: bool,
 ) -> dict:
     router = await IspScope.assert_router(isp, isp_router_id)
+    # FR-IPLOGS-ZONE: a franchisee changes IP logs only inside its zones
+    # (shared-site, other zone -> 404 ISP_ROUTER_NOT_FOUND, never 403).
+    from .workflow_franchisee_setup import assert_router_in_franchisee_zones
+
+    await assert_router_in_franchisee_zones(isp, router)
     peer, server = await _link(db, router.id)
     blocker = _blocker(router, peer, server)
     if on and blocker == "not_mikrotik":
@@ -777,6 +789,13 @@ async def ip_logs_routers(
                 wanted=wanted.get(r.id),
             )
         )
+    # FR-IPLOGS-ZONE: per-row switch permission for a franchisee only.
+    from .workflow_franchisee_setup import franchisee_routers_outside_zones
+
+    outside = await franchisee_routers_outside_zones(isp, routers)
+    if outside is not None:
+        for r, i in zip(routers, items, strict=True):
+            i["can_change"] = r.id not in outside
     summary: dict[str, int] = {}
     for i in items:
         summary[i["state"]] = summary.get(i["state"], 0) + 1
