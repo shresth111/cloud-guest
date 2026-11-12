@@ -290,6 +290,9 @@ class FakeRouterRepositoryForSnmp:
     async def get_by_mac_address(self, mac_address: str):
         return None
 
+    async def routers_holding_identity(self, **_kwargs: object) -> list:
+        return []
+
 
 class TestRouterServiceSnmpConfig:
     async def test_create_router_encrypts_snmp_community(self) -> None:
