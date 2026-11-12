@@ -89,9 +89,7 @@ def get_otp_service(
         # A venue's own verified WhatsApp/SMS account sends its guests'
         # login codes when it has one; otherwise (and on any failure) the
         # providers above do. See app.domains.guest_messaging.
-        org_dispatcher=build_org_otp_dispatcher(
-            db, redis, settings, audit_repository
-        ),
+        org_dispatcher=build_org_otp_dispatcher(db, redis, settings, audit_repository),
     )
 
 

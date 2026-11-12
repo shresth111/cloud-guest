@@ -123,6 +123,8 @@ async def put_login_provider(
         provider_type=body.provider_type,
         config=body.config,
         enabled=body.enabled,
+        # Refused for a venue (service): Master decides the fallback.
+        fallback_to_platform_default=body.fallback_to_platform_default,
     )
     if created:
         response.status_code = status.HTTP_201_CREATED
@@ -233,6 +235,7 @@ async def platform_put_login_provider(
         provider_type=body.provider_type,
         config=body.config,
         enabled=body.enabled,
+        fallback_to_platform_default=body.fallback_to_platform_default,
     )
     if created:
         response.status_code = status.HTTP_201_CREATED

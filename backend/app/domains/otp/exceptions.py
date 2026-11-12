@@ -45,6 +45,7 @@ __all__ = [
     "OtpPurposeNotAllowedError",
     "OtpVenueRequiredError",
     "OtpDailyCapReachedError",
+    "OtpVenueSendFailedError",
     "OtpError",
     "InvalidOtpIdentifierError",
     "OtpRequestRateLimitExceededError",
@@ -194,3 +195,24 @@ class OtpDailyCapReachedError(OtpError):
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             data={"code": "OTP_DAILY_CAP_REACHED", "scope": scope},
         )
+
+
+class OtpVenueSendFailedError(OtpError):
+    """The venue's own login-code provider failed, and the venue is set to
+    send ONLY through it (``fallback_to_platform_default`` off on its row,
+    ``app.domains.guest_messaging``). The code is not sent through Wyfy
+    Guest's default; the guest is asked to try again. ``vendor_error`` is the
+    provider's error code (never its raw text), for support."""
+
+    def __init__(self, *, provider_type: str, error_code: str) -> None:
+        super().__init__(
+            "We couldn't send your code. Please try again.",
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            data={
+                "code": "OTP_SEND_FAILED",
+                "provider_type": provider_type,
+                "vendor_error": error_code[:80],
+            },
+        )
+        self.provider_type = provider_type
+        self.error_code = error_code

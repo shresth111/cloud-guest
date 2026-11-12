@@ -93,12 +93,22 @@ class SendResult:
 
 class ProviderSendError(Exception):
     """A vendor refused or failed a send. ``auth`` marks a credential or
-    account error (HTTP 401/403, Meta 190, "invalid API key")."""
+    account error (HTTP 401/403, Meta 190, "invalid API key").
+    ``vendor_code`` is the vendor's own error code when it sent one (e.g.
+    TrustSignal ``114``/``INVALID_SENDERID``): safe to log, never a secret."""
 
-    def __init__(self, code: str, message: str, *, auth: bool = False) -> None:
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        auth: bool = False,
+        vendor_code: str | None = None,
+    ) -> None:
         self.code = code
         self.message = str(message)[:500]
         self.auth = auth
+        self.vendor_code = vendor_code[:60] if vendor_code else None
         super().__init__(f"{code}: {self.message}")
 
 

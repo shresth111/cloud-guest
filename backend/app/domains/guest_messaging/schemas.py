@@ -21,6 +21,9 @@ class LoginProviderPutRequest(_Strict):
     # the Custom HTTP adapter's ``headers`` list.
     config: dict[str, Any] = Field(default_factory=dict)
     enabled: bool | None = None
+    # Master only (the customer route refuses it). False = the venue's own
+    # account is the ONLY sender of its guest login codes; no Wyfy fallback.
+    fallback_to_platform_default: bool | None = None
 
 
 class VerifyStartRequest(_Strict):

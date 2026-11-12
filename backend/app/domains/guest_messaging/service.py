@@ -12,11 +12,17 @@ Resolution, per organization and channel (WhatsApp, SMS):
 Nobody has to do anything for the default: an organization with no row, or
 without the add-on, sends through Wyfy exactly as before.
 
-Login never breaks on a venue's vendor. :class:`OrgOtpDispatcher` is what
-``OtpService`` calls first; if the venue's provider raises, times out, or
-anything about resolving it fails (including the database), it records the
+By default login never breaks on a venue's vendor. :class:`OrgOtpDispatcher`
+is what ``OtpService`` calls first; if the venue's provider raises, times out,
+or anything about resolving it fails (including the database), it records the
 fallback (counter on the row, a throttled audit row) and returns ``False``,
 and ``OtpService`` sends the same code through the platform provider.
+
+``fallback_to_platform_default = false`` on the row (Master only) turns that
+off for one venue: its own account is then the ONLY sender. A failed or slow
+send raises ``OtpVenueSendFailedError`` (the guest is asked to try again), the
+breaker does not divert to Wyfy, and Wyfy Guest's own provider -- and its
+SMS credit -- is never used for that venue's guest login codes.
 
 Two callers manage rows through the same :class:`LoginMessagingService`:
 
@@ -49,6 +55,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from app.core.config import Settings
+from app.domains.otp.exceptions import OtpVenueSendFailedError
 from app.domains.rbac.enums import AuditAction
 
 from .adapters import REGISTRY
@@ -106,6 +113,13 @@ def normalize_phone(raw: str) -> str | None:
     return "+" + body
 
 
+def _fallback_on(row: Any) -> bool:
+    """Rows from before 0184 (and test doubles without the column) keep
+    #419's behaviour: the platform default backs the venue up."""
+    value = getattr(row, "fallback_to_platform_default", True)
+    return True if value is None else bool(value)
+
+
 def mask_phone(phone_e164: str) -> str:
     return phone_e164[:3] + "•" * max(len(phone_e164) - 7, 0) + phone_e164[-4:]
 
@@ -136,6 +150,7 @@ class ResolvedSender:
     provider_type: str
     adapter: Any
     config: dict[str, Any]
+    fallback_to_platform_default: bool = True
 
 
 def platform_default_label(settings: Settings, channel: str) -> tuple[bool, str]:
@@ -229,6 +244,7 @@ class LoginMessagingService:
             "last_error": row.last_error,
             "display": display,
             "configured_by_platform": bool(row.configured_by_platform),
+            "fallback_to_platform_default": _fallback_on(row),
             "set_up_by": "wyfy_team" if row.configured_by_platform else "venue",
             "fallback": {
                 "count": int(row.fallback_count or 0),
@@ -301,7 +317,15 @@ class LoginMessagingService:
         provider_type: str | None,
         config: dict[str, Any],
         enabled: bool | None,
+        fallback_to_platform_default: bool | None = None,
     ) -> tuple[dict[str, Any], bool]:
+        if fallback_to_platform_default is not None and not actor.via_platform:
+            # Whether Wyfy's own sender backs a venue up is the Wyfy team's
+            # call (it decides whose SMS credit a failed code may use).
+            raise ProviderConfigInvalidError(
+                "Only the Wyfy Guest team can change the fallback setting",
+                fields={"fallback_to_platform_default": "set from Master"},
+            )
         if actor.via_platform:
             await self._require_org(organization_id)
         elif not await self.byo_allowed(organization_id):
@@ -358,6 +382,8 @@ class LoginMessagingService:
             fields["enabled"] = enabled
         elif existing is None:
             fields["enabled"] = False
+        if fallback_to_platform_default is not None:
+            fields["fallback_to_platform_default"] = fallback_to_platform_default
         changed_fields: list[str] = []
         if changed:
             try:
@@ -404,6 +430,7 @@ class LoginMessagingService:
                 "provider_type": new_type,
                 "changed_fields": changed_fields,  # names only, never values
                 "enabled": bool(row.enabled),
+                "fallback_to_platform_default": _fallback_on(row),
             },
         )
         view = await self.provider_view(
@@ -658,8 +685,36 @@ class LoginMessagingService:
             return None
         if not await self.byo_allowed(org):
             return None
-        adapter, config = self._build(row)
-        return ResolvedSender(org, channel, row.id, row.provider_type, adapter, config)
+        strict = not _fallback_on(row)
+        try:
+            adapter, config = self._build(row)
+        except Exception as exc:
+            if not strict:
+                raise
+            # Undecryptable or retired provider on a venue that sends only
+            # through its own account: an error, not a Wyfy-paid send.
+            logger.warning(
+                "guest_login_byo_send_failed_no_fallback",
+                extra={
+                    "organization_id": str(org),
+                    "channel": channel,
+                    "provider_type": row.provider_type,
+                    "error_code": "provider_unavailable",
+                    "error_type": type(exc).__name__,
+                },
+            )
+            raise OtpVenueSendFailedError(
+                provider_type=row.provider_type, error_code="provider_unavailable"
+            ) from exc
+        return ResolvedSender(
+            org,
+            channel,
+            row.id,
+            row.provider_type,
+            adapter,
+            config,
+            fallback_to_platform_default=not strict,
+        )
 
     def _breaker_key(self, organization_id: uuid.UUID, channel: str) -> str:
         return f"guest_messaging:breaker:{organization_id}:{channel}"
@@ -677,18 +732,31 @@ class LoginMessagingService:
     async def record_fallback(
         self, sender: ResolvedSender, error: str, *, auth: bool = False
     ) -> None:
+        """A send on the venue's account failed. With the platform fallback on
+        (the default) the code then goes out through Wyfy's default; with it
+        off nothing else sends, so the breaker is not set (it only exists to
+        divert to Wyfy) and the row is never auto-disabled (that would quietly
+        move the venue's guests onto Wyfy's sender)."""
         now = self._now()
         detail = scrub(error, sender.config) or "error"
-        try:
-            await self.redis.set(
-                self._breaker_key(sender.organization_id, sender.channel),
-                "1",
-                ex=BREAKER_SECONDS,
-            )
-        except Exception:  # noqa: BLE001
-            logger.warning("guest_login_byo_breaker_set_failed", exc_info=True)
+        fell_back = sender.fallback_to_platform_default
+        if fell_back:
+            try:
+                await self.redis.set(
+                    self._breaker_key(sender.organization_id, sender.channel),
+                    "1",
+                    ex=BREAKER_SECONDS,
+                )
+            except Exception:  # noqa: BLE001
+                logger.warning("guest_login_byo_breaker_set_failed", exc_info=True)
         await self.repository.record_fallback(sender.provider_id, at=now, error=detail)
-        if auth:
+        if auth and not fell_back:
+            row = await self.repository.get_provider(
+                sender.organization_id, sender.channel
+            )
+            if row is not None and row.id == sender.provider_id:
+                await self.repository.update_provider(row, {"last_error": detail})
+        elif auth:
             # Wrong or revoked credentials will not fix themselves: stop
             # trying until someone re-verifies, and say so on the card.
             row = await self.repository.get_provider(
@@ -717,11 +785,15 @@ class LoginMessagingService:
                 description=(
                     f"A guest login code could not go through the venue's own "
                     f"{sender.channel} provider and was sent by Wyfy Guest's default"
+                    if fell_back
+                    else f"A guest login code could not go through the venue's own "
+                    f"{sender.channel} provider; it was NOT sent (no fallback)"
                 ),
                 event_metadata={
                     "channel": sender.channel,
                     "provider_type": sender.provider_type,
                     "error": detail,
+                    "fell_back_to_platform": fell_back,
                     "throttled_for_seconds": FALLBACK_AUDIT_EVERY_SECONDS,
                 },
             )
@@ -755,13 +827,27 @@ class LoginMessagingService:
 
 
 class OrgOtpDispatcher:
-    """What ``OtpService`` calls before its platform provider. Never raises:
-    ``True`` = the venue's own provider accepted the code; ``False`` = use the
-    platform default (no own provider, or it failed -- recorded)."""
+    """What ``OtpService`` calls before its platform provider. ``True`` = the
+    venue's own provider accepted the code; ``False`` = use the platform
+    default (no own provider, or it failed -- recorded). Raises only
+    ``OtpVenueSendFailedError``, and only for a venue whose row has the
+    platform fallback off: then nothing but the venue's own account sends."""
 
-    def __init__(self, service: LoginMessagingService, session: Any | None) -> None:
+    def __init__(
+        self,
+        service: LoginMessagingService,
+        session: Any | None,
+        *,
+        durable_recorder: Callable[[ResolvedSender, str, bool], Awaitable[None]]
+        | None = None,
+    ) -> None:
         self.service = service
         self.session = session
+        # A no-fallback failure ends the request with an error, which rolls
+        # the request's own transaction back -- and with it a failure
+        # recorded there. This records it in a transaction of its own, so
+        # the Master card and the audit log still show it.
+        self.durable_recorder = durable_recorder
 
     def _savepoint(self):  # noqa: ANN202
         if self.session is None:
@@ -789,12 +875,21 @@ class OrgOtpDispatcher:
                     location_id=location_id,
                     channel=channel,
                 )
+        except OtpVenueSendFailedError:
+            raise
         except Exception:  # noqa: BLE001 - resolving must never fail a login
             logger.warning("guest_login_byo_resolve_failed", exc_info=True)
             return False
         if sender is None:
             return False
-        if await self.service.breaker_open(sender.organization_id, channel):
+        strict = not sender.fallback_to_platform_default
+        # The breaker only diverts to Wyfy's default. A venue that sends
+        # only through its own account always tries it: there is nothing
+        # else to send through, and one blip must not block every guest
+        # for the breaker's two minutes.
+        if not strict and await self.service.breaker_open(
+            sender.organization_id, channel
+        ):
             return False
         e164 = normalize_phone(phone) or phone
         try:
@@ -805,26 +900,43 @@ class OrgOtpDispatcher:
         except Exception as exc:  # noqa: BLE001 - any failure falls back
             if isinstance(exc, ProviderSendError):
                 error = f"{exc.code}: {exc.message}"
+                error_code = exc.code
+                vendor_code = exc.vendor_code
             elif isinstance(exc, TimeoutError):
                 error = "provider_timeout: no answer in time"
+                error_code, vendor_code = "provider_timeout", None
             else:
                 error = f"provider_error: {type(exc).__name__}"
+                error_code, vendor_code = "provider_error", None
             logger.warning(
-                "guest_login_byo_send_failed_falling_back",
+                "guest_login_byo_send_failed_no_fallback"
+                if strict
+                else "guest_login_byo_send_failed_falling_back",
                 extra={
                     "organization_id": str(sender.organization_id),
                     "channel": channel,
                     "provider_type": sender.provider_type,
-                    "error_code": getattr(exc, "code", type(exc).__name__),
+                    "error_code": error_code,
+                    "vendor_error_code": vendor_code,
+                    "fell_back_to_platform": not strict,
                 },
             )
+            auth = bool(getattr(exc, "auth", False))
             try:
-                async with self._savepoint():
-                    await self.service.record_fallback(
-                        sender, error, auth=bool(getattr(exc, "auth", False))
-                    )
+                if strict and self.durable_recorder is not None:
+                    await self.durable_recorder(sender, error, auth)
+                else:
+                    async with self._savepoint():
+                        await self.service.record_fallback(sender, error, auth=auth)
             except Exception:  # noqa: BLE001
                 logger.warning("guest_login_byo_fallback_record_failed", exc_info=True)
+            if strict:
+                raise OtpVenueSendFailedError(
+                    provider_type=sender.provider_type,
+                    error_code=f"{error_code}:{vendor_code}"
+                    if vendor_code
+                    else error_code,
+                ) from exc
             return False
         logger.info(
             "guest_login_byo_sent",

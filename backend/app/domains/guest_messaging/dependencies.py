@@ -63,10 +63,29 @@ def build_org_otp_dispatcher(
 ) -> OrgOtpDispatcher | None:
     """For ``OtpService``. Building it must not fail a login either: on any
     error there is simply no dispatcher and the platform default sends."""
+
+    async def record_in_own_transaction(sender, error: str, auth: bool) -> None:  # noqa: ANN001
+        # A no-fallback failure fails the request (its transaction rolls
+        # back), so the counter, last error and audit row are written in a
+        # short transaction of their own.
+        from app.database.session import SessionLocal
+        from app.domains.rbac.repository import RBACRepository
+
+        async with SessionLocal() as own:
+            recorder = LoginMessagingService(
+                LoginProviderRepository(own),
+                settings=settings,
+                redis=redis,
+                audit_writer=RBACRepository(own),
+            )
+            await recorder.record_fallback(sender, error, auth=auth)
+            await own.commit()
+
     try:
         return OrgOtpDispatcher(
             build_login_messaging_service(session, redis, settings, audit_writer),
             session,
+            durable_recorder=record_in_own_transaction,
         )
     except Exception:  # noqa: BLE001
         logger.warning("guest_login_byo_dispatcher_unavailable", exc_info=True)

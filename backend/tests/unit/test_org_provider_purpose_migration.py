@@ -1,5 +1,5 @@
-"""Migration 0167: ``org_marketing_providers`` gains ``purpose`` (+ the
-fallback/Master columns) and its unique index moves to
+"""Migration 0184 (first written as 0167 in PR #419): ``org_marketing_providers``
+gains ``purpose`` (+ the fallback/Master columns) and its unique index moves to
 (organization, purpose, channel).
 
 Two layers:
@@ -8,7 +8,7 @@ Two layers:
   operations the model declares (captured through a fake ``op``);
 * against a real Postgres (gated on ``CLOUDGUEST_TEST_POSTGRES_URL``, like
   ``test_marketing_credits_postgres.py``) -- in a throwaway schema, 0135's
-  table is built, 0167 upgrade runs, a marketing and an otp row coexist for
+  table is built, 0184 upgrade runs, a marketing and an otp row coexist for
   the same channel, the new index refuses a second otp row, and downgrade
   refuses while otp rows exist and then restores the old shape.
 """
@@ -26,7 +26,7 @@ import pytest
 from app.domains.marketing.models import OrgMarketingProvider
 
 VERSIONS = pathlib.Path(__file__).resolve().parents[2] / "alembic" / "versions"
-FILE = "0167_org_provider_purpose.py"
+FILE = "0184_org_provider_purpose.py"
 
 
 def _load(filename: str) -> Any:
@@ -67,10 +67,8 @@ class _Op:
 class TestOffline:
     def test_chains_on_mains_head(self) -> None:
         module = _load(FILE)
-        assert module.revision == "0167_org_provider_purpose"
-        assert module.down_revision == (
-            "0166_add_review_prompt_columns_to_guest_sessions"
-        )
+        assert module.revision == "0184_org_provider_purpose"
+        assert module.down_revision == "0183_retire_deleted_router_identity"
         assert len(module.revision) <= 32
 
     def test_is_the_only_head(self) -> None:
@@ -79,7 +77,7 @@ class TestOffline:
             for p in VERSIONS.glob("0*.py")
             if p.name != FILE
         }
-        assert "0167_org_provider_purpose" not in downs
+        assert "0184_org_provider_purpose" not in downs
 
     def test_upgrade_adds_what_the_model_declares(self, monkeypatch) -> None:
         module = _load(FILE)
@@ -93,6 +91,7 @@ class TestOffline:
             "fallback_count",
             "last_fallback_at",
             "last_fallback_error",
+            "fallback_to_platform_default",
         }
         declared = {c.name for c in OrgMarketingProvider.__table__.columns}
         assert added <= declared
@@ -102,11 +101,23 @@ class TestOffline:
         )  # fmt: skip
         assert purpose.nullable is False
         assert purpose.server_default.arg == "marketing"
+        fallback = next(
+            args[1] for name, args, _ in op.calls
+            if name == "add_column" and args[1].name == "fallback_to_platform_default"
+        )  # fmt: skip
+        # Every existing and future row keeps #419's behaviour unless Master
+        # turns it off for one venue.
+        assert fallback.nullable is False
+        assert str(fallback.server_default.arg).lower() == "true"
         drop = ("drop_index", ("uq_omp_org_channel",), {"table_name": module.TABLE})
         assert drop in op.calls
         created = [a for n, a, k in op.calls if n == "create_index"]
         assert created == [
-            ("uq_omp_org_purpose_channel", module.TABLE, ["organization_id", "purpose", "channel"])  # noqa: E501
+            (
+                "uq_omp_org_purpose_channel",
+                module.TABLE,
+                ["organization_id", "purpose", "channel"],
+            )  # noqa: E501
         ]
         index = next(
             i for i in OrgMarketingProvider.__table__.indexes
@@ -124,7 +135,7 @@ class TestOffline:
         monkeypatch.setattr(module, "op", op)
         module.downgrade()
         dropped = {a[1] for n, a, _ in op.calls if n == "drop_column"}
-        assert "purpose" in dropped and len(dropped) == 5
+        assert "purpose" in dropped and len(dropped) == 6
         assert ("uq_omp_org_channel", module.TABLE, ["organization_id", "channel"]) in [
             a for n, a, _ in op.calls if n == "create_index"
         ]
@@ -155,7 +166,7 @@ def test_upgrade_and_downgrade_on_postgres() -> None:
     except Exception:  # noqa: BLE001
         engine = sa.create_engine(_PG_URL.replace("+asyncpg", "+psycopg"))
     schema = f"t_{uuid.uuid4().hex[:10]}"
-    m0135, m0167 = _load("0135_create_org_marketing_providers.py"), _load(FILE)
+    m0135, m0184 = _load("0135_create_org_marketing_providers.py"), _load(FILE)
     with engine.begin() as conn:
         conn.execute(sa.text(f"CREATE SCHEMA {schema}"))
     try:
@@ -182,8 +193,8 @@ def test_upgrade_and_downgrade_on_postgres() -> None:
                 "{cols}) VALUES (:o, 'sms', 'ping4sms', 'x', '{{}}'{vals})"
             )
             conn.execute(sa.text(insert.text.format(cols="", vals="")), {"o": org})
-            m0167.op = ops
-            m0167.upgrade()
+            m0184.op = ops
+            m0184.upgrade()
             purpose = conn.execute(
                 sa.text("SELECT purpose FROM org_marketing_providers")
             ).scalar()
@@ -195,16 +206,16 @@ def test_upgrade_and_downgrade_on_postgres() -> None:
             conn.execute(otp, {"o": org})
         with engine.begin() as conn:
             conn.execute(sa.text(f"SET search_path TO {schema}"))
-            m0167.op = Operations(MigrationContext.configure(conn))
+            m0184.op = Operations(MigrationContext.configure(conn))
             with pytest.raises(RuntimeError):
-                m0167.downgrade()
+                m0184.downgrade()
         with engine.begin() as conn:
             conn.execute(sa.text(f"SET search_path TO {schema}"))
             conn.execute(
                 sa.text("DELETE FROM org_marketing_providers WHERE purpose = 'otp'")
             )
-            m0167.op = Operations(MigrationContext.configure(conn))
-            m0167.downgrade()
+            m0184.op = Operations(MigrationContext.configure(conn))
+            m0184.downgrade()
             columns = {
                 r[0]
                 for r in conn.execute(

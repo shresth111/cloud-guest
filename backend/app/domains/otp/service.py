@@ -152,6 +152,7 @@ from .exceptions import (
     OtpExpiredError,
     OtpNotFoundError,
     OtpRequestRateLimitExceededError,
+    OtpVenueSendFailedError,
 )
 from .models import OtpRequest
 from .repository import OtpRepositoryProtocol
@@ -270,7 +271,9 @@ class WhatsAppProviderProtocol(Protocol):
 class OrgOtpDispatcherProtocol(Protocol):
     """``app.domains.guest_messaging.service.OrgOtpDispatcher``: sends a guest
     login code through the venue's own provider when it has a verified one.
-    Returns False (never raises) when the platform provider must send."""
+    Returns False when the platform provider must send. The one exception
+    it raises is ``OtpVenueSendFailedError``: the venue's provider failed
+    and the venue sends only through it (no platform fallback)."""
 
     async def try_send(
         self,
@@ -590,8 +593,7 @@ class SmtpIdentity:
             )
         if not self.from_address:
             raise MailIdentityMismatchError(
-                f"{self.label}: no From address and no username to derive "
-                "one from."
+                f"{self.label}: no From address and no username to derive " "one from."
             )
 
     @classmethod
@@ -918,9 +920,7 @@ class TwilioSmsProvider:
     ``app.domains.monitoring.service``'s Slack/Teams/Discord notifiers
     already set."""
 
-    _API_URL_TEMPLATE = (
-        "https://api.twilio.com/2010-04-01/Accounts/{sid}/Messages.json"
-    )
+    _API_URL_TEMPLATE = "https://api.twilio.com/2010-04-01/Accounts/{sid}/Messages.json"
     _TIMEOUT_SECONDS = 10.0
 
     def __init__(self, *, account_sid: str, auth_token: str, from_number: str) -> None:
@@ -971,9 +971,7 @@ class TwilioWhatsAppProvider:
     honest error if ``whatsapp_twilio_content_sid`` is left unset rather
     than silently attempting (and failing) a freeform send."""
 
-    _API_URL_TEMPLATE = (
-        "https://api.twilio.com/2010-04-01/Accounts/{sid}/Messages.json"
-    )
+    _API_URL_TEMPLATE = "https://api.twilio.com/2010-04-01/Accounts/{sid}/Messages.json"
     _TIMEOUT_SECONDS = 10.0
 
     def __init__(
@@ -1175,9 +1173,7 @@ class Ping4SmsProvider:
             # the OTP text. The exception reaches the app's unhandled-error
             # handler, which logs it with its traceback.
             if response.is_error:
-                raise RuntimeError(
-                    f"ping4sms send failed: HTTP {response.status_code}"
-                )
+                raise RuntimeError(f"ping4sms send failed: HTTP {response.status_code}")
             body = response.text.strip()
             if body.isdigit():
                 code = int(body)
@@ -1675,9 +1671,7 @@ class OtpService:
                 ),
             )
         else:
-            email_html = _render_otp_email(
-                intro=intro, code=code, minutes=minutes
-            )
+            email_html = _render_otp_email(intro=intro, code=code, minutes=minutes)
             await self._send_recorded(
                 otp_request,
                 self.email_provider,
@@ -1721,6 +1715,7 @@ class OtpService:
             )
             otp_request.provider_name = name
             otp_request.provider_response_ms = _elapsed_ms(started)
+
     async def _send_through_venue(
         self,
         otp_request: OtpRequest,
@@ -1734,8 +1729,9 @@ class OtpService:
         masking) always use the platform's own sender."""
         if self.org_dispatcher is None or purpose != OtpPurpose.GUEST_LOGIN:
             return False
+        started = time.perf_counter()
         try:
-            return await self.org_dispatcher.try_send(
+            sent = await self.org_dispatcher.try_send(
                 organization_id=otp_request.organization_id,
                 location_id=otp_request.location_id,
                 channel=channel.value,
@@ -1743,6 +1739,18 @@ class OtpService:
                 code=code,
                 message=message,
             )
+            if sent:
+                # Same columns ``_send_recorded`` fills for the platform
+                # sender, so the request row says which account sent it.
+                otp_request.provider_outcome = OTP_PROVIDER_ACCEPTED
+                otp_request.provider_name = "venue_own_provider"
+                otp_request.provider_response_ms = _elapsed_ms(started)
+            return sent
+        except OtpVenueSendFailedError:
+            # The venue sends ONLY through its own account (Master turned
+            # the platform fallback off): its failure is the guest's error,
+            # never a send on Wyfy Guest's own provider.
+            raise
         except Exception:  # noqa: BLE001 - belt and braces: never fail a login
             logger.warning("otp_venue_provider_dispatch_failed", exc_info=True)
             return False

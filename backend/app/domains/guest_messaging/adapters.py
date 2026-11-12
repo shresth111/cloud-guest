@@ -70,8 +70,16 @@ def _client(ctx: AdapterContext) -> httpx.AsyncClient:
 
 
 async def _send(
-    client: httpx.AsyncClient, provider: str, method: str, url: str, **kwargs: Any
+    client: httpx.AsyncClient,
+    provider: str,
+    method: str,
+    url: str,
+    *,
+    vendor_errors: bool = False,
+    **kwargs: Any,
 ) -> httpx.Response:
+    """``vendor_errors=True`` hands 4xx/5xx back to the adapter, for vendors
+    whose error body carries their own error code (TrustSignal)."""
     try:
         async with client:
             response = await client.request(method, url, **kwargs)
@@ -87,6 +95,8 @@ async def _send(
         raise ProviderSendError(
             "redirect_refused", f"{provider} answered a redirect; not followed"
         )
+    if vendor_errors:
+        return response
     if response.status_code in (401, 403):
         raise ProviderSendError(
             "provider_auth_failed",
@@ -705,6 +715,308 @@ class Msg91OtpAdapter:
                 auth="auth" in message_text.lower(),
             )
         return SendResult(self.provider, str(body.get("message") or "") or None)
+
+
+# -- TrustSignal ---------------------------------------------------------------
+
+# GSM 03.38: the basic set (1 septet) and its extension table (2 septets).
+_GSM7_BASIC = set(
+    "@£$¥èéùìòÇ\nØø\rÅåΔ_ΦΓΛΩΠΨΣΘΞÆæßÉ !\"#¤%&'()*+,-./0123456789:;<=>?"
+    "¡ABCDEFGHIJKLMNOPQRSTUVWXYZÄÖÑÜ§¿abcdefghijklmnopqrstuvwxyzäöñüà"
+)
+_GSM7_EXTENDED = set("^{}\\[~]|€")
+# Three concatenated GSM-7 parts (153 septets each). A login code that needs
+# more than that is a template problem, not something to send.
+SMS_MAX_SEPTETS = 3 * 153
+_DLT_VAR = re.compile(r"\{#var\d*#\}", re.IGNORECASE)
+
+
+def gsm7_septets(text: str) -> int | None:
+    """Septets ``text`` takes in GSM-7, or ``None`` when it needs Unicode."""
+    total = 0
+    for char in text:
+        if char in _GSM7_BASIC:
+            total += 1
+        elif char in _GSM7_EXTENDED:
+            total += 2
+        else:
+            return None
+    return total
+
+
+def _validate_dlt_sms_template(config: dict[str, Any]) -> dict[str, str]:
+    """The approved text must hold exactly one code slot (a second
+    ``{#var#}`` would go out literally and fail the DLT scrubber), be plain
+    GSM-7 (TrustSignal's send call has no Unicode switch), and fit in three
+    SMS parts with a code in it."""
+    template = config.get("message_template") or ""
+    slots = len(_CODE_SLOT.findall(template))
+    if slots != 1:
+        return {
+            "message_template": "must contain exactly one {#var#} (or {otp}) "
+            "where the code goes"
+            if slots
+            else "must contain {#var#} (or {otp}) where the code goes"
+        }
+    septets = gsm7_septets(render_sms(template, "0" * 8))
+    if septets is None:
+        bad = sorted({c for c in template if c not in _GSM7_BASIC | _GSM7_EXTENDED})
+        return {
+            "message_template": "use plain text only; these characters need "
+            "Unicode: " + " ".join(repr(c) for c in bad[:5])
+        }
+    if septets > SMS_MAX_SEPTETS:
+        return {"message_template": "too long for an SMS (over 3 parts)"}
+    return {}
+
+
+def _normalize_template_text(text: str) -> str:
+    text = _DLT_VAR.sub("{#var#}", text or "")
+    text = re.sub(r"\{otp\}", "{#var#}", text, flags=re.IGNORECASE)
+    return " ".join(text.split())
+
+
+class TrustSignalOtpAdapter:
+    """TrustSignal SMS: ``POST https://sms.trustsignal.io/v1/sms?api_key=``
+    with JSON ``{sender_id, to: [<10-digit int>], route, message,
+    template_id}``; numbers outside India go to ``/v1/sms/countrycode`` with
+    ``to: ["+<E.164>"]``. Success is HTTP 200 ``{"success": true, "results":
+    [{"phone", "transaction_id", "sms_cost"}]}``; failure is ``{"success":
+    false, "errors": [{"code": "114", "codeMsg": "INVALID_SENDERID",
+    "message": ...}]}`` (HTTP 400). There is no PE/entity id or Unicode field
+    on the send call: the entity id is registered with the sender on
+    TrustSignal's side, and ``template_id`` names a template registered
+    there. ``preflight`` (before the first test code) checks that template
+    via ``GET /v1/api/templates`` and the route's balance via
+    ``GET /v1/accounts/credits``.
+
+    Docs: https://postman.trustsignal.io/ (SMS > Send SMS > Send SMS (POST),
+    SMS with Country Code, Templates > Fetch All Template, Credits)
+    """
+
+    provider = "trustsignal"
+    BASE = "https://sms.trustsignal.io"
+    URL = BASE + "/v1/sms"
+    URL_COUNTRY_CODE = BASE + "/v1/sms/countrycode"
+    AUTH_CODES = {"101"}  # API_KEY_MISSING; 401/403 are auth too
+    TEMPLATE_PAGES = 4
+    TEMPLATE_PAGE_SIZE = 50
+
+    def __init__(self, config: dict[str, Any], ctx: AdapterContext) -> None:
+        self.config = config
+        self.ctx = ctx
+
+    # -- errors --------------------------------------------------------------
+
+    @classmethod
+    def error(cls, response: httpx.Response, body: Any) -> ProviderSendError:
+        first: dict[str, Any] = {}
+        if isinstance(body, dict):
+            errors = body.get("errors")
+            if isinstance(errors, list) and errors and isinstance(errors[0], dict):
+                first = errors[0]
+        code = str(first.get("code") or "").strip()[:20]
+        name = str(first.get("codeMsg") or "").strip()[:40]
+        text = str(
+            first.get("message")
+            or (body.get("message") if isinstance(body, dict) else "")
+            or _text(response)[:200]
+        )[:200]
+        vendor = "/".join(p for p in (code, name) if p) or (
+            f"http_{response.status_code}"
+        )
+        upper = name.upper()
+        auth = (
+            response.status_code in (401, 403)
+            or code in cls.AUTH_CODES
+            or "API_KEY" in upper
+            or "UNAUTHORI" in upper
+        )
+        if auth:
+            kind = "provider_auth_failed"
+        elif "TEMPLATE" in upper:
+            kind = "template_rejected"
+        elif "SENDER" in upper:
+            kind = "sender_rejected"
+        else:
+            kind = "provider_rejected"
+        return ProviderSendError(
+            kind,
+            f"trustsignal {vendor} (HTTP {response.status_code}): {text}",
+            auth=auth,
+            vendor_code=vendor,
+        )
+
+    async def _get(self, path: str, params: dict[str, Any]) -> Any:
+        response = await _send(
+            _client(self.ctx),
+            self.provider,
+            "GET",
+            self.BASE + path,
+            vendor_errors=True,
+            params={"api_key": self.config["api_key"], **params},
+        )
+        body = _json(response)
+        if response.status_code != 200 or not (
+            isinstance(body, dict) and body.get("success") is True
+        ):
+            raise self.error(response, body)
+        return body
+
+    # -- send ----------------------------------------------------------------
+
+    def render(self, code: str) -> str:
+        if not code.isdigit() or len(code) > 30:  # a DLT variable is <= 30
+            raise ProviderSendError("invalid_code", "the code must be digits")
+        text = render_sms(self.config["message_template"], code)
+        septets = gsm7_septets(text)
+        if septets is None or septets > SMS_MAX_SEPTETS:
+            raise ProviderSendError(
+                "message_invalid", "the message is not plain text or is too long"
+            )
+        return text
+
+    async def send_otp(self, message: OtpMessage) -> SendResult:
+        cfg = self.config
+        digits = message.phone_digits
+        if len(digits) == 12 and digits.startswith("91"):
+            url, to = self.URL, [int(digits[2:])]
+        else:
+            url, to = self.URL_COUNTRY_CODE, ["+" + digits]
+        payload = {
+            "sender_id": cfg["sender_id"],
+            "to": to,
+            "route": cfg.get("route") or "otp",
+            "message": self.render(message.code),
+            "template_id": cfg["template_id"],
+        }
+        response = await _send(
+            _client(self.ctx),
+            self.provider,
+            "POST",
+            url,
+            vendor_errors=True,
+            params={"api_key": cfg["api_key"]},
+            json=payload,
+        )
+        body = _json(response)
+        if (
+            response.status_code == 200
+            and isinstance(body, dict)
+            and body.get("success") is True
+        ):
+            results = body.get("results")
+            first = (
+                results[0]
+                if isinstance(results, list)
+                and results
+                and isinstance(results[0], dict)
+                else {}
+            )
+            transaction = first.get("transaction_id")
+            return SendResult(self.provider, str(transaction) if transaction else None)
+        raise self.error(response, body)
+
+    # -- verify --------------------------------------------------------------
+
+    async def preflight(self) -> list[str]:
+        """Before the first test code: the template is approved on TrustSignal
+        for this sender with the same text, and the route has credit. A
+        lookup TrustSignal answers with anything but its documented shape is
+        reported and skipped (the test code is the real check); a credential
+        error or a definite mismatch stops verification."""
+        cfg = self.config
+        details: list[str] = []
+        template_id = cfg["template_id"]
+        match: dict[str, Any] | None = None
+        scanned = total = 0
+        try:
+            for page in range(1, self.TEMPLATE_PAGES + 1):
+                body = await self._get(
+                    "/v1/api/templates",
+                    {
+                        "limit": self.TEMPLATE_PAGE_SIZE,
+                        "page": page,
+                        "status": "approved",
+                    },
+                )
+                rows = [t for t in body.get("templates") or [] if isinstance(t, dict)]
+                total = int(body.get("totalrecords") or 0)
+                scanned += len(rows)
+                match = next(
+                    (
+                        t
+                        for t in rows
+                        if template_id
+                        in (str(t.get("id") or ""), str(t.get("dlt_entity_id") or ""))
+                    ),
+                    None,
+                )
+                if match is not None or scanned >= total or not rows:
+                    break
+        except ProviderSendError as exc:
+            if exc.auth:
+                raise
+            details.append(
+                "Could not list templates on TrustSignal "
+                f"({exc.vendor_code or exc.code}); the test code will show "
+                "whether the template works"
+            )
+        else:
+            if match is None and scanned >= total:
+                raise ProviderSendError(
+                    "template_not_found",
+                    f"No approved TrustSignal template has id {template_id}",
+                )
+            if match is None:
+                details.append(
+                    f"Template {template_id} not in the first {scanned} approved "
+                    "templates; not checked"
+                )
+            else:
+                headers = [str(h) for h in match.get("headers") or []]
+                if headers and cfg["sender_id"] not in headers:
+                    raise ProviderSendError(
+                        "template_sender_mismatch",
+                        f"Template {template_id} is not linked to sender "
+                        f"{cfg['sender_id']} on TrustSignal (it is: "
+                        f"{', '.join(headers[:5])})",
+                    )
+                content = str(match.get("content") or "")
+                if content and _normalize_template_text(
+                    content
+                ) != _normalize_template_text(cfg["message_template"]):
+                    raise ProviderSendError(
+                        "template_text_mismatch",
+                        "The approved message text does not match the template "
+                        f"on TrustSignal: {content[:300]}",
+                    )
+                details.append(
+                    f"Template {template_id} is approved on TrustSignal"
+                    + (f" for {cfg['sender_id']}" if headers else "")
+                    + (" with the same text" if content else "")
+                )
+        route = cfg.get("route") or "otp"
+        try:
+            body = await self._get("/v1/accounts/credits", {})
+        except ProviderSendError as exc:
+            if exc.auth:
+                raise
+            details.append(
+                "Could not read the TrustSignal balance "
+                f"({exc.vendor_code or exc.code})"
+            )
+        else:
+            credits = (body.get("credits") or {}).get(route)
+            remaining = credits.get("remaining") if isinstance(credits, dict) else None
+            if isinstance(remaining, int | float):
+                if remaining <= 0:
+                    raise ProviderSendError(
+                        "no_credits",
+                        f"The TrustSignal account has no '{route}' route credits left",
+                    )
+                details.append(f"{remaining:g} '{route}' route credits left")
+        return details
 
 
 class ExotelOtpAdapter:
@@ -1453,6 +1765,43 @@ REGISTRY.register(
 )
 REGISTRY.register(
     AdapterSpec(
+        key="trustsignal",
+        channel="sms",
+        display_name="TrustSignal",
+        docs_url="https://postman.trustsignal.io/",
+        fields=(
+            FieldSpec("api_key", "API key", kind=KIND_SECRET),
+            SENDER,
+            FieldSpec(
+                "route",
+                "Route",
+                default="otp",
+                options=("otp", "transactional"),
+                kind=KIND_SELECT,
+                help="The TrustSignal route your credits are on (otp or "
+                "transactional). Verify shows the balance.",
+            ),
+            FieldSpec(
+                "template_id",
+                "Template id",
+                pattern=r"[A-Za-z0-9_-]{1,64}",
+                pattern_message="letters, digits, - and _",
+                help="The id of this template on TrustSignal; for a DLT "
+                "template this is normally the DLT template id (1407...).",
+            ),
+            DLT_ENTITY,
+            MESSAGE_TEMPLATE,
+        ),
+        factory=TrustSignalOtpAdapter,
+        validate=_validate_dlt_sms_template,
+        sender_field="sender_id",
+        notes="Sends only on the venue's TrustSignal account. Verify checks "
+        "the template, the sender and the route's balance on TrustSignal "
+        "before the test code.",
+    )
+)
+REGISTRY.register(
+    AdapterSpec(
         key="exotel",
         channel="sms",
         display_name="Exotel",
@@ -1710,7 +2059,9 @@ __all__ = [
     "REGISTRY",
     "CustomHttpOtpAdapter",
     "MetaCloudOtpAdapter",
+    "TrustSignalOtpAdapter",
     "build_adapter",
+    "gsm7_septets",
     "json_path_get",
     "meta_auth_template_payload",
     "parse_json_path",
