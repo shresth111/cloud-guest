@@ -430,11 +430,42 @@ class OrgMarketingProvider(BaseModel):
     updated_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), nullable=True
     )
+    # What this account sends (migration 0167): ``marketing`` -- campaigns
+    # (this domain) -- or ``otp`` -- guest login codes
+    # (``app.domains.guest_messaging``). The two never share a row: a venue
+    # may run campaigns through one vendor and login codes through another,
+    # and each path reads only its own purpose.
+    purpose: Mapped[str] = mapped_column(
+        String(16), default="marketing", server_default="marketing", nullable=False
+    )
+    # Set when the Wyfy team configured the row from the Master console on
+    # the venue's behalf (the customer card says "Set up by Wyfy Guest team").
+    configured_by_platform: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="false", nullable=False
+    )
+    # OTP rows only: sends that failed on the venue's account (and went out
+    # through the platform default, unless fallback_to_platform_default is
+    # off). Surfaced as the dashboard's fallback warning.
+    fallback_count: Mapped[int] = mapped_column(
+        Integer, default=0, server_default="0", nullable=False
+    )
+    last_fallback_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    last_fallback_error: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    # OTP rows only (migration 0184). False = this account is the ONLY sender
+    # for the venue's guest login codes: a failed or slow send is an error to
+    # the guest and is never retried through Wyfy Guest's own (paid) default.
+    # Only the Wyfy team changes it, from the Master console.
+    fallback_to_platform_default: Mapped[bool] = mapped_column(
+        Boolean, default=True, server_default="true", nullable=False
+    )
 
     __table_args__ = (
         Index(
-            "uq_omp_org_channel",
+            "uq_omp_org_purpose_channel",
             "organization_id",
+            "purpose",
             "channel",
             unique=True,
             postgresql_where=text("deleted_at IS NULL"),

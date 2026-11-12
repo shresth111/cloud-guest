@@ -57,7 +57,10 @@ def get_otp_service(
     redis: Redis = Depends(get_redis_client),
     audit_repository: RBACRepositoryProtocol = Depends(get_rbac_repository),
     settings: Settings = Depends(get_settings),
+    db: AsyncSession = Depends(get_db_session),
 ) -> OtpService:
+    from app.domains.guest_messaging.dependencies import build_org_otp_dispatcher
+
     return OtpService(
         repository,
         redis,
@@ -83,6 +86,10 @@ def get_otp_service(
         daily_cap_per_location=settings.otp_daily_cap_per_location,
         daily_cap_platform=settings.otp_daily_cap_platform,
         daily_cap_enforce=settings.otp_daily_cap_mode == "enforce",
+        # A venue's own verified WhatsApp/SMS account sends its guests'
+        # login codes when it has one; otherwise (and on any failure) the
+        # providers above do. See app.domains.guest_messaging.
+        org_dispatcher=build_org_otp_dispatcher(db, redis, settings, audit_repository),
     )
 
 
