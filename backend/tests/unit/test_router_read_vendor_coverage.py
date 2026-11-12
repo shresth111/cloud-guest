@@ -97,6 +97,16 @@ NARROWING_HELPERS = frozenset({"agent_managed_only", "agent_managed_vendor_crite
 # ---------------------------------------------------------------------------
 
 AGENT_MANAGED_ONLY: dict[str, str] = {
+    "app/domains/analytics/router_cpu.py::"
+    "RouterCpuRepository.list_mikrotik_routers": (
+        "The customer dashboard's Router CPU card charts router_health_"
+        "snapshots, which only the RouterOS-API and SNMP sweeps write -- "
+        "both agent-managed only. Omada and Aruba rows never have a "
+        "snapshot, and the owner asked (2026-11-12) for the card to list "
+        "MikroTik routers only, so they are excluded here (and further "
+        "narrowed to vendor mikrotik/NULL) rather than shown as 'not "
+        "reported'. A venue with no MikroTik gets no card."
+    ),
     "app/domains/analytics/venue_insights.py::"
     "VenueInsightsRepository.get_router_liveness": (
         "The customer venue-comparison card judges each router online or "
