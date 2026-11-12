@@ -284,6 +284,49 @@ def synthesize_nas_only_identity(seed: uuid.UUID) -> tuple[str, str]:
     return serial, mac
 
 
+#: Marker in a retired row's serial. A row whose serial carries it has
+#: already given its identity up; retiring it again is a no-op.
+RETIRED_SERIAL_MARKER = "-deleted-"
+
+#: ``routers.serial_number`` is ``String(100)``.
+_SERIAL_NUMBER_MAX_LENGTH = 100
+
+
+def retired_router_identity(
+    router_id: uuid.UUID, serial_number: str, retired_at: datetime
+) -> tuple[str, str]:
+    """``(serial_number, mac_address)`` a soft-deleted fleet row holds instead
+    of its real ones.
+
+    ``uq_routers_serial_number``/``uq_routers_mac_address`` are plain unique
+    indexes, so they count soft-deleted rows: a decommissioned row kept the
+    device's real serial and MAC, and re-adding the same device was an
+    ``IntegrityError`` (prod 2026-11-12: an Aruba AP21 removed from Master
+    could not be added again). Retiring a row moves its identity here, in the
+    same transaction as the soft delete; the real values stay on the row in
+    ``settings["retired_identity"]`` and in the decommission audit entry.
+
+    * MAC: derived from the row id, locally administered (bit 1 of the first
+      octet set, multicast bit clear). No manufacturer may burn such a MAC
+      into hardware, so it never collides with a real device, it still
+      parses as a MAC everywhere, and ``aruba_shared.is_placeholder_mac``
+      already reads it as "no AP MAC".
+    * Serial: ``<serial>-deleted-<yyyymmdd>-<8 hex>``, the original kept
+      readable for an operator scanning the table. The hex comes from the
+      row id, so one device retired twice on the same day gets two distinct
+      values; the original is cut so the whole fits the column.
+
+    Deterministic, so the migration that retires already-deleted rows
+    (``0183``) produces exactly what a fresh decommission would.
+    """
+    digest = hashlib.sha256(b"retired-router-identity:" + router_id.bytes).digest()
+    first_octet = (digest[0] & 0b1111_1100) | 0b10
+    mac = ":".join(f"{octet:02X}" for octet in (first_octet, *digest[1:6]))
+    suffix = f"{RETIRED_SERIAL_MARKER}{retired_at:%Y%m%d}-{digest[6:10].hex()}"
+    serial = f"{serial_number[: _SERIAL_NUMBER_MAX_LENGTH - len(suffix)]}{suffix}"
+    return serial, mac
+
+
 class RouterService:
     """Core router device business logic."""
 
@@ -476,10 +519,9 @@ class RouterService:
 
         normalized_serial = serial_number.strip()
         normalized_mac = _normalize_mac(mac_address)
-        if await self.repository.get_by_serial_number(normalized_serial):
-            raise DuplicateSerialNumberError(normalized_serial)
-        if await self.repository.get_by_mac_address(normalized_mac):
-            raise DuplicateMacAddressError(normalized_mac)
+        await self._refuse_identity_holders(
+            serial_number=normalized_serial, mac_address=normalized_mac
+        )
 
         router = await self.repository.create_router(
             location_id=location_id,
@@ -652,6 +694,11 @@ class RouterService:
 
         A live holder is a real duplicate: 409, as ``create_router`` does.
 
+        Since ``_retire_router``, a decommissioned row no longer holds its
+        serial/MAC at all, so the release below only meets rows deleted
+        before that (until migration ``0183`` retires them) and the orphan
+        case.
+
         A *decommissioned* holder still owns the value under the unique
         index, so a straight insert would be an ``IntegrityError``. When that
         holder is itself a NAS-only row -- the "added at the wrong location,
@@ -726,11 +773,7 @@ class RouterService:
     async def _decommission_orphan(
         self, actor_user_id: uuid.UUID | None, router: Router
     ) -> None:
-        updated = await self.repository.update_router(
-            router,
-            {"status": RouterStatus.DECOMMISSIONED.value, "updated_by": actor_user_id},
-        )
-        updated = await self.repository.soft_delete_router(updated)
+        updated, retired = await self._retire_router(actor_user_id, router)
         await self._audit(
             actor_user_id,
             AuditAction.ROUTER_DECOMMISSIONED,
@@ -739,8 +782,78 @@ class RouterService:
                 f"Instant On row '{updated.name}' decommissioned: its location "
                 "was deleted and a new row needs its serial/MAC"
             ),
-            metadata={"reason": "orphaned_by_deleted_location"},
+            metadata={"reason": "orphaned_by_deleted_location", **retired},
         )
+
+    async def _retire_router(
+        self, actor_user_id: uuid.UUID | None, router: Router
+    ) -> tuple[Router, dict[str, object]]:
+        """Decommission + soft-delete ``router`` and give up its serial/MAC.
+
+        The one way a fleet row is deleted (``decommission_router`` and the
+        orphan path above both come through here), so no delete path can
+        leave a tombstone holding a device's real identity under the unique
+        indexes -- see ``retired_router_identity``. One flush for the status
+        and identity, one for the soft delete, both in the caller's session:
+        a later failure in the request rolls all of it back together.
+
+        Returns the row and the audit metadata naming the real values.
+        """
+        original_serial = router.serial_number
+        original_mac = router.mac_address
+        changes: dict[str, object] = {
+            "status": RouterStatus.DECOMMISSIONED.value,
+            "updated_by": actor_user_id,
+        }
+        retired: dict[str, object] = {}
+        if RETIRED_SERIAL_MARKER not in (original_serial or ""):
+            moment = datetime.now(UTC)
+            serial, mac = retired_router_identity(router.id, original_serial, moment)
+            settings = dict(router.settings or {})
+            settings["retired_identity"] = {
+                "serial_number": original_serial,
+                "mac_address": original_mac,
+                "retired_at": moment.isoformat(),
+            }
+            changes.update(
+                {"serial_number": serial, "mac_address": mac, "settings": settings}
+            )
+            retired = {
+                "retired_serial_number": original_serial,
+                "retired_mac_address": original_mac,
+            }
+        updated = await self.repository.update_router(router, changes)
+        updated = await self.repository.soft_delete_router(updated)
+        return updated, retired
+
+    async def _refuse_identity_holders(
+        self,
+        *,
+        serial_number: str | None = None,
+        mac_address: str | None = None,
+        exclude_router_id: uuid.UUID | None = None,
+    ) -> None:
+        """409 when any row -- soft-deleted ones included, because the unique
+        indexes include them -- already holds this serial or MAC.
+
+        ``get_by_serial_number``/``get_by_mac_address`` skip soft-deleted
+        rows, so checking with them let a value held by a tombstone through
+        to the INSERT, which then failed on the index as an unhandled
+        ``DuplicateRecordError``: a 500 instead of the 409 the check exists
+        to give. Rows deleted since ``_retire_router`` no longer hold their
+        identity at all; this is what keeps any row that still does (a live
+        duplicate, or one the retire migration has not reached) a 409.
+        """
+        holders = await self.repository.routers_holding_identity(
+            serial_number=serial_number, mac_address=mac_address
+        )
+        for holder in holders:
+            if exclude_router_id is not None and holder.id == exclude_router_id:
+                continue
+            if serial_number is not None and holder.serial_number == serial_number:
+                raise DuplicateSerialNumberError(serial_number)
+            if mac_address is not None and holder.mac_address == mac_address:
+                raise DuplicateMacAddressError(mac_address)
 
     async def update_router(
         self,
@@ -768,16 +881,16 @@ class RouterService:
 
         if update_data.get("mac_address") is not None:
             normalized = _normalize_mac(str(update_data["mac_address"]))
-            existing = await self.repository.get_by_mac_address(normalized)
-            if existing is not None and existing.id != router.id:
-                raise DuplicateMacAddressError(normalized)
+            await self._refuse_identity_holders(
+                mac_address=normalized, exclude_router_id=router.id
+            )
             update_data["mac_address"] = normalized
 
         if update_data.get("serial_number") is not None:
             normalized = str(update_data["serial_number"]).strip()
-            existing = await self.repository.get_by_serial_number(normalized)
-            if existing is not None and existing.id != router.id:
-                raise DuplicateSerialNumberError(normalized)
+            await self._refuse_identity_holders(
+                serial_number=normalized, exclude_router_id=router.id
+            )
             update_data["serial_number"] = normalized
 
         # The write-only secrets leave `update_data` under one name and come
@@ -1074,16 +1187,13 @@ class RouterService:
         )
         self._validate_transition(router, RouterStatus.DECOMMISSIONED)
 
-        updated = await self.repository.update_router(
-            router,
-            {"status": RouterStatus.DECOMMISSIONED.value, "updated_by": actor_user_id},
-        )
-        updated = await self.repository.soft_delete_router(updated)
+        updated, retired = await self._retire_router(actor_user_id, router)
         await self._audit(
             actor_user_id,
             AuditAction.ROUTER_DECOMMISSIONED,
             router=updated,
             description=f"Router '{updated.name}' decommissioned",
+            metadata=retired or None,
         )
         return updated
 

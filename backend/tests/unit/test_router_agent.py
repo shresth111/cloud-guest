@@ -284,6 +284,18 @@ class FakeRouterRepository:
         router.version += 1
         return router
 
+    async def routers_holding_identity(
+        self, *, serial_number: str | None = None, mac_address: str | None = None
+    ) -> list[Router]:
+        """Mirrors the real read: soft-deleted rows INCLUDED, because the
+        unique indexes include them."""
+        return [
+            r
+            for r in self.routers.values()
+            if (serial_number is not None and r.serial_number == serial_number)
+            or (mac_address is not None and r.mac_address == mac_address)
+        ]
+
     async def soft_delete_router(self, router: Router) -> Router:
         router.is_deleted = True
         router.deleted_at = _now()

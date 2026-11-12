@@ -184,7 +184,7 @@ class RouterRepositoryProtocol(Protocol):
     ) -> list[Router]: ...
 
     async def routers_holding_identity(
-        self, *, serial_number: str, mac_address: str
+        self, *, serial_number: str | None = None, mac_address: str | None = None
     ) -> list[Router]: ...
 
     async def count_live_integrations_at_location(
@@ -427,7 +427,7 @@ class RouterRepository:
         return rows, PaginationMeta.from_total(params, total_items)
 
     async def routers_holding_identity(
-        self, *, serial_number: str, mac_address: str
+        self, *, serial_number: str | None = None, mac_address: str | None = None
     ) -> list[Router]:
         """Every row -- soft-deleted ones INCLUDED -- whose serial or MAC is
         one of these.
@@ -439,12 +439,14 @@ class RouterRepository:
         promise. Adding a mistaken Instant On row, removing it and adding it
         again with the AP's real serial is exactly that sequence.
         """
-        statement = select(Router).where(
-            or_(
-                Router.serial_number == serial_number,
-                Router.mac_address == mac_address,
-            )
-        )
+        conditions = []
+        if serial_number is not None:
+            conditions.append(Router.serial_number == serial_number)
+        if mac_address is not None:
+            conditions.append(Router.mac_address == mac_address)
+        if not conditions:
+            return []
+        statement = select(Router).where(or_(*conditions))
         return list((await self.session.execute(statement)).scalars().all())
 
     async def count_live_integrations_at_location(

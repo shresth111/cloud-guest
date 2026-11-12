@@ -403,8 +403,9 @@ class TestIdentity:
 
     async def test_remove_then_re_add_with_the_real_serial(self) -> None:
         """Added at the wrong location, removed, added at the right one: the
-        unique index still holds the tombstone's serial/MAC, so without the
-        release this is an IntegrityError (500) in production."""
+        unique index counts the tombstone, so decommissioning retires its
+        serial/MAC (prod 2026-11-12, this AP21). Without that this is an
+        IntegrityError (500) in production."""
         service, repo, locations, _orgs, audit, org, wrong = _setup()
         first, _s, _m = await _create(
             service, org, wrong, serial_number=_AP21_SERIAL, mac_address=_AP21_MAC
@@ -420,16 +421,61 @@ class TestIdentity:
 
         assert second.serial_number == _AP21_SERIAL
         assert second.mac_address == _AP21_MAC
-        assert first.serial_number != _AP21_SERIAL
+        assert first.serial_number.startswith(f"{_AP21_SERIAL}-deleted-")
         assert first.mac_address != _AP21_MAC
+        assert first.settings["retired_identity"]["mac_address"] == _AP21_MAC
+        retired = [
+            e
+            for e in audit.entries
+            if e["action"] == AuditAction.ROUTER_DECOMMISSIONED.value
+        ]
+        assert retired and retired[0]["entity_id"] == first.id
+        assert retired[0]["event_metadata"]["retired_serial_number"] == _AP21_SERIAL
+        assert retired[0]["event_metadata"]["retired_mac_address"] == _AP21_MAC
+
+    async def test_a_tombstone_that_still_holds_the_serial_is_still_released(
+        self,
+    ) -> None:
+        """A row deleted before decommission retired identities (the 0183
+        migration's job) keeps the old release path."""
+        service, repo, locations, _orgs, audit, org, wrong = _setup()
+        first, _s, _m = await _create(
+            service, org, wrong, serial_number=_AP21_SERIAL, mac_address=_AP21_MAC
+        )
+        first.is_deleted = True
+        first.status = "decommissioned"
+        right = locations.add(organization_id=org.id)
+
+        second, _s, _m = await _create(
+            service, org, right, serial_number=_AP21_SERIAL, mac_address=_AP21_MAC
+        )
+
+        assert second.serial_number == _AP21_SERIAL
         assert first.serial_number.startswith(NAS_ONLY_SYNTHETIC_SERIAL_PREFIX)
         release = [
             e for e in audit.entries if e["action"] == AuditAction.ROUTER_UPDATED.value
         ]
-        assert release and release[0]["entity_id"] == first.id
         assert release[0]["event_metadata"]["released_serial_number"] == _AP21_SERIAL
 
-    async def test_a_decommissioned_mikrotiks_identity_is_not_touched(self) -> None:
+    async def test_a_legacy_mikrotik_tombstone_is_a_409_not_a_500(self) -> None:
+        """A non-NAS-only tombstone the migration has not reached is not
+        released here; it stays a clean 409."""
+        service, repo, locations, _orgs, _audit, org, location = _setup()
+        elsewhere = locations.add(organization_id=org.id)
+        old = await make_router(
+            repo,
+            location_id=elsewhere.id,
+            organization_id=org.id,
+            serial_number=_AP21_SERIAL,
+        )
+        old.is_deleted = True
+        old.status = "decommissioned"
+        with pytest.raises(DuplicateSerialNumberError):
+            await _create(service, org, location, serial_number=_AP21_SERIAL)
+        assert old.serial_number == _AP21_SERIAL
+        assert len(repo.routers) == 1
+
+    async def test_a_decommissioned_mikrotik_frees_its_serial(self) -> None:
         service, repo, locations, _orgs, _audit, org, location = _setup()
         elsewhere = locations.add(organization_id=org.id)
         old = await make_router(
@@ -441,10 +487,10 @@ class TestIdentity:
         await service.decommission_router(
             actor_user_id=_ACTOR_ID, router_id=old.id, requesting_organization_id=None
         )
-        with pytest.raises(DuplicateSerialNumberError):
-            await _create(service, org, location, serial_number=_AP21_SERIAL)
-        assert old.serial_number == _AP21_SERIAL
-        assert len(repo.routers) == 1
+        created, _s, _m = await _create(
+            service, org, location, serial_number=_AP21_SERIAL
+        )
+        assert created.serial_number == _AP21_SERIAL
 
     async def test_live_row_at_a_deleted_location_is_released(self) -> None:
         """Prod 2026-11-01: the AP21 test location was deleted, its Instant On

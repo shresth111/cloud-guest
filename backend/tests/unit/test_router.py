@@ -79,7 +79,7 @@ from app.domains.router.schemas import (
     RouterManagementAccessRequest,
     RouterUpdateRequest,
 )
-from app.domains.router.service import RouterService
+from app.domains.router.service import RouterService, retired_router_identity
 
 # ============================================================================
 # Test doubles
@@ -353,14 +353,15 @@ class FakeRouterRepository:
         return paged, PaginationMeta.from_total(params, len(values))
 
     async def routers_holding_identity(
-        self, *, serial_number: str, mac_address: str
+        self, *, serial_number: str | None = None, mac_address: str | None = None
     ) -> list[Router]:
         """Mirrors the real read: soft-deleted rows INCLUDED, because the
         unique indexes include them."""
         return [
             r
             for r in self.routers.values()
-            if r.serial_number == serial_number or r.mac_address == mac_address
+            if (serial_number is not None and r.serial_number == serial_number)
+            or (mac_address is not None and r.mac_address == mac_address)
         ]
 
     # location_id -> live network integrations there. A test sets it.
@@ -723,6 +724,150 @@ class TestRouterCRUD:
         assert decommissioned.status == RouterStatus.DECOMMISSIONED.value
         assert decommissioned.is_deleted is True
         assert any(e["action"] == "router_decommissioned" for e in audit.entries)
+
+    async def test_decommission_retires_serial_and_mac(self) -> None:
+        """Prod 2026-11-12: a removed device could not be added again because
+        the unique indexes count soft-deleted rows. Decommission now gives the
+        identity up and keeps the real values on the row and in the audit."""
+        service, repo, location_lookup, org_lookup, audit = make_service()
+        organization = org_lookup.add()
+        location = location_lookup.add(organization_id=organization.id)
+        created = await service.create_router(
+            actor_user_id=uuid.uuid4(),
+            location_id=location.id,
+            requesting_organization_id=None,
+            **_create_kwargs(),
+        )
+
+        retired = await service.decommission_router(
+            actor_user_id=uuid.uuid4(),
+            router_id=created.id,
+            requesting_organization_id=None,
+        )
+
+        assert retired.is_deleted is True
+        assert retired.serial_number.startswith("HB31090ABCD-deleted-")
+        assert len(retired.serial_number) <= 100
+        assert retired.mac_address != "AA:BB:CC:DD:EE:FF"
+        first_octet = int(retired.mac_address[:2], 16)
+        assert first_octet & 0b10 and not first_octet & 0b01  # local, unicast
+        assert retired.settings["retired_identity"]["serial_number"] == "HB31090ABCD"
+        assert retired.settings["retired_identity"]["mac_address"] == (
+            "AA:BB:CC:DD:EE:FF"
+        )
+        (entry,) = [e for e in audit.entries if e["action"] == "router_decommissioned"]
+        assert entry["event_metadata"] == {
+            "retired_serial_number": "HB31090ABCD",
+            "retired_mac_address": "AA:BB:CC:DD:EE:FF",
+        }
+
+    async def test_re_add_after_decommission_with_the_same_serial_and_mac(
+        self,
+    ) -> None:
+        service, repo, location_lookup, org_lookup, _audit = make_service()
+        organization = org_lookup.add()
+        location = location_lookup.add(organization_id=organization.id)
+        first = await service.create_router(
+            actor_user_id=uuid.uuid4(),
+            location_id=location.id,
+            requesting_organization_id=None,
+            **_create_kwargs(),
+        )
+        await service.decommission_router(
+            actor_user_id=uuid.uuid4(),
+            router_id=first.id,
+            requesting_organization_id=None,
+        )
+
+        second = await service.create_router(
+            actor_user_id=uuid.uuid4(),
+            location_id=location.id,
+            requesting_organization_id=None,
+            **_create_kwargs(mac_address="aa:bb:cc:dd:ee:ff"),
+        )
+
+        assert second.id != first.id
+        assert second.serial_number == "HB31090ABCD"
+        assert second.mac_address == "AA:BB:CC:DD:EE:FF"
+
+    async def test_a_tombstone_still_holding_the_identity_is_a_409(self) -> None:
+        """A row deleted before decommission retired identities (until the
+        0183 migration reaches it) is a clean 409, not an INSERT that fails
+        on the unique index as a 500."""
+        service, repo, location_lookup, org_lookup, _audit = make_service()
+        organization = org_lookup.add()
+        location = location_lookup.add(organization_id=organization.id)
+        legacy = await service.create_router(
+            actor_user_id=uuid.uuid4(),
+            location_id=location.id,
+            requesting_organization_id=None,
+            **_create_kwargs(),
+        )
+        await repo.soft_delete_router(legacy)
+
+        with pytest.raises(DuplicateSerialNumberError):
+            await service.create_router(
+                actor_user_id=uuid.uuid4(),
+                location_id=location.id,
+                requesting_organization_id=None,
+                **_create_kwargs(),
+            )
+        with pytest.raises(DuplicateMacAddressError):
+            await service.create_router(
+                actor_user_id=uuid.uuid4(),
+                location_id=location.id,
+                requesting_organization_id=None,
+                **_create_kwargs(serial_number="OTHER-SERIAL"),
+            )
+
+    async def test_update_to_a_tombstones_mac_is_a_409(self) -> None:
+        service, repo, location_lookup, org_lookup, _audit = make_service()
+        organization = org_lookup.add()
+        location = location_lookup.add(organization_id=organization.id)
+        legacy = await service.create_router(
+            actor_user_id=uuid.uuid4(),
+            location_id=location.id,
+            requesting_organization_id=None,
+            **_create_kwargs(),
+        )
+        await repo.soft_delete_router(legacy)
+        live = await service.create_router(
+            actor_user_id=uuid.uuid4(),
+            location_id=location.id,
+            requesting_organization_id=None,
+            **_create_kwargs(serial_number="LIVE-1", mac_address="11:22:33:44:55:66"),
+        )
+
+        with pytest.raises(DuplicateMacAddressError):
+            await service.update_router(
+                actor_user_id=uuid.uuid4(),
+                router_id=live.id,
+                requesting_organization_id=None,
+                data={"mac_address": "AA:BB:CC:DD:EE:FF"},
+            )
+        # Its own values are not a conflict with itself.
+        updated = await service.update_router(
+            actor_user_id=uuid.uuid4(),
+            router_id=live.id,
+            requesting_organization_id=None,
+            data={"mac_address": "11:22:33:44:55:66", "serial_number": "LIVE-1"},
+        )
+        assert updated.serial_number == "LIVE-1"
+
+    def test_retired_identity_fits_the_columns_and_is_distinct_per_row(self) -> None:
+        moment = datetime(2026, 11, 12, tzinfo=UTC)
+        long_serial = "S" * 100
+        a = retired_router_identity(uuid.uuid4(), long_serial, moment)
+        b = retired_router_identity(uuid.uuid4(), long_serial, moment)
+        assert a != b
+        for serial, mac in (a, b):
+            assert len(serial) == 100
+            assert "-deleted-20261112-" in serial
+            assert len(mac) == 17
+        rid = uuid.uuid4()
+        assert retired_router_identity(rid, "X", moment) == retired_router_identity(
+            rid, "X", moment
+        )
 
     async def test_list_routers_within_location(self) -> None:
         service, repo, location_lookup, org_lookup, _audit = make_service()
