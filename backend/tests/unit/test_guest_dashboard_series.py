@@ -202,8 +202,12 @@ class _ReferenceRepository:
             lo = max(first_bucket_start + i * width, start)
             hi = min(first_bucket_start + (i + 1) * width, end)
             a = sum(1 for r in rows if lo <= r["started_at"] < hi)
-            o = sum(
-                1 for r in rows if r["started_at"] < hi and (r["ended_at"] or now) > lo
+            o = len(
+                {
+                    r["guest_id"]
+                    for r in rows
+                    if r["started_at"] < hi and (r["ended_at"] or now) > lo
+                }
             )
             if a:
                 arrivals[i] = a
@@ -216,10 +220,11 @@ class _ReferenceRepository:
             )
             for r in started
         ]
-        os_counts: dict[str, int] = {}
+        os_devices: dict[str, set] = {}
         for r in started:
             name = classify_dashboard_os(r.get("user_agent"))
-            os_counts[name] = os_counts.get(name, 0) + 1
+            os_devices.setdefault(name, set()).add(r["device_id"] or r["guest_id"])
+        os_counts = {name: len(devices) for name, devices in os_devices.items()}
         return DashboardSeriesAggregate(
             guests=len({r["guest_id"] or r["device_id"] for r in started}),
             sessions=len(started),
@@ -423,6 +428,56 @@ class TestScenarios:
         ]
         assert result.sessions == 3
         assert result.peak_online == 2
+
+    async def test_online_counts_guests_not_sessions(self, harness) -> None:
+        # Magpie Cafe, 2026-11-13: two guests each signed in twice in the
+        # same hour (a failed first attempt, then a working one). The chart
+        # read "peak 4" for a venue that never had more than 2 people online.
+        h, repo = harness
+        b = IST_MIDNIGHT
+        anish, shresth = uuid.uuid4(), uuid.uuid4()
+        android = "Mozilla/5.0 (Linux; Android 14)"
+        await h.add(
+            **_session(
+                b + timedelta(minutes=5),
+                b + timedelta(minutes=15),
+                guest_id=anish,
+                user_agent=android,
+            )
+        )
+        await h.add(
+            **_session(
+                b + timedelta(minutes=20),
+                b + timedelta(minutes=50),
+                guest_id=anish,
+                user_agent=android,
+            )
+        )
+        await h.add(
+            **_session(
+                b + timedelta(minutes=8), b + timedelta(minutes=12), guest_id=shresth
+            )
+        )
+        await h.add(
+            **_session(
+                b + timedelta(minutes=30), b + timedelta(minutes=55), guest_id=shresth
+            )
+        )
+        result = await GuestAnalyticsService(repo).get_dashboard_series(
+            organization_id=ORG_A,
+            location_id=LOC_A,
+            start=b,
+            end=b + 2 * HOUR,
+            bucket=DashboardSeriesBucket.HOUR,
+            tz_offset_minutes=IST,
+            now=FAR_FUTURE,
+        )
+        assert [p.online for p in result.series] == [2, 0]
+        assert result.peak_online == 2
+        assert result.sessions == 4
+        assert result.guests == 2
+        # One Android phone that signed in twice is one Android device.
+        assert dict(result.os_breakdown).get("Android") == 1
 
     async def test_open_session_is_not_counted_past_now(self, harness) -> None:
         h, repo = harness
