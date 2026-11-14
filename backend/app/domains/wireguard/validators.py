@@ -11,7 +11,9 @@ database or event loop.
 
 from __future__ import annotations
 
+import asyncio
 import ipaddress
+import socket
 
 from app.domains.router.enums import RouterStatus
 from app.domains.router.models import Router
@@ -157,3 +159,43 @@ __all__ = [
     "hub_reserved_ip",
     "allocate_tunnel_ip",
 ]
+
+
+async def resolve_hub_endpoint_address(
+    host: str, *, timeout_seconds: float = 2.0
+) -> str | None:
+    """IPv4 address for the hub's ``endpoint_host``, resolved now, or None.
+
+    Fed to the setup-script generator as ``hub_endpoint_address``: the
+    WireGuard chunk dials the hub by NAME, and only falls back to this raw
+    address when the router itself cannot resolve the name at paste time.
+    Without it the chunk refuses to build a peer at all (see
+    ``buildWireguardPeerStatements`` in the frontend), which leaves the
+    router with no tunnel, no RADIUS and no management.
+
+    Never raises: a lookup failure or a slow resolver returns None and the
+    script keeps today's behaviour. An IP literal is returned unchanged.
+    """
+    candidate = (host or "").strip()
+    if not candidate:
+        return None
+    try:
+        literal = ipaddress.ip_address(candidate)
+    except ValueError:
+        literal = None
+    if literal is not None:
+        return str(literal) if literal.version == 4 else None
+    try:
+        infos = await asyncio.wait_for(
+            asyncio.get_running_loop().getaddrinfo(
+                candidate, None, family=socket.AF_INET, type=socket.SOCK_DGRAM
+            ),
+            timeout=timeout_seconds,
+        )
+    except (OSError, TimeoutError, UnicodeError):
+        return None
+    for info in infos:
+        address = info[4][0]
+        if address:
+            return str(address)
+    return None

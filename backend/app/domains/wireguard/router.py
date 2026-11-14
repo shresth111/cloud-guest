@@ -75,7 +75,7 @@ from .schemas import (
     WireGuardTunnelRotateResponse,
 )
 from .service import FleetStatus, TunnelDeliveryInfo, WireGuardService
-from .validators import hub_reserved_ip
+from .validators import hub_reserved_ip, resolve_hub_endpoint_address
 
 router = APIRouter(tags=["WireGuard"])
 
@@ -360,6 +360,9 @@ async def allocate_external_wireguard_peer(
         reused=allocation.reused,
         hub_public_key=allocation.hub_public_key,
         hub_endpoint_host=allocation.hub_endpoint_host,
+        hub_endpoint_address=await resolve_hub_endpoint_address(
+            allocation.hub_endpoint_host
+        ),
         hub_endpoint_port=allocation.hub_endpoint_port,
         tunnel_network_cidr=allocation.tunnel_network_cidr,
         hub_tunnel_ip_address=allocation.hub_tunnel_ip_address,
