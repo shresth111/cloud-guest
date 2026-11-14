@@ -24,6 +24,7 @@ from typing import Protocol
 from sqlalchemy import (
     DateTime,
     Integer,
+    String,
     and_,
     case,
     cast,
@@ -1398,11 +1399,15 @@ class GuestRepository:
             .scalars()
             .all()
         }
-        active_statement = select(GuestSession.id, GuestSession.guest_id).where(
-            *conditions,
-            GuestSession.guest_id.in_(guest_ids),
-            GuestSession.status == GuestSessionStatus.ACTIVE.value,
-        ).order_by(GuestSession.started_at.desc(), GuestSession.id)
+        active_statement = (
+            select(GuestSession.id, GuestSession.guest_id)
+            .where(
+                *conditions,
+                GuestSession.guest_id.in_(guest_ids),
+                GuestSession.status == GuestSessionStatus.ACTIVE.value,
+            )
+            .order_by(GuestSession.started_at.desc(), GuestSession.id)
+        )
         active_ids: dict[uuid.UUID, list[uuid.UUID]] = {}
         active_rows = (await self.session.execute(active_statement)).all()
         for session_id, guest_id in active_rows:
@@ -2312,6 +2317,12 @@ class GuestRepository:
                     bucket_index(effective_end, func.ceil) - 1,
                     literal(bucket_count - 1, Integer),
                 ).label("i_max"),
+                # Who is online, not how many sessions: a guest whose phone
+                # re-authenticates (a retry after a failed login, a MAC
+                # change, a reconnect) opens a second session in the same
+                # hour. Counting sessions showed "peak 4" at a venue with 2
+                # guests (Magpie Cafe, 2026-11-13).
+                GuestSession.guest_id.label("who"),
             )
             .where(
                 *tenant,
@@ -2327,7 +2338,7 @@ class GuestRepository:
             .lateral()
         )
         online_statement = (
-            select(bucket_indexes.c.i, func.count())
+            select(bucket_indexes.c.i, func.count(func.distinct(spans_subquery.c.who)))
             .select_from(spans_subquery)
             .join(bucket_indexes, true())
             .group_by(bucket_indexes.c.i)
@@ -2348,10 +2359,23 @@ class GuestRepository:
             (ua.contains("linux"), "Linux"),
             else_="Other",
         )
-        os_subquery = select(os_name.label("name")).where(*started_in_window).subquery()
-        os_statement = select(os_subquery.c.name, func.count()).group_by(
-            os_subquery.c.name
+        # "Devices by OS" counts devices, not sessions: one phone that signs in
+        # twice is one Android device. A session with no device row falls back
+        # to its guest.
+        os_subquery = (
+            select(
+                os_name.label("name"),
+                func.coalesce(
+                    cast(GuestSession.device_id, String),
+                    cast(GuestSession.guest_id, String),
+                ).label("device"),
+            )
+            .where(*started_in_window)
+            .subquery()
         )
+        os_statement = select(
+            os_subquery.c.name, func.count(func.distinct(os_subquery.c.device))
+        ).group_by(os_subquery.c.name)
         os_rows = (await self.session.execute(os_statement)).all()
 
         return DashboardSeriesAggregate(
