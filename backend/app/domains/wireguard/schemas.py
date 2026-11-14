@@ -146,6 +146,11 @@ class WireGuardTunnelCreateResponse(WireGuardPeerResponse):
     )
     hub_public_key: str
     hub_endpoint_host: str
+    # ``hub_endpoint_host`` resolved to IPv4 when this response was built,
+    # or None. Only a fallback for a router whose own DNS cannot resolve the
+    # name at paste time; the peer is still built against the name whenever
+    # the router can resolve it.
+    hub_endpoint_address: str | None = None
     hub_endpoint_port: int
     tunnel_network_cidr: str
     # The hub's own address *inside* the tunnel (e.g. "10.20.0.1"), derived
